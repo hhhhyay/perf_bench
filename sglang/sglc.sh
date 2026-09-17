@@ -10,7 +10,7 @@
 #      theoretical_per_dp_bs       = min(token_theoretical_per_dp_bs, request_limit)
 #    若 MAX_RUNNING_REQUESTS 未获取到/<=0，则仅使用 token capacity。
 #    自动 BS 扫描围绕最终 effective theoretical BS，而不是只围绕 KV token 理论值。
-# 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory(±1/±2) 与 Mean/P99 TPOT inline 连续加密
+# 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory(±1/±2) 与 SLA inline 连续加密
 # 5) 汇总 jsonl + log -> sum_all.csv
 # ============================================================
 
@@ -62,28 +62,29 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
 #   MAX_RUNNING_REQUESTS=20 bash this_script.sh
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 
-# /server_info 自动提取的并行与 CUDA Graph 配置（TP/DP/PP/EP/ACP）。
+# /server_info 自动提取的并行与 CUDA Graph 配置（TP/DP/PP/EP/ACP/KV cache dtype）。
 # 若接口不可用，则回退原 DP_SIZE 布局策略。
 TP_SIZE="${TP_SIZE:-}"
 PP_SIZE="${PP_SIZE:-}"
 EP_SIZE="${EP_SIZE:-}"
 ATTN_CP_SIZE="${ATTN_CP_SIZE:-}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 DP_ATTENTION="${DP_ATTENTION:-}"
 CUDA_GRAPH_DECODE_BS="${CUDA_GRAPH_DECODE_BS:-}"
 PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"
 
 # Mean TPOT 接近该值时，在相邻 BS 区间自动补点。
-TPOT_DENSE_ENABLE="${TPOT_DENSE_ENABLE:-1}"
-# 默认 1=开启 Mean/P99 TPOT inline 自动加密；设 0 可关闭
-# TPOT_DENSE_ENABLE=0 bash this_script.sh
+SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-1}"
+# 通用 SLA 规则：metric:target:near，多个规则用逗号分隔
+# 例如：mean_tpot_ms:30:2,p99_tpot_ms:75:5,mean_ttft_ms:1000:100
+SLA_RULES="${SLA_RULES:-mean_tpot_ms:50:5,p99_tpot_ms:75:5}"
+# 默认 1=开启 SLA inline 自动加密；设 0 可关闭
+# SLA_DENSE_ENABLE=0 bash this_script.sh
 # TPOT 附近连续加密：
-# - 默认关闭；TPOT_DENSE_ENABLE=1 时开启
+# - 默认关闭；SLA_DENSE_ENABLE=1 时开启
 # - 同时检测 Mean TPOT / P99 TPOT 是否接近目标值
 # - 一旦当前 BS 命中 target±near，就立刻把“当前 BS 到下一个基础/CUDA-Graph BS 之间”按连续整数 BS 跑完
 # - 不再有第二阶段补测，不回头、不重复；随后继续原 CUDA-Graph/theory BS 顺序。
-TPOT_MEAN_SLA_MS="${TPOT_MEAN_SLA_MS:-50}"
-TPOT_P99_SLA_MS="${TPOT_P99_SLA_MS:-75}"
-TPOT_DENSE_NEAR_MS="${TPOT_DENSE_NEAR_MS:-5}"
 
 # 真实服务默认关闭；FakePD / 仅测 decode 时设 1
 
@@ -328,27 +329,29 @@ load_server_info() {
 d=json.load(sys.stdin)
 tp=d.get("tp_size"); dp=d.get("dp_size"); pp=d.get("pp_size"); ep=d.get("ep_size")
 acp=d.get("attn_cp_size"); dpa=d.get("enable_dp_attention")
+kv=d.get("kv_cache_dtype")
 cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
 def sv(v):
     if isinstance(v,bool): return "true" if v else "false"
     return "" if v is None else str(v)
-print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
+print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
     || true
   )"
 
   if [[ -n "${values}" ]]; then
-    read -r _tp _dp _pp _ep _acp _dpa _cudabs <<< "${values}"
+    read -r _tp _dp _pp _ep _acp _dpa _kv _cudabs <<< "${values}"
     [[ -n "${_tp}" ]] && TP_SIZE="${_tp}"
     [[ -n "${_dp}" ]] && DP_SIZE="${_dp}"
     [[ -n "${_pp}" ]] && PP_SIZE="${_pp}"
     [[ -n "${_ep}" ]] && EP_SIZE="${_ep}"
     [[ -n "${_acp}" ]] && ATTN_CP_SIZE="${_acp}"
     [[ -n "${_dpa}" ]] && DP_ATTENTION="${_dpa}"
+    [[ -n "${_kv}" ]] && KV_CACHE_DTYPE="${_kv}"
     [[ -n "${_cudabs}" ]] && CUDA_GRAPH_DECODE_BS="${_cudabs}"
 
     local attn_tag
     if [[ "${DP_ATTENTION}" == "true" ]]; then attn_tag="DPA"; else attn_tag="TPA"; fi
-    PARALLEL_CONFIG="TP${TP_SIZE:-NA}-DP${DP_SIZE:-NA}(${attn_tag})-PP${PP_SIZE:-NA}-EP${EP_SIZE:-NA}-ACP${ATTN_CP_SIZE:-NA}"
+    PARALLEL_CONFIG="TP${TP_SIZE:-NA}-DP${DP_SIZE:-NA}(${attn_tag})-PP${PP_SIZE:-NA}-EP${EP_SIZE:-NA}-ACP${ATTN_CP_SIZE:-NA}-KV${KV_CACHE_DTYPE:-NA}"
 
     echo "[INFO] server_info: ${PARALLEL_CONFIG}"
     if [[ -n "${CUDA_GRAPH_DECODE_BS}" ]]; then
@@ -1318,6 +1321,17 @@ trap on_exit EXIT
 load_server_info || true
 load_server_capacity
 validate_fixed_mode
+python3 - "${SLA_RULES}" <<'PY2' || exit 1
+import sys
+for raw in sys.argv[1].split(','):
+    raw=raw.strip()
+    if not raw: continue
+    p=raw.split(':')
+    if len(p)!=3 or not p[0]:
+        print(f'[ERROR] 非法 SLA_RULES 项: {raw}',file=sys.stderr); raise SystemExit(1)
+    try: float(p[1]); float(p[2])
+    except: print(f'[ERROR] SLA target/near 非数字: {raw}',file=sys.stderr); raise SystemExit(1)
+PY2
 
 if [[ ! "${NUM_PROMPTS_MULTIPLIER}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] NUM_PROMPTS_MULTIPLIER 必须是正整数，当前=${NUM_PROMPTS_MULTIPLIER}"
@@ -1336,7 +1350,7 @@ echo "MAX_TOTAL_TOKENS : ${MAX_TOTAL_TOKENS}"
 echo "MAX_RUNNING_REQS  : ${MAX_RUNNING_REQUESTS:-0}"
 echo "PARALLEL_CONFIG   : ${PARALLEL_CONFIG:-UNKNOWN}"
 echo "CUDA_GRAPH_BS     : ${CUDA_GRAPH_DECODE_BS:-FALLBACK_DP_LAYOUT}"
-echo "TPOT DENSE         : enable=${TPOT_DENSE_ENABLE} mean_target=${TPOT_MEAN_SLA_MS}ms p99_target=${TPOT_P99_SLA_MS}ms near=±${TPOT_DENSE_NEAR_MS}ms mode=inline"
+echo "SLA DENSE          : enable=${SLA_DENSE_ENABLE} rules=${SLA_RULES} mode=inline"
 echo "USE_FAKE_PREFILL : ${USE_FAKE_PREFILL}"
 echo "TEST_MODE        : $(get_test_mode_name)"
 echo "FIXED_PER_DP_BS  : ${FIXED_PER_DP_BS:-AUTO}"
@@ -1408,6 +1422,8 @@ run_one_bs() {
     --request-rate inf
     --max-concurrency "${global_concurrency}"
     --warmup-requests "${warmup_requests}"
+    --extra-request-body
+    "{\"sampling_params\":{\"temperature\":0.6,\"top_p\":0.95,\"max_new_tokens\":${output_len},\"ignore_eos\":true}}"
     --output-details
     --output-file "${output_file}"
     --disable-tqdm
@@ -1444,57 +1460,45 @@ run_one_bs() {
 
 # ============================================================
 # Inline TPOT dense helper
-# 当前 BS 测完后立即检查 Mean/P99 TPOT。
+# 当前 BS 测完后立即检查 SLA。
 # 任一指标进入 target±near，就把当前 BS 到下一个基础 BS 之间的整数 BS 连续跑完。
 # ============================================================
-is_tpot_near_target() {
+is_sla_near_target() {
   local current_case="$1"
   local current_bs="$2"
   local csv_file="${out_dir}/sum_all.csv"
-
   [[ -s "${csv_file}" ]] || return 1
-
-  python3 - "${csv_file}" "${current_case}" "${current_bs}" \
-    "${TPOT_MEAN_SLA_MS}" "${TPOT_P99_SLA_MS}" "${TPOT_DENSE_NEAR_MS}" <<'PY'
-import csv, sys, math
-
-csv_file, case_name, bs_s = sys.argv[1], sys.argv[2], sys.argv[3]
-bs = int(bs_s)
-mean_target = float(sys.argv[4])
-p99_target = float(sys.argv[5])
-near = float(sys.argv[6])
-
-row_match = None
-with open(csv_file, newline="", encoding="utf-8-sig") as f:
+  python3 - "${csv_file}" "${current_case}" "${current_bs}" "${SLA_RULES}" <<'PY2'
+import csv,sys,math
+csv_file,case_name,bs_s,rules_text=sys.argv[1:5]
+bs=int(bs_s)
+row=None
+with open(csv_file,newline='',encoding='utf-8-sig') as f:
     for r in csv.DictReader(f):
-        if r.get("case_name") != case_name:
-            continue
-        try:
-            r_bs = int(float(r.get("per_dp_bs", "")))
-        except Exception:
-            continue
-        if r_bs == bs:
-            row_match = r
-
-if not row_match:
-    sys.exit(1)
-
-def getf(key):
+        if r.get('case_name')!=case_name: continue
+        try: rbs=int(float(r.get('per_dp_bs','')))
+        except: continue
+        if rbs==bs: row=r
+if not row: raise SystemExit(1)
+hits=[]; states=[]
+for raw in rules_text.split(','):
+    raw=raw.strip()
+    if not raw: continue
+    p=raw.split(':')
+    if len(p)!=3:
+        states.append(raw+'=INVALID'); continue
+    metric,target_s,near_s=p
     try:
-        v = float(row_match.get(key, ""))
-        return v if math.isfinite(v) else None
-    except Exception:
-        return None
-
-mean = getf("mean_tpot_ms")
-p99 = getf("p99_tpot_ms")
-
-mean_hit = mean is not None and abs(mean - mean_target) <= near
-p99_hit = p99 is not None and abs(p99 - p99_target) <= near
-
-print(f"[TPOT-CHECK] bs={bs} mean={mean} p99={p99} mean_hit={mean_hit} p99_hit={p99_hit}", file=sys.stderr)
-sys.exit(0 if (mean_hit or p99_hit) else 1)
-PY
+        target=float(target_s); near=float(near_s); value=float(row.get(metric,''))
+        if not math.isfinite(value): raise ValueError
+    except:
+        states.append(metric+'=NA'); continue
+    hit=abs(value-target)<=near
+    states.append(f'{metric}={value:.4f} target={target:g}±{near:g} hit={hit}')
+    if hit: hits.append(metric)
+print(f'[SLA-CHECK] bs={bs} '+' | '.join(states),file=sys.stderr)
+raise SystemExit(0 if hits else 1)
+PY2
 }
 
 # ============================================================
@@ -1544,7 +1548,7 @@ for case_config in "${CASES[@]}"; do
 
   # 单阶段顺序执行：
   # 1) 按 CUDA Graph / fallback / theory 生成的基础 BS 从小到大跑
-  # 2) 每个 BS 跑完立即检查 Mean/P99 TPOT
+  # 2) 每个 BS 跑完立即检查 SLA
   # 3) 若当前点命中 target±near，则直接连续跑到下一个基础 BS 前一位
   #    例如基础点 ...18,22,24...，BS18 命中后立即跑 19/20/21，然后继续 22、24...
   mapfile -t base_bs_array < <(printf "%s\n" ${bs_list} | awk 'NF' | sort -n)
@@ -1558,22 +1562,21 @@ for case_config in "${CASES[@]}"; do
       continue
     fi
 
-    if [[ "${TPOT_DENSE_ENABLE}" != "1" ]]; then
+    if [[ "${SLA_DENSE_ENABLE}" != "1" ]]; then
       continue
     fi
 
     next_base_bs="${base_bs_array[$((i + 1))]}"
 
     # 当前点 Mean/P99 任一接近目标，立即连续测试到下一个基础点之前。
-    if is_tpot_near_target "${case_name}" "${per_dp_bs}"; then
+    if is_sla_near_target "${case_name}" "${per_dp_bs}"; then
       if (( next_base_bs > per_dp_bs + 1 )); then
         echo
         echo "############################################################"
-        echo "# Inline TPOT Dense Scan"
+        echo "# Inline SLA Dense Scan"
         echo "# Current BS        : ${per_dp_bs}"
         echo "# Next Base BS      : ${next_base_bs}"
-        echo "# Mean TPOT Target  : ${TPOT_MEAN_SLA_MS} ms"
-        echo "# P99 TPOT Target   : ${TPOT_P99_SLA_MS} ms"
+        echo "# SLA Rules         : ${SLA_RULES}"
         echo "# Dense BS          : $((per_dp_bs + 1)) .. $((next_base_bs - 1))"
         echo "############################################################"
 
