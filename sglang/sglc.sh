@@ -1422,8 +1422,6 @@ run_one_bs() {
     --request-rate inf
     --max-concurrency "${global_concurrency}"
     --warmup-requests "${warmup_requests}"
-    --extra-request-body
-    "{\"sampling_params\":{\"temperature\":0.6,\"top_p\":0.95,\"max_new_tokens\":${output_len},\"ignore_eos\":true}}"
     --output-details
     --output-file "${output_file}"
     --disable-tqdm
