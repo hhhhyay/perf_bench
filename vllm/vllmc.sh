@@ -1226,8 +1226,6 @@ run_one_bs() {
       --num-prompts "${num_prompts}" \
       --request-rate inf \
       --num-warmups "${warmup_requests}" \
-      --temperature 0.6 \
-      --top-p 0.95 \
       --ignore-eos \
       --percentile-metrics "${PERCENTILE_METRICS}" \
       --metric-percentiles "${METRIC_PERCENTILES}" \
