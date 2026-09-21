@@ -208,10 +208,6 @@ THEORY_DELTAS=(
   -2
   -1
   0
-  1
-  2
-  4
-  8
 )
 
 
@@ -607,7 +603,7 @@ get_bs_list() {
     fi
   fi
   if (( theoretical_floor < 1 )); then theoretical_floor=1; fi
-  scan_max=$((theoretical_floor + 2))
+  scan_max=$((theoretical_floor))
 
   declare -A selected=()
 
