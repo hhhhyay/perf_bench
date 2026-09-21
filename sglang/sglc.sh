@@ -10,7 +10,7 @@
 #      theoretical_per_dp_bs       = min(token_theoretical_per_dp_bs, request_limit)
 #    若 MAX_RUNNING_REQUESTS 未获取到/<=0，则仅使用 token capacity。
 #    自动 BS 扫描围绕最终 effective theoretical BS，而不是只围绕 KV token 理论值。
-# 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory(±1/±2) 与 SLA inline 连续加密
+# 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory 前侧加密点（不超过 theory）与 SLA inline 连续加密
 # 5) 汇总 jsonl + log -> sum_all.csv
 # ============================================================
 
@@ -80,9 +80,9 @@ SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-1}"
 SLA_RULES="${SLA_RULES:-mean_tpot_ms:50:5,p99_tpot_ms:75:5}"
 # 默认 1=开启 SLA inline 自动加密；设 0 可关闭
 # SLA_DENSE_ENABLE=0 bash this_script.sh
-# TPOT 附近连续加密：
-# - 默认关闭；SLA_DENSE_ENABLE=1 时开启
-# - 同时检测 Mean TPOT / P99 TPOT 是否接近目标值
+# SLA 附近连续加密：
+# - 默认开启；SLA_DENSE_ENABLE=0 时关闭
+# - 检测 SLA_RULES 中配置的任意指标是否接近目标值
 # - 一旦当前 BS 命中 target±near，就立刻把“当前 BS 到下一个基础/CUDA-Graph BS 之间”按连续整数 BS 跑完
 # - 不再有第二阶段补测，不回头、不重复；随后继续原 CUDA-Graph/theory BS 顺序。
 
@@ -164,7 +164,7 @@ LOW_DP_BS=(
 
 # DP>3 时使用关键 anchor 加密的 per-DP BS。
 # 重点观察 16 / 32 / 64 附近的 scheduler / kernel / cudagraph 性能拐点。
-# >72 后继续按 16 粗扫，再叠加 effective theory 附近 ±1/±2。
+# >72 后继续按 16 粗扫，再叠加 effective theory 前侧加密点；最大 BS 不超过 theory。
 DENSE_DP_BS=(
   1
   2
@@ -584,9 +584,9 @@ get_theory_limit_factor() {
 #
 # - DP<=3：1/2/4/8/16/32/48/64/96/128... + 理论附近加密
 # - DP>3 ：per-DP BS 使用更密扫描
-# - 理论附近：floor(effective_theory)-2/-1/0/+1/+2
-# - scan_max = effective_theory_floor + 8
-# - 小范围 (<=8)：连续扫描
+# - 理论附近：由 THEORY_DELTAS 控制，当前为 -8/-4/-2/-1/0
+# - scan_max = floor(effective_theory)，绝不测试 theory 之后的 BS
+# - CUDA Graph / fallback 基础点同样会被 scan_max 截断
 # ============================================================
 
 get_bs_list() {
@@ -634,8 +634,8 @@ get_bs_list() {
     fi
   fi
 
-  # 第二层：effective theory 附近 ±1/±2
-  for delta in -2 -1 0 1 2; do
+  # 第二层：effective theory 前侧加密；只使用 THEORY_DELTAS，不测试 theory 之后的 BS
+  for delta in "${THEORY_DELTAS[@]}"; do
     bs=$((theoretical_floor + delta))
     if (( bs >= 1 && bs <= scan_max )); then selected["${bs}"]=1; fi
   done
