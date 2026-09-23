@@ -11,7 +11,8 @@
 #    若 MAX_RUNNING_REQUESTS 未获取到/<=0，则仅使用 token capacity。
 #    自动 BS 扫描围绕最终 effective theoretical BS，而不是只围绕 KV token 理论值。
 # 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory 前侧加密点（不超过 theory）与 SLA inline 连续加密
-# 5) 汇总 jsonl + log -> sum_all.csv
+# 5) 支持 mean_tpot_ms 硬停止阈值；达到阈值立即停止当前 case 后续 BS
+# 6) 汇总 jsonl + log -> sum_all.csv
 # ============================================================
 
 set -uo pipefail
@@ -78,6 +79,19 @@ SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-1}"
 # 通用 SLA 规则：metric:target:near，多个规则用逗号分隔
 # 例如：mean_tpot_ms:30:2,p99_tpot_ms:75:5,mean_ttft_ms:1000:100
 SLA_RULES="${SLA_RULES:-mean_tpot_ms:50:5,p99_tpot_ms:75:5}"
+
+# 通用硬停止规则：metric:op:threshold，多个规则用逗号分隔。
+# 任意一条命中即可触发“当前 case 停止”。
+# 支持 op：ge / gt / le / lt
+# 例如：
+#   mean_tpot_ms:ge:100
+#   mean_tpot_ms:ge:100,p99_tpot_ms:ge:150,mean_ttft_ms:ge:5000
+# 空字符串表示关闭硬停止。
+#
+# 重要：硬停止优先级低于 SLA inline 加密。
+# 如果当前点同时命中 SLA 附近加密和 HARD_STOP_RULES，
+# 会先完成“当前 BS -> 下一个基础 BS 之前”的 dense 补点，再停止当前 case。
+HARD_STOP_RULES="${HARD_STOP_RULES:-}"
 # 默认 1=开启 SLA inline 自动加密；设 0 可关闭
 # SLA_DENSE_ENABLE=0 bash this_script.sh
 # SLA 附近连续加密：
@@ -1329,6 +1343,27 @@ for raw in sys.argv[1].split(','):
     except: print(f'[ERROR] SLA target/near 非数字: {raw}',file=sys.stderr); raise SystemExit(1)
 PY2
 
+python3 - "${HARD_STOP_RULES}" <<'PY_STOP_VALIDATE' || exit 1
+import sys
+rules_text=sys.argv[1].strip()
+if not rules_text:
+    raise SystemExit(0)
+valid_ops={"ge","gt","le","lt"}
+for raw in rules_text.split(','):
+    raw=raw.strip()
+    if not raw:
+        continue
+    p=raw.split(':')
+    if len(p)!=3 or not p[0] or p[1] not in valid_ops:
+        print(f'[ERROR] 非法 HARD_STOP_RULES 项: {raw}; 格式应为 metric:ge|gt|le|lt:threshold', file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        float(p[2])
+    except Exception:
+        print(f'[ERROR] HARD_STOP_RULES threshold 非数字: {raw}', file=sys.stderr)
+        raise SystemExit(1)
+PY_STOP_VALIDATE
+
 if [[ ! "${NUM_PROMPTS_MULTIPLIER}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] NUM_PROMPTS_MULTIPLIER 必须是正整数，当前=${NUM_PROMPTS_MULTIPLIER}"
   exit 1
@@ -1347,6 +1382,7 @@ echo "MAX_RUNNING_REQS  : ${MAX_RUNNING_REQUESTS:-0}"
 echo "PARALLEL_CONFIG   : ${PARALLEL_CONFIG:-UNKNOWN}"
 echo "CUDA_GRAPH_BS     : ${CUDA_GRAPH_DECODE_BS:-FALLBACK_DP_LAYOUT}"
 echo "SLA DENSE          : enable=${SLA_DENSE_ENABLE} rules=${SLA_RULES} mode=inline"
+echo "HARD STOP          : rules=${HARD_STOP_RULES:-OFF} (after SLA inline dense)"
 echo "USE_FAKE_PREFILL : ${USE_FAKE_PREFILL}"
 echo "TEST_MODE        : $(get_test_mode_name)"
 echo "FIXED_PER_DP_BS  : ${FIXED_PER_DP_BS:-AUTO}"
@@ -1358,7 +1394,7 @@ echo
 
 
 # ============================================================
-# TPOT=50ms 附近自适应加密
+# SLA 附近自适应加密 + 通用硬停止
 # ============================================================
 
 run_one_bs() {
@@ -1453,7 +1489,7 @@ run_one_bs() {
 
 
 # ============================================================
-# Inline TPOT dense helper
+# Inline SLA dense helper
 # 当前 BS 测完后立即检查 SLA。
 # 任一指标进入 target±near，就把当前 BS 到下一个基础 BS 之间的整数 BS 连续跑完。
 # ============================================================
@@ -1493,6 +1529,75 @@ for raw in rules_text.split(','):
 print(f'[SLA-CHECK] bs={bs} '+' | '.join(states),file=sys.stderr)
 raise SystemExit(0 if hits else 1)
 PY2
+}
+
+# ============================================================
+# 通用硬停止检查
+# HARD_STOP_RULES 格式：metric:op:threshold，多个规则逗号分隔。
+# 任意规则命中返回 0，否则返回 1。
+# 注意：主循环会先处理 SLA inline dense，再根据该返回值决定是否停止。
+# ============================================================
+is_hard_stop_hit() {
+  local current_case="$1"
+  local current_bs="$2"
+  local csv_file="${out_dir}/sum_all.csv"
+  [[ -n "${HARD_STOP_RULES// }" ]] || return 1
+  [[ -s "${csv_file}" ]] || return 1
+
+  python3 - "${csv_file}" "${current_case}" "${current_bs}" "${HARD_STOP_RULES}" <<'PY_STOP'
+import csv, sys, math
+csv_file, case_name, bs_s, rules_text = sys.argv[1:5]
+bs = int(bs_s)
+row = None
+try:
+    with open(csv_file, newline='', encoding='utf-8-sig') as f:
+        for r in csv.DictReader(f):
+            if r.get('case_name') != case_name:
+                continue
+            try:
+                rbs = int(float(r.get('per_dp_bs', '')))
+            except Exception:
+                continue
+            if rbs == bs:
+                row = r
+except OSError:
+    raise SystemExit(1)
+if not row:
+    raise SystemExit(1)
+
+ops = {
+    'ge': lambda v,t: v >= t,
+    'gt': lambda v,t: v > t,
+    'le': lambda v,t: v <= t,
+    'lt': lambda v,t: v < t,
+}
+state=[]
+hits=[]
+for raw in rules_text.split(','):
+    raw=raw.strip()
+    if not raw:
+        continue
+    metric, op, threshold_s = raw.split(':', 2)
+    threshold=float(threshold_s)
+    try:
+        value=float(row.get(metric, ''))
+        if not math.isfinite(value):
+            raise ValueError
+    except Exception:
+        state.append(f'{metric}=NA')
+        continue
+    hit=ops[op](value, threshold)
+    symbol={'ge':'>=','gt':'>','le':'<=','lt':'<'}[op]
+    state.append(f'{metric}={value:.4f} {symbol} {threshold:g} hit={hit}')
+    if hit:
+        hits.append((metric,value,symbol,threshold))
+
+print(f'[HARD-STOP-CHECK] bs={bs} '+' | '.join(state), file=sys.stderr)
+if hits:
+    detail='; '.join(f'{m}={v:.4f} {sym} {t:g}' for m,v,sym,t in hits)
+    print(f'[HARD-STOP-HIT] case={case_name} bs={bs}: {detail}', file=sys.stderr)
+raise SystemExit(0 if hits else 1)
+PY_STOP
 }
 
 # ============================================================
@@ -1542,28 +1647,38 @@ for case_config in "${CASES[@]}"; do
 
   # 单阶段顺序执行：
   # 1) 按 CUDA Graph / fallback / theory 生成的基础 BS 从小到大跑
-  # 2) 每个 BS 跑完立即检查 SLA
-  # 3) 若当前点命中 target±near，则直接连续跑到下一个基础 BS 前一位
-  #    例如基础点 ...18,22,24...，BS18 命中后立即跑 19/20/21，然后继续 22、24...
+  # 2) 每个基础 BS 跑完后，同时判断 SLA-near 与 hard-stop
+  # 3) 若 SLA-near 命中：优先完成当前 BS 到下一个基础 BS 之间的整数 dense 补点
+  # 4) dense 期间如果 hard-stop 命中，只记录，不中途打断 dense
+  # 5) 当前 dense 区间完成后，如任一点命中 hard-stop，再停止当前 case
+  # 6) 若基础 BS 命中 hard-stop 但未触发 dense，则立即停止当前 case
   mapfile -t base_bs_array < <(printf "%s\n" ${bs_list} | awk 'NF' | sort -n)
+  case_hard_stop=0
 
   for ((i=0; i<${#base_bs_array[@]}; i++)); do
     per_dp_bs="${base_bs_array[$i]}"
     run_one_bs "${per_dp_bs}"
 
-    # 最后一个基础点没有“下一个基础点”，无需区间加密。
-    if (( i + 1 >= ${#base_bs_array[@]} )); then
-      continue
+    base_hard_stop=0
+    if is_hard_stop_hit "${case_name}" "${per_dp_bs}"; then
+      base_hard_stop=1
     fi
 
-    if [[ "${SLA_DENSE_ENABLE}" != "1" ]]; then
+    # 最后一个基础点没有“下一个基础点”，无法继续做右侧区间加密。
+    if (( i + 1 >= ${#base_bs_array[@]} )); then
+      if (( base_hard_stop == 1 )); then
+        case_hard_stop=1
+        break
+      fi
       continue
     fi
 
     next_base_bs="${base_bs_array[$((i + 1))]}"
+    dense_triggered=0
 
-    # 当前点 Mean/P99 任一接近目标，立即连续测试到下一个基础点之前。
-    if is_sla_near_target "${case_name}" "${per_dp_bs}"; then
+    # SLA inline 优先于硬停止：若当前点接近 SLA，先完成整个 dense 区间。
+    if [[ "${SLA_DENSE_ENABLE}" == "1" ]] && is_sla_near_target "${case_name}" "${per_dp_bs}"; then
+      dense_triggered=1
       if (( next_base_bs > per_dp_bs + 1 )); then
         echo
         echo "############################################################"
@@ -1571,15 +1686,42 @@ for case_config in "${CASES[@]}"; do
         echo "# Current BS        : ${per_dp_bs}"
         echo "# Next Base BS      : ${next_base_bs}"
         echo "# SLA Rules         : ${SLA_RULES}"
+        echo "# Hard Stop Rules   : ${HARD_STOP_RULES:-OFF}"
         echo "# Dense BS          : $((per_dp_bs + 1)) .. $((next_base_bs - 1))"
+        echo "# Priority          : finish dense first, then hard-stop"
         echo "############################################################"
 
+        dense_hard_stop=0
         for ((dense_bs=per_dp_bs + 1; dense_bs<next_base_bs; dense_bs++)); do
           run_one_bs "${dense_bs}"
+          if is_hard_stop_hit "${case_name}" "${dense_bs}"; then
+            dense_hard_stop=1
+          fi
         done
+
+        if (( base_hard_stop == 1 || dense_hard_stop == 1 )); then
+          case_hard_stop=1
+          break
+        fi
       fi
     fi
+
+    # 未触发 dense 时，基础点命中 hard-stop 就立即停止。
+    if (( dense_triggered == 0 && base_hard_stop == 1 )); then
+      case_hard_stop=1
+      break
+    fi
+
+    # SLA 命中但下一个基础点紧邻、没有可补 dense BS，仍需执行 hard-stop。
+    if (( dense_triggered == 1 && next_base_bs <= per_dp_bs + 1 && base_hard_stop == 1 )); then
+      case_hard_stop=1
+      break
+    fi
   done
+
+  if (( case_hard_stop == 1 )); then
+    echo "[HARD-STOP] ${case_name} 已完成当前 SLA 附近加密（如有），停止后续 BS；继续下一个 case。"
+  fi
 
 done
 
