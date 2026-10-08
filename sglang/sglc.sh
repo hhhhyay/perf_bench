@@ -63,13 +63,14 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
 #   MAX_RUNNING_REQUESTS=20 bash this_script.sh
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 
-# /server_info 自动提取的并行与 CUDA Graph 配置（TP/DP/PP/EP/ACP/KV cache dtype）。
+# /server_info 自动提取的并行与 CUDA Graph 配置（TP/DP/PP/EP/ACP/KV cache dtype/mem_fraction_static）。
 # 若接口不可用，则回退原 DP_SIZE 布局策略。
 TP_SIZE="${TP_SIZE:-}"
 PP_SIZE="${PP_SIZE:-}"
 EP_SIZE="${EP_SIZE:-}"
 ATTN_CP_SIZE="${ATTN_CP_SIZE:-}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
 DP_ATTENTION="${DP_ATTENTION:-}"
 CUDA_GRAPH_DECODE_BS="${CUDA_GRAPH_DECODE_BS:-}"
 PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"
@@ -340,16 +341,19 @@ d=json.load(sys.stdin)
 tp=d.get("tp_size"); dp=d.get("dp_size"); pp=d.get("pp_size"); ep=d.get("ep_size")
 acp=d.get("attn_cp_size"); dpa=d.get("enable_dp_attention")
 kv=d.get("kv_cache_dtype")
+mem=d.get("mem_fraction_static")
+if mem is None and isinstance(d.get("server_args"), dict):
+    mem=d["server_args"].get("mem_fraction_static")
 cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
 def sv(v):
     if isinstance(v,bool): return "true" if v else "false"
     return "" if v is None else str(v)
-print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
+print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
     || true
   )"
 
   if [[ -n "${values}" ]]; then
-    read -r _tp _dp _pp _ep _acp _dpa _kv _cudabs <<< "${values}"
+    read -r _tp _dp _pp _ep _acp _dpa _kv _mem _cudabs <<< "${values}"
     [[ -n "${_tp}" ]] && TP_SIZE="${_tp}"
     [[ -n "${_dp}" ]] && DP_SIZE="${_dp}"
     [[ -n "${_pp}" ]] && PP_SIZE="${_pp}"
@@ -357,11 +361,12 @@ print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),",".join(str(int(x)) fo
     [[ -n "${_acp}" ]] && ATTN_CP_SIZE="${_acp}"
     [[ -n "${_dpa}" ]] && DP_ATTENTION="${_dpa}"
     [[ -n "${_kv}" ]] && KV_CACHE_DTYPE="${_kv}"
+    [[ -n "${_mem}" ]] && MEM_FRACTION_STATIC="${_mem}"
     [[ -n "${_cudabs}" ]] && CUDA_GRAPH_DECODE_BS="${_cudabs}"
 
     local attn_tag
     if [[ "${DP_ATTENTION}" == "true" ]]; then attn_tag="DPA"; else attn_tag="TPA"; fi
-    PARALLEL_CONFIG="TP${TP_SIZE:-NA}-DP${DP_SIZE:-NA}(${attn_tag})-PP${PP_SIZE:-NA}-EP${EP_SIZE:-NA}-ACP${ATTN_CP_SIZE:-NA}-KV${KV_CACHE_DTYPE:-NA}"
+    PARALLEL_CONFIG="TP${TP_SIZE:-NA}-DP${DP_SIZE:-NA}(${attn_tag})-PP${PP_SIZE:-NA}-EP${EP_SIZE:-NA}-ACP${ATTN_CP_SIZE:-NA}-KV${KV_CACHE_DTYPE:-NA}-MEM${MEM_FRACTION_STATIC:-NA}"
 
     echo "[INFO] server_info: ${PARALLEL_CONFIG}"
     if [[ -n "${CUDA_GRAPH_DECODE_BS}" ]]; then
