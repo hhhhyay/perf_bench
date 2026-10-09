@@ -23,9 +23,8 @@ set -uo pipefail
 
 run_id="$(date +%Y%m%d_%H%M%S)"
 out_dir="./all_result/bench_vllm_prefix_salt_${run_id}"
-jsonl_dir="${out_dir}/jsonl"
 log_dir="${out_dir}/logs"
-mkdir -p "${jsonl_dir}" "${log_dir}"
+mkdir -p "${log_dir}"
 STARTUP_READY=0
 
 
@@ -642,7 +641,6 @@ get_bs_list() {
 
 merge_results() {
 python3 - \
-  "${jsonl_dir}" \
   "${log_dir}" \
   "${out_dir}/sum_all.csv" \
   "${KV_TOKENS}" \
@@ -652,28 +650,28 @@ python3 - \
   "${CACHE_MODE}" \
   "${PARALLEL_CONFIG:-UNKNOWN}" \
   "${NUM_PROMPTS_MULTIPLIER}" <<'PY'
-import csv, json, re, sys
+import csv, re, sys
 from pathlib import Path
 
-if len(sys.argv) < 11:
-    raise SystemExit(f"merge_results argv mismatch: expected 10 args, got {len(sys.argv)-1}")
+if len(sys.argv) < 10:
+    raise SystemExit(f"merge_results argv mismatch: expected 9 args, got {len(sys.argv)-1}")
 
-jsonl_dir, log_dir, output_csv = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+log_dir, output_csv = Path(sys.argv[1]), Path(sys.argv[2])
 def to_int_or_none(v):
     try:
         return int(v)
     except (TypeError, ValueError):
         return None
 
-kv_tokens, dp_size = to_int_or_none(sys.argv[4]), to_int_or_none(sys.argv[5])
-max_num_seqs_raw = sys.argv[6].strip()
+kv_tokens, dp_size = to_int_or_none(sys.argv[3]), to_int_or_none(sys.argv[4])
+max_num_seqs_raw = sys.argv[5].strip()
 max_num_seqs = int(max_num_seqs_raw) if max_num_seqs_raw.isdigit() else ""
-run_id, cache_mode = sys.argv[7], sys.argv[8]
-parallel_config = sys.argv[9]
-num_prompts_multiplier = int(sys.argv[10])
+run_id, cache_mode = sys.argv[6], sys.argv[7]
+parallel_config = sys.argv[8]
+num_prompts_multiplier = int(sys.argv[9])
 
 pattern = re.compile(
-    r"(?P<case>.+?)_in(?P<input>\d+)_out(?P<output>\d+)_perdp(?P<perdp>\d+)_global(?P<global>\d+)\.(?:log|json)$"
+    r"(?P<case>.+?)_in(?P<input>\d+)_out(?P<output>\d+)_perdp(?P<perdp>\d+)_global(?P<global>\d+)\.log$"
 )
 
 
@@ -761,6 +759,71 @@ def parse_percentiles_from_log(log_path):
     return out
 
 
+def parse_scalar(value):
+    value = value.strip()
+    if value.lower() in {"inf", "+inf", "-inf", "nan", "none", "null", "n/a"}:
+        return value
+    try:
+        if re.fullmatch(r"[-+]?\d+", value):
+            return int(value)
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", value):
+            return float(value)
+    except ValueError:
+        pass
+    return value
+
+
+def normalize_log_key(label):
+    key = label.strip().lower()
+    key = key.replace("%", "percent")
+    key = re.sub(r"\(req/s\)", "", key)
+    key = re.sub(r"\(tok/s\)", "", key)
+    key = re.sub(r"\(ms\)", "_ms", key)
+    key = re.sub(r"\(s\)", "_s", key)
+    key = re.sub(r"[^a-z0-9]+", "_", key)
+    return re.sub(r"_+", "_", key).strip("_")
+
+
+def parse_summary_from_log(log_path):
+    """解析 vLLM benchmark 的完整 Label: value 汇总，而不依赖结果 JSON。"""
+    result = {}
+    if not log_path.exists():
+        return result
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return result
+
+    aliases = {
+        "input_token_throughput": "input_throughput",
+        "output_token_throughput": "output_throughput",
+        "total_token_throughput": "total_throughput",
+        "peak_output_token_throughput": "peak_output_throughput",
+        "peak_concurrent_requests": "peak_concurrency",
+        "mean_e2el_ms": "mean_e2e_latency_ms",
+    }
+    known_prefixes = (
+        "successful_requests", "completed", "benchmark_duration", "duration_s",
+        "total_input", "total_generated", "request_throughput", "input_token",
+        "output_token", "total_token", "peak_output", "peak_concurrency",
+        "concurrency", "max_", "mean_", "median_", "p50_", "p75_", "p90_",
+        "p95_", "p99_", "p999_", "max_", "accept_length", "request_rate",
+    )
+    for raw_line in lines:
+        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_line).strip()
+        match = re.match(r"^(.+?)\s*:\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        key = normalize_log_key(match.group(1).strip(" -="))
+        if not key or not key.startswith(known_prefixes):
+            continue
+        key = aliases.get(key, key)
+        result[key] = parse_scalar(match.group(2))
+
+    result.update(parse_percentiles_from_log(log_path))
+    return result
+
+
 def normalize_row(row, log_path=None):
     # ========================================================
     # 标准字段 alias：与 SGLang CSV 口径对齐
@@ -798,6 +861,10 @@ def normalize_row(row, log_path=None):
 
     row["rps"] = first_present(
         row, "rps", "request_throughput", "request_throughput_req_s"
+    )
+    row["input_throughput_tok_s"] = first_present(
+        row, "input_throughput_tok_s",
+        "input_throughput", "input_token_throughput"
     )
     row["generate_throughput_tok_s"] = first_present(
         row, "generate_throughput_tok_s",
@@ -887,7 +954,6 @@ for log_path in sorted(log_dir.glob("*.log")):
     global_c = int(m.group("global"))
     case_name = m.group("case")
 
-    json_path = jsonl_dir / (log_path.stem + ".json")
     time_path = Path(str(log_path) + ".time")
     exit_path = Path(str(log_path) + ".exitcode")
 
@@ -940,38 +1006,10 @@ for log_path in sorted(log_dir.glob("*.log")):
         else ("FAIL" if row.get("case_exit_code") not in ("", None) else "UNKNOWN")
     )
 
-    if json_path.exists():
-        try:
-            text = json_path.read_text(encoding="utf-8", errors="replace").strip()
-            obj = None
-            try:
-                obj = json.loads(text)
-            except json.JSONDecodeError:
-                for line in text.splitlines()[::-1]:
-                    if not line.strip():
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if isinstance(v, (str, int, float, bool, list, dict)) or v is None:
-                        # keep percentile lists for later extraction; skip huge arrays
-                        if isinstance(v, list) and k in {
-                            "ttfts", "itls", "tpots", "latencies",
-                            "input_lens", "output_lens", "errors",
-                            "generated_texts", "start_times",
-                        }:
-                            continue
-                        row[k] = v
-        except Exception:
-            pass
+    row.update(parse_summary_from_log(log_path))
 
     row = normalize_row(row, log_path)
     row["log_file"] = log_path.name
-    row["json_file"] = json_path.name
     rows.append(row)
 
 # ============================================================
@@ -999,6 +1037,7 @@ preferred = [
     "request_rate",
     "duration_s",
     "rps",
+    "input_throughput_tok_s",
     "generate_throughput_tok_s",
     "total_throughput_tok_s",
     "mean_ttft_ms",
@@ -1035,6 +1074,8 @@ duplicate_aliases = {
     "request_throughput",
     "request_throughput_req_s",
     "traffic_request_rate",
+    "input_throughput",
+    "input_token_throughput",
     "output_throughput",
     "output_throughput_tok_s",
     "total_token_throughput",
@@ -1045,13 +1086,14 @@ duplicate_aliases = {
 
 hidden_columns = {
     "backend", "model", "random_input_len", "random_output_len",
-    "request_throughput", "output_throughput", "total_token_throughput",
+    "request_throughput", "input_throughput", "input_token_throughput",
+    "output_throughput", "total_token_throughput",
     "mean_ttft", "median_ttft", "p95_ttft", "p99_ttft",
     "mean_tpot", "median_tpot", "p95_tpot", "p99_tpot",
     "mean_itl", "median_itl", "p95_itl", "p99_itl",
     "mean_e2el", "median_e2el", "p95_e2el", "p99_e2el",
     "dp_size", "global_concurrency", "bs_vs_theory_ratio",
-    "start_time", "end_time", "elapsed_s", "log_file", "json_file",
+    "start_time", "end_time", "elapsed_s", "log_file",
     "ttfts", "itls", "tpots", "latencies",
     "input_lens", "output_lens", "errors",
     "generated_texts", "start_times",
@@ -1165,10 +1207,10 @@ case_result_exists() {
   local per_dp_bs="$2"
   local global_concurrency=$((DP_SIZE * per_dp_bs))
   local base_name="${current_case}_in${input_len}_out${output_len}_perdp${per_dp_bs}_global${global_concurrency}"
-  local result_file="${jsonl_dir}/${base_name}.json"
+  local log_file="${log_dir}/${base_name}.log"
   local exit_file="${log_dir}/${base_name}.log.exitcode"
 
-  [[ -s "${result_file}" && -f "${exit_file}" ]] || return 1
+  [[ -s "${log_file}" && -f "${exit_file}" ]] || return 1
   [[ "$(tr -d '[:space:]' < "${exit_file}" 2>/dev/null)" == "0" ]]
 }
 
@@ -1179,7 +1221,6 @@ run_one_bs() {
   local warmup_requests="${WARMUP_REQUESTS:-0}"
 
   local base_name="${case_name}_in${input_len}_out${output_len}_perdp${per_dp_bs}_global${global_concurrency}"
-  local result_file="${jsonl_dir}/${base_name}.json"
   local log_file="${log_dir}/${base_name}.log"
   local exit_file="${log_file}.exitcode"
 
@@ -1206,7 +1247,6 @@ run_one_bs() {
   echo "Max Num Seqs       : ${MAX_NUM_SEQS:-N/A}"
   echo "Start Time         : ${bs_start_time}"
   echo "LOG                : ${log_file}"
-  echo "JSON               : ${result_file}"
   echo "Cache Mode         : ${CACHE_MODE}"
   echo "Cache Salt         : ${cache_salt}"
   echo "============================================================"
@@ -1229,10 +1269,6 @@ run_one_bs() {
       --ignore-eos \
       --percentile-metrics "${PERCENTILE_METRICS}" \
       --metric-percentiles "${METRIC_PERCENTILES}" \
-      --save-result \
-      --save-detailed \
-      --result-dir "${jsonl_dir}" \
-      --result-filename "${base_name}.json" \
       --disable-tqdm \
       --extra-body "{\"cache_salt\":\"${cache_salt}\"}" \
       2>&1 | tee "${log_file}"

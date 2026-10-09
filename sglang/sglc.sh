@@ -12,7 +12,7 @@
 #    自动 BS 扫描围绕最终 effective theoretical BS，而不是只围绕 KV token 理论值。
 # 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory 前侧加密点（不超过 theory）与 SLA inline 连续加密
 # 5) 支持 mean_tpot_ms 硬停止阈值；达到阈值立即停止当前 case 后续 BS
-# 6) 汇总 jsonl + log -> sum_all.csv
+# 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL
 # ============================================================
 
 set -uo pipefail
@@ -24,10 +24,8 @@ set -uo pipefail
 run_id="$(date +%Y%m%d_%H%M%S)"
 
 out_dir="./all_result/bench_theory_bs_${run_id}"
-jsonl_dir="${out_dir}/jsonl"
 log_dir="${out_dir}/logs"
 
-mkdir -p "${jsonl_dir}"
 mkdir -p "${log_dir}"
 
 # 是否生成 Excel 版汇总。
@@ -669,14 +667,13 @@ get_bs_list() {
 }
 
 # ============================================================
-# 9. 汇总 LOG + JSONL -> sum_all.csv
+# 9. 汇总 LOG -> sum_all.csv
 # CSV 理论 BS 仅保留：token_theoretical_per_dp_bs / effective_theoretical_per_dp_bs
 # ============================================================
 
 merge_results() {
 
 python3 - \
-  "${jsonl_dir}" \
   "${log_dir}" \
   "${out_dir}/sum_all.csv" \
   "${MAX_TOTAL_TOKENS}" \
@@ -686,20 +683,18 @@ python3 - \
   "${PARALLEL_CONFIG:-UNKNOWN}" <<'PY'
 
 import csv
-import json
 import math
 import re
 import sys
 from pathlib import Path
 
-jsonl_dir = Path(sys.argv[1])
-log_dir = Path(sys.argv[2])
-output_csv = Path(sys.argv[3])
-max_total_tokens = int(sys.argv[4])
-dp_size = int(sys.argv[5])
-max_running_requests = int(sys.argv[6])
-num_prompts_multiplier = int(sys.argv[7])
-parallel_config = sys.argv[8]
+log_dir = Path(sys.argv[1])
+output_csv = Path(sys.argv[2])
+max_total_tokens = int(sys.argv[3])
+dp_size = int(sys.argv[4])
+max_running_requests = int(sys.argv[5])
+num_prompts_multiplier = int(sys.argv[6])
+parallel_config = sys.argv[7]
 
 pattern = re.compile(
     r"(?P<case>.+?)"
@@ -707,7 +702,7 @@ pattern = re.compile(
     r"_out(?P<output>\d+)"
     r"_perdp(?P<perdp>\d+)"
     r"_global(?P<global>\d+)"
-    r"\.(?:log|jsonl)$"
+    r"\.log$"
 )
 
 SPECIAL_KEYS = {
@@ -888,83 +883,6 @@ def parse_log(path):
     return result, True
 
 
-def parse_jsonl(path):
-    result = {}
-    if not path.exists():
-        return result
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return result
-
-    records = []
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            records.append(obj)
-        elif isinstance(obj, list):
-            records.extend(x for x in obj if isinstance(x, dict))
-    except json.JSONDecodeError:
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                records.append(obj)
-
-    if not records:
-        return result
-
-    obj = records[-1]
-    for key, value in obj.items():
-        if value is None or isinstance(value, (str, int, float, bool)):
-            result[normalize_key(key)] = value
-
-    latencies = obj.get("latencies") or obj.get("e2e_latencies") or obj.get("request_latencies")
-    if latencies:
-        add_stats(result, "e2e_latency", latencies, 1000.0)
-
-    ttfts = obj.get("ttfts") or obj.get("raw_ttfts")
-    if ttfts:
-        add_stats(result, "ttft", ttfts, 1000.0)
-
-    itls = obj.get("itls") or obj.get("raw_itls")
-    if itls:
-        add_stats(result, "itl", itls, 1000.0)
-
-    tpots = obj.get("tpots") or obj.get("raw_tpots")
-    if tpots:
-        add_stats(result, "tpot", tpots, 1000.0)
-    elif latencies and ttfts and obj.get("output_lens"):
-        flat_latency, flat_ttft, flat_out = [], [], []
-
-        def flatten(v, target):
-            if isinstance(v, list):
-                for x in v:
-                    flatten(x, target)
-            elif isinstance(v, (int, float)):
-                target.append(float(v))
-
-        flatten(latencies, flat_latency)
-        flatten(ttfts, flat_ttft)
-        flatten(obj["output_lens"], flat_out)
-        if len(flat_latency) == len(flat_ttft) == len(flat_out):
-            calculated = []
-            for latency, ttft, outlen in zip(flat_latency, flat_ttft, flat_out):
-                if outlen <= 1:
-                    continue
-                value = (latency - ttft) / (outlen - 1)
-                if value >= 0:
-                    calculated.append(value)
-            if calculated:
-                add_stats(result, "tpot", calculated, 1000.0)
-
-    return result
-
-
 def read_exit_code(log_path):
     path = Path(str(log_path) + ".exitcode")
     if not path.exists():
@@ -1025,13 +943,9 @@ rows = []
 for input_len, output_len, perdp, log_path, match in log_files:
     case_name = match.group("case")
     global_concurrency = int(match.group("global"))
-    jsonl_path = jsonl_dir / (log_path.stem + ".jsonl")
-
-    json_result = parse_jsonl(jsonl_path)
     log_result, found_result = parse_log(log_path)
 
     row = {}
-    row.update(json_result)
     row.update(log_result)
 
     tokens_per_request = input_len + output_len
@@ -1225,8 +1139,6 @@ duplicate_aliases = {
     "start_time": "trace_only",
     "end_time": "trace_only",
     "log_file": "trace_only",
-    "json_file": "trace_only",
-    "jsonl_file": "trace_only",
     "source_file": "trace_only",
     "theoretical_per_dp_bs": "effective_theoretical_per_dp_bs",
     "bs_vs_theory_ratio": "hidden_theory",
@@ -1244,8 +1156,6 @@ hidden_columns = {
     "end_time",
     "elapsed_s",
     "log_file",
-    "json_file",
-    "jsonl_file",
     "source_file",
     "backend",
     "traffic_request_rate",
@@ -1318,7 +1228,6 @@ on_exit() {
   merge_results || true
   echo
   echo "结果目录：${out_dir}"
-  echo "JSONL   ：${jsonl_dir}"
   echo "LOG     ：${log_dir}"
   echo "CSV     ：${out_dir}/sum_all.csv"
   exit "${exit_code}"
@@ -1413,12 +1322,11 @@ run_one_bs() {
   fi
 
   local base_name="${case_name}_in${input_len}_out${output_len}_perdp${per_dp_bs}_global${global_concurrency}"
-  local output_file="${jsonl_dir}/${base_name}.jsonl"
   local log_file="${log_dir}/${base_name}.log"
   local exit_file="${log_file}.exitcode"
 
   # 已有成功结果则跳过，方便续跑/补点。
-  if [[ -s "${output_file}" && -f "${exit_file}" ]] && [[ "$(cat "${exit_file}" 2>/dev/null)" == "0" ]]; then
+  if [[ -s "${log_file}" && -f "${exit_file}" ]] && [[ "$(cat "${exit_file}" 2>/dev/null)" == "0" ]]; then
     echo "[SKIP] 已完成 ${case_name} per_dp_bs=${per_dp_bs}"
     return 0
   fi
@@ -1440,7 +1348,6 @@ run_one_bs() {
   echo "Num Prompts        : ${num_prompts} (${global_concurrency} x ${NUM_PROMPTS_MULTIPLIER})"
   echo "Warmup Requests    : ${warmup_requests}"
   echo "Start Time         : ${bs_start_time}"
-  echo "JSONL              : ${output_file}"
   echo "LOG                : ${log_file}"
   echo "============================================================"
   echo
@@ -1459,8 +1366,6 @@ run_one_bs() {
     --request-rate inf
     --max-concurrency "${global_concurrency}"
     --warmup-requests "${warmup_requests}"
-    --output-details
-    --output-file "${output_file}"
     --disable-tqdm
   )
 
@@ -1743,9 +1648,6 @@ echo "============================================================"
 echo
 echo "结果目录："
 echo "${out_dir}"
-echo
-echo "JSONL："
-echo "${jsonl_dir}"
 echo
 echo "Client LOG："
 echo "${log_dir}"

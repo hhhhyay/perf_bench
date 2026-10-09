@@ -21,6 +21,7 @@ perf_bench/
 - 自动读取 `/server_info` 中的 TP / DP / PP / EP / ACP / KV cache dtype / CUDA Graph decode BS。
 - 理论 per-DP BS 同时受 KV token capacity 和 `max_running_requests` 约束。
 - 支持 `SLA_RULES` inline 加密扫描：当当前 BS 命中任一 SLA 规则后，连续补测到下一个基础 BS 前。
+- 直接从 benchmark 日志提取 RPS、Token 吞吐、请求数、耗时和时延分位数，不保存逐请求 JSONL。
 
 ### vLLM: `vllm/vllmc.sh`
 
@@ -29,6 +30,12 @@ perf_bench/
 - CSV 前置常用指标与 SGLang 脚本口径对齐。
 - 理论 BS = `min(token theory, max_num_seqs)`；如果无法获取 `max_num_seqs`，退回 token theory。
 - 支持与 SGLang 相同的 `SLA_RULES` inline 加密扫描。
+- 直接从 vLLM benchmark 日志提取 RPS、Token 吞吐、请求数、耗时、平均时延和分位数，不保存结果 JSON。
+
+## 长度口径
+
+脚本中的 `CASES` 使用二进制 K，默认 `1K = 1024 tokens`。例如 `"4 1"` 表示输入
+`4096 tokens`、输出 `1024 tokens`；`"1024 1"` 表示输入 `1M tokens`、输出 `1K tokens`。
 
 ## 快速运行
 
@@ -91,9 +98,8 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 
 ## 输出
 
-脚本会在当前目录生成 `all_result/` 子目录，每次运行一个独立结果目录，通常包含：
+脚本会在当前目录生成 `all_result/` 子目录，每次运行一个独立结果目录，包含：
 
-- `jsonl/`：原始 benchmark 输出。
 - `logs/`：每个 case / BS 的执行日志。
 - `sum_all.csv`：汇总后的核心指标表。
 
