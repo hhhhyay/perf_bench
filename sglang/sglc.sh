@@ -13,6 +13,7 @@
 # 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory 前侧加密点（不超过 theory）与 SLA inline 连续加密
 # 5) 支持 mean_tpot_ms 硬停止阈值；达到阈值立即停止当前 case 后续 BS
 # 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL
+# 7) K 口径由 TOKEN_UNIT 控制，默认 1024；可设为 1000 使用十进制 K
 # ============================================================
 
 set -uo pipefail
@@ -131,14 +132,21 @@ FIXED_CONCURRENCY="${FIXED_CONCURRENCY:-}"
 #   NUM_PROMPTS_MULTIPLIER=4 bash this_script.sh
 NUM_PROMPTS_MULTIPLIER="${NUM_PROMPTS_MULTIPLIER:-1}"
 
+# K 的 token 定义：默认 1K=1024，可用 TOKEN_UNIT=1000 切换为十进制口径。
+TOKEN_UNIT="${TOKEN_UNIT:-1024}"
+if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] TOKEN_UNIT 必须是正整数，当前为: ${TOKEN_UNIT}" >&2
+  exit 1
+fi
+
 
 
 # ============================================================
-# 3. Input / Output（单位：K）
+# 3. Input / Output（单位：K，可使用小数）
 #
-# 4 1    => 4K in / 1K out   → theory = 258304 / 5 / 1024 ≈ 50.45
-# 64 16  => 64K / 16K
-# 1024 1 => 1M / 1K
+# 4 1      => 4K in / 1K out
+# 0.5 1    => 默认 512 in / 1024 out
+# 1024 1   => 默认 1M in / 1K out
 # ============================================================
 
 CASES=(
@@ -425,13 +433,24 @@ load_server_capacity() {
 format_k_name() {
   local value="$1"
 
-  if (( value == 1024 )); then
-    echo "1m"
-  elif (( value > 1024 && value % 1024 == 0 )); then
-    echo "$((value / 1024))m"
-  else
-    echo "${value}k"
-  fi
+  awk -v value="${value}" -v unit="${TOKEN_UNIT}" 'BEGIN {
+    scaled = value / unit
+    rounded = int(scaled + 0.5)
+    if (value >= unit && scaled == rounded) {
+      printf "%gm", scaled
+    } else {
+      printf "%gk", value
+    }
+  }'
+}
+
+tokens_from_k() {
+  local value="$1"
+  awk -v value="${value}" -v unit="${TOKEN_UNIT}" 'BEGIN {
+    tokens = value * unit
+    if (tokens < 1) exit 1
+    printf "%.0f", tokens
+  }'
 }
 
 
@@ -536,7 +555,7 @@ get_test_mode_name() {
 # 7. 理论 BS
 #
 # token_theoretical_per_dp_bs =
-#   MAX_TOTAL_TOKENS / ((input_k + output_k) * 1024)
+#   MAX_TOTAL_TOKENS / ((input_k + output_k) * TOKEN_UNIT)
 #
 # request_limit_per_dp_bs =
 #   MAX_RUNNING_REQUESTS
@@ -555,9 +574,10 @@ get_token_theoretical_bs() {
     -v max_tokens="${MAX_TOTAL_TOKENS}" \
     -v input_k="${input_k}" \
     -v output_k="${output_k}" \
+    -v token_unit="${TOKEN_UNIT}" \
     'BEGIN {
       printf "%.3f",
-      max_tokens / ((input_k + output_k) * 1024)
+      max_tokens / ((input_k + output_k) * token_unit)
     }'
 }
 
@@ -610,8 +630,10 @@ get_bs_list() {
   local input_k="$1"
   local output_k="$2"
 
-  local tokens_per_request theoretical_floor scan_max bs delta
-  tokens_per_request=$(((input_k + output_k) * 1024))
+  local input_tokens output_tokens tokens_per_request theoretical_floor scan_max bs delta
+  input_tokens="$(tokens_from_k "${input_k}")" || return 1
+  output_tokens="$(tokens_from_k "${output_k}")" || return 1
+  tokens_per_request=$((input_tokens + output_tokens))
   theoretical_floor=$((MAX_TOTAL_TOKENS / tokens_per_request))
 
   if [[ "${MAX_RUNNING_REQUESTS:-0}" =~ ^[0-9]+$ ]] && (( MAX_RUNNING_REQUESTS > 0 )); then
@@ -680,7 +702,8 @@ python3 - \
   "${DP_SIZE}" \
   "${MAX_RUNNING_REQUESTS}" \
   "${NUM_PROMPTS_MULTIPLIER}" \
-  "${PARALLEL_CONFIG:-UNKNOWN}" <<'PY'
+  "${PARALLEL_CONFIG:-UNKNOWN}" \
+  "${TOKEN_UNIT}" <<'PY'
 
 import csv
 import math
@@ -695,6 +718,7 @@ dp_size = int(sys.argv[4])
 max_running_requests = int(sys.argv[5])
 num_prompts_multiplier = int(sys.argv[6])
 parallel_config = sys.argv[7]
+token_unit = int(sys.argv[8])
 
 pattern = re.compile(
     r"(?P<case>.+?)"
@@ -967,8 +991,9 @@ for input_len, output_len, perdp, log_path, match in log_files:
     row["case_name"] = case_name
     row["input_len"] = input_len
     row["output_len"] = output_len
-    row["input_k"] = input_len / 1024
-    row["output_k"] = output_len / 1024
+    row["input_k"] = input_len / token_unit
+    row["output_k"] = output_len / token_unit
+    row["token_unit"] = token_unit
     row["parallel_config"] = parallel_config
     row["max_total_tokens"] = max_total_tokens
     row["max_running_requests"] = max_running_requests if max_running_requests > 0 else ""
@@ -1021,6 +1046,7 @@ preferred_columns = [
     "output_len",
     "input_k",
     "output_k",
+    "token_unit",
     "parallel_config",
     "max_running_requests",
     "max_total_tokens",
@@ -1293,6 +1319,7 @@ echo "MODEL            : ${MODEL}"
 echo "DP_SIZE          : ${DP_SIZE}"
 echo "MAX_TOTAL_TOKENS : ${MAX_TOTAL_TOKENS}"
 echo "MAX_RUNNING_REQS  : ${MAX_RUNNING_REQUESTS:-0}"
+echo "TOKEN_UNIT        : ${TOKEN_UNIT}"
 echo "PARALLEL_CONFIG   : ${PARALLEL_CONFIG:-UNKNOWN}"
 echo "CUDA_GRAPH_BS     : ${CUDA_GRAPH_DECODE_BS:-FALLBACK_DP_LAYOUT}"
 echo "SLA DENSE          : enable=${SLA_DENSE_ENABLE} rules=${SLA_RULES} mode=inline"
@@ -1517,8 +1544,12 @@ PY_STOP
 for case_config in "${CASES[@]}"; do
   read -r input_k output_k <<< "${case_config}"
 
-  input_len=$((input_k * 1024))
-  output_len=$((output_k * 1024))
+  if ! [[ "${input_k}" =~ ^[0-9]+([.][0-9]+)?$ && "${output_k}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "[ERROR] CASE 输入/输出必须是正数或小数: ${case_config}" >&2
+    exit 1
+  fi
+  input_len="$(tokens_from_k "${input_k}")" || { echo "[ERROR] 无法转换输入长度: ${input_k}K" >&2; exit 1; }
+  output_len="$(tokens_from_k "${output_k}")" || { echo "[ERROR] 无法转换输出长度: ${output_k}K" >&2; exit 1; }
   input_name="$(format_k_name "${input_k}")"
   output_name="$(format_k_name "${output_k}")"
   case_name="${input_name}_${output_name}"
@@ -1535,8 +1566,8 @@ for case_config in "${CASES[@]}"; do
   echo
   echo "############################################################"
   echo "# CASE              : ${case_name}"
-  echo "# Input             : ${input_k}K = ${input_len}"
-  echo "# Output            : ${output_k}K = ${output_len}"
+  echo "# Input             : ${input_k}K(${TOKEN_UNIT}) = ${input_len}"
+  echo "# Output            : ${output_k}K(${TOKEN_UNIT}) = ${output_len}"
   echo "# Tokens / Request  : ${tokens_per_request}"
   echo "# DP Size           : ${DP_SIZE}"
   echo "# Max Total Tokens  : ${MAX_TOTAL_TOKENS}"

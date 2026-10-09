@@ -34,8 +34,10 @@ perf_bench/
 
 ## 长度口径
 
-脚本中的 `CASES` 使用二进制 K，默认 `1K = 1024 tokens`。例如 `"4 1"` 表示输入
-`4096 tokens`、输出 `1024 tokens`；`"1024 1"` 表示输入 `1M tokens`、输出 `1K tokens`。
+脚本中的 `CASES` 默认使用二进制 K，即 `TOKEN_UNIT=1024`。例如 `"4 1"` 表示输入
+`4096 tokens`、输出 `1024 tokens`；`"0.5 1"` 表示输入 `512 tokens`、输出 `1024 tokens`。
+需要十进制口径时设置 `TOKEN_UNIT=1000`，此时 `"1 1"` 表示输入和输出各 `1000 tokens`。
+小数换算后会四舍五入为整数 token；`TOKEN_UNIT` 会写入 `sum_all.csv`，用于区分两种结果。
 
 ## 快速运行
 
@@ -71,6 +73,7 @@ bash vllm/vllmc.sh
 | `DP_SIZE` | 手动指定 DP 数；通常由脚本自动识别。 |
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
+| `TOKEN_UNIT` | K 的 token 定义，默认 `1024`；设为 `1000` 使用十进制 K。 |
 
 `SLA_RULES` 示例：
 

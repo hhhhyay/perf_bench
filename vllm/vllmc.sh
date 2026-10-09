@@ -36,6 +36,11 @@ BASE_URL="${BASE_URL:-http://12.12.12.108:8332}"
 SERVER_INFO_URL="${SERVER_INFO_URL:-${BASE_URL%/}/server_info}"
 SERVER_LOG="${SERVER_LOG:-}"   # 可选：vLLM 服务端启动日志路径，用于提取 max_num_seqs 等未暴露配置
 MODEL="${MODEL:-/model/Qwen3-8B}"
+TOKEN_UNIT="${TOKEN_UNIT:-1024}"
+if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] TOKEN_UNIT 必须是正整数，当前为: ${TOKEN_UNIT}" >&2
+  exit 1
+fi
 CACHE_MODE="prefix_salt_no_flush"
 
 SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-1}"
@@ -102,7 +107,7 @@ PERCENTILE_METRICS="${PERCENTILE_METRICS:-ttft,tpot,itl,e2el}"
 
 
 # ============================================================
-# Input / Output（单位 K）
+# Input / Output（单位 K，可使用小数）
 # ============================================================
 
 CASES=(
@@ -529,20 +534,32 @@ get_test_bs_list() {
 
 format_k_name() {
   local value="$1"
-  if (( value == 1024 )); then
-    echo "1m"
-  elif (( value > 1024 && value % 1024 == 0 )); then
-    echo "$((value / 1024))m"
-  else
-    echo "${value}k"
-  fi
+  awk -v value="${value}" -v unit="${TOKEN_UNIT}" 'BEGIN {
+    scaled = value / unit
+    rounded = int(scaled + 0.5)
+    if (value >= unit && scaled == rounded) {
+      printf "%gm", scaled
+    } else {
+      printf "%gk", value
+    }
+  }'
+}
+
+tokens_from_k() {
+  local value="$1"
+  awk -v value="${value}" -v unit="${TOKEN_UNIT}" 'BEGIN {
+    tokens = value * unit
+    if (tokens < 1) exit 1
+    printf "%.0f", tokens
+  }'
 }
 
 get_token_theoretical_bs() {
   local input_k="$1"
   local output_k="$2"
   awk -v max_tokens="${KV_TOKENS}" -v input_k="${input_k}" -v output_k="${output_k}" \
-    'BEGIN { printf "%.3f", max_tokens / ((input_k + output_k) * 1024) }'
+    -v token_unit="${TOKEN_UNIT}" \
+    'BEGIN { printf "%.3f", max_tokens / ((input_k + output_k) * token_unit) }'
 }
 
 get_theoretical_bs() {
@@ -570,7 +587,9 @@ get_bs_list() {
   local bs
   local delta
 
-  tokens_per_request=$(((input_k + output_k) * 1024))
+  input_tokens="$(tokens_from_k "${input_k}")" || return 1
+  output_tokens="$(tokens_from_k "${output_k}")" || return 1
+  tokens_per_request=$((input_tokens + output_tokens))
   token_floor=$((KV_TOKENS / tokens_per_request))
   theoretical_floor="${token_floor}"
 
@@ -649,12 +668,13 @@ python3 - \
   "${run_id}" \
   "${CACHE_MODE}" \
   "${PARALLEL_CONFIG:-UNKNOWN}" \
-  "${NUM_PROMPTS_MULTIPLIER}" <<'PY'
+  "${NUM_PROMPTS_MULTIPLIER}" \
+  "${TOKEN_UNIT}" <<'PY'
 import csv, re, sys
 from pathlib import Path
 
-if len(sys.argv) < 10:
-    raise SystemExit(f"merge_results argv mismatch: expected 9 args, got {len(sys.argv)-1}")
+if len(sys.argv) < 11:
+    raise SystemExit(f"merge_results argv mismatch: expected 10 args, got {len(sys.argv)-1}")
 
 log_dir, output_csv = Path(sys.argv[1]), Path(sys.argv[2])
 def to_int_or_none(v):
@@ -669,6 +689,7 @@ max_num_seqs = int(max_num_seqs_raw) if max_num_seqs_raw.isdigit() else ""
 run_id, cache_mode = sys.argv[6], sys.argv[7]
 parallel_config = sys.argv[8]
 num_prompts_multiplier = int(sys.argv[9])
+token_unit = int(sys.argv[10])
 
 pattern = re.compile(
     r"(?P<case>.+?)_in(?P<input>\d+)_out(?P<output>\d+)_perdp(?P<perdp>\d+)_global(?P<global>\d+)\.log$"
@@ -961,8 +982,9 @@ for log_path in sorted(log_dir.glob("*.log")):
         "case_name": case_name,
         "input_len": input_len,
         "output_len": output_len,
-        "input_k": input_len / 1024,
-        "output_k": output_len / 1024,
+        "input_k": input_len / token_unit,
+        "output_k": output_len / token_unit,
+        "token_unit": token_unit,
         "parallel_config": parallel_config,
         "kv_tokens": kv_tokens,
         "max_num_seqs": max_num_seqs,
@@ -1022,6 +1044,7 @@ preferred = [
     "output_len",
     "input_k",
     "output_k",
+    "token_unit",
     "parallel_config",
     "max_num_seqs",
     "max_total_tokens",
@@ -1345,6 +1368,7 @@ echo "Benchmark Configuration"
 echo "============================================================"
 echo "BASE_URL   : ${BASE_URL}"
 echo "MODEL      : ${MODEL}"
+echo "TOKEN_UNIT : ${TOKEN_UNIT}"
 echo "DP_SIZE      : ${DP_SIZE}"
 echo "MAX_NUM_SEQS : ${MAX_NUM_SEQS:-N/A}"
 echo "KV_TOKENS    : ${KV_TOKENS}"
@@ -1366,8 +1390,12 @@ echo
 for case_config in "${CASES[@]}"; do
   read -r input_k output_k <<< "${case_config}"
 
-  input_len=$((input_k * 1024))
-  output_len=$((output_k * 1024))
+  if ! [[ "${input_k}" =~ ^[0-9]+([.][0-9]+)?$ && "${output_k}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "[ERROR] CASE 输入/输出必须是正数或小数: ${case_config}" >&2
+    exit 1
+  fi
+  input_len="$(tokens_from_k "${input_k}")" || { echo "[ERROR] 无法转换输入长度: ${input_k}K" >&2; exit 1; }
+  output_len="$(tokens_from_k "${output_k}")" || { echo "[ERROR] 无法转换输出长度: ${output_k}K" >&2; exit 1; }
   case_name="$(format_k_name "${input_k}")_$(format_k_name "${output_k}")"
   tokens_per_request=$((input_len + output_len))
   token_theoretical_bs="$(get_token_theoretical_bs "${input_k}" "${output_k}")"
