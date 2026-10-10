@@ -37,7 +37,7 @@ perf_bench/
 脚本中的 `CASES` 默认使用二进制 K，即 `TOKEN_UNIT=1024`。例如 `"4 1"` 表示输入
 `4096 tokens`、输出 `1024 tokens`；`"0.5 1"` 表示输入 `512 tokens`、输出 `1024 tokens`。
 需要十进制口径时设置 `TOKEN_UNIT=1000`，此时 `"1 1"` 表示输入和输出各 `1000 tokens`。
-小数换算后会四舍五入为整数 token；`TOKEN_UNIT` 会写入 `sum_all.csv`，用于区分两种结果。
+小数换算后会四舍五入为整数 token；结果可根据 `input_len/output_len` 与 `input_k/output_k` 判断实际口径。
 
 ## 快速运行
 

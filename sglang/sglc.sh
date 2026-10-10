@@ -993,7 +993,6 @@ for input_len, output_len, perdp, log_path, match in log_files:
     row["output_len"] = output_len
     row["input_k"] = input_len / token_unit
     row["output_k"] = output_len / token_unit
-    row["token_unit"] = token_unit
     row["parallel_config"] = parallel_config
     row["max_total_tokens"] = max_total_tokens
     row["max_running_requests"] = max_running_requests if max_running_requests > 0 else ""
@@ -1046,7 +1045,6 @@ preferred_columns = [
     "output_len",
     "input_k",
     "output_k",
-    "token_unit",
     "parallel_config",
     "max_running_requests",
     "max_total_tokens",
