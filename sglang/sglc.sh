@@ -75,7 +75,7 @@ CUDA_GRAPH_DECODE_BS="${CUDA_GRAPH_DECODE_BS:-}"
 PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"
 
 # Mean TPOT 接近该值时，在相邻 BS 区间自动补点。
-SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-1}"
+SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-0}"
 # 通用 SLA 规则：metric:target:near，多个规则用逗号分隔
 # 例如：mean_tpot_ms:30:2,p99_tpot_ms:75:5,mean_ttft_ms:1000:100
 SLA_RULES="${SLA_RULES:-mean_tpot_ms:50:5,p99_tpot_ms:75:5}"
