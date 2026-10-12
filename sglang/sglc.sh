@@ -22,7 +22,7 @@ set -uo pipefail
 # 1. 基础配置
 # ============================================================
 
-run_id="$(date +%Y%m%d_%H%M%S)"
+run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 out_dir="./all_result/bench_theory_bs_${run_id}"
 log_dir="${out_dir}/logs"

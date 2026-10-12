@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-run_id="$(date +%Y%m%d_%H%M%S)"
+run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 out_dir="./all_result/bench_vllm_prefix_salt_${run_id}"
 log_dir="${out_dir}/logs"
 mkdir -p "${log_dir}"
