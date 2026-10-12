@@ -20,7 +20,9 @@ perf_bench/
 - `/v1/loads` 不可用时回退 `/metrics` 和环境变量。
 - 自动读取 `/server_info` 中的 TP / DP / PP / EP / ACP / KV cache dtype / CUDA Graph decode BS。
 - 理论 per-DP BS 同时受 KV token capacity 和 `max_running_requests` 约束。
+- 每个 benchmark case 使用 `--flush-cache`；warmup 完成后清理服务端 Prefix Cache，避免预热请求影响正式测量。
 - 支持 `SLA_RULES` inline 加密扫描：当当前 BS 命中任一 SLA 规则后，连续补测到下一个基础 BS 前。
+- 支持 `HARD_STOP_RULES` 硬停止：指标命中阈值后停止当前 case 的后续 BS 测试。
 - 直接从 benchmark 日志提取 RPS、Token 吞吐、请求数、耗时和时延分位数，不保存逐请求 JSONL。
 
 ### vLLM: `vllm/vllmc.sh`
@@ -70,6 +72,7 @@ bash vllm/vllmc.sh
 | `NUM_PROMPTS_MULTIPLIER` | 请求数量倍率，`num_prompts = max_concurrency * NUM_PROMPTS_MULTIPLIER`。 |
 | `SLA_DENSE_ENABLE` | 是否开启 SLA inline 加密扫描，默认 `1`。 |
 | `SLA_RULES` | SLA 规则，格式为 `metric:target:near`，多个规则用逗号分隔。 |
+| `HARD_STOP_RULES` | SGLang 硬停止规则，格式为 `metric:op:threshold`，多个规则用逗号分隔；默认关闭。 |
 | `DP_SIZE` | 手动指定 DP 数；通常由脚本自动识别。 |
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
@@ -82,6 +85,21 @@ SLA_RULES="mean_tpot_ms:50:5,p99_tpot_ms:75:5,mean_ttft_ms:1000:100"
 ```
 
 含义是当某个 BS 的指标落入 `target ± near` 区间时，立即连续补测当前基础 BS 到下一个基础 BS 之间的整数 BS。
+
+`HARD_STOP_RULES` 示例：
+
+```bash
+HARD_STOP_RULES="mean_tpot_ms:ge:100,p99_tpot_ms:ge:150,mean_ttft_ms:ge:5000" \
+bash sglang/sglc.sh
+```
+
+规则格式为 `metric:op:threshold`：
+
+- `metric` 使用 `sum_all.csv` 中的指标名，例如 `mean_tpot_ms`、`p99_tpot_ms`、`mean_ttft_ms`、`p99_ttft_ms`。
+- `op` 支持 `ge`（大于等于）、`gt`（大于）、`le`（小于等于）和 `lt`（小于）。
+- 多条规则用逗号分隔，任意一条命中就会触发硬停止。
+- 每个 BS 完成并汇总到 `sum_all.csv` 后检查；命中后停止当前 case 的后续 BS，不影响已经完成的结果。
+- 默认值为空，表示关闭硬停止；如果同时命中 `SLA_RULES`，会先完成 SLA inline dense 补点，再执行硬停止。
 
 ## 固定并发示例
 

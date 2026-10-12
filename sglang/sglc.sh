@@ -1391,6 +1391,7 @@ run_one_bs() {
     --request-rate inf
     --max-concurrency "${global_concurrency}"
     --warmup-requests "${warmup_requests}"
+    --flush-cache
     --disable-tqdm
   )
 
