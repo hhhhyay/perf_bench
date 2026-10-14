@@ -36,7 +36,7 @@ PREFILL_TTFT_SEARCH_ITERS=7
 PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16"
 ```
 
-输入值表示 K，实际 token 数继续由 `TOKEN_UNIT` 换算。输出长度固定为 1 token，默认通过 `0.000976562K` 表示；`TOKEN_UNIT=1000` 时使用等价的十进制换算。
+输入值表示 K，实际 token 数继续由 `TOKEN_UNIT` 换算。输出长度固定写死为 1 token，不作为矩阵参数，也不通过 `TOKEN_UNIT` 换算。
 
 TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒。
 
