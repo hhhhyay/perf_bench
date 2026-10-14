@@ -22,7 +22,7 @@ perf_bench/
 - 理论 per-DP BS 同时受 KV token capacity 和 `max_running_requests` 约束。
 - 每个 benchmark case 使用 `--flush-cache`；warmup 完成后清理服务端 Prefix Cache，避免预热请求影响正式测量。
 - 默认单侧 Prefill case 使用 `output=0.000976562K`，在默认 `TOKEN_UNIT=1024` 下约等于 1 token。
-- 对输出 1 token 的 Prefill case，先用 `request_rate=inf` 获取实际客户端 RPS，再按 `-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5` 相对基准 RPS 独立回测 7 次。
+- 对输出 1 token 的 Prefill case，先用 `request_rate=inf` 获取实际客户端 RPS，再按 `-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5` 的绝对 RPS 步长累计回测 7 次。
 - 支持 `SLA_RULES` inline 加密扫描：当当前 BS 命中任一 SLA 规则后，连续补测到下一个基础 BS 前。
 - 支持 `HARD_STOP_RULES` 硬停止：指标命中阈值后停止当前 case 的后续 BS 测试。
 - 直接从 benchmark 日志提取 RPS、Token 吞吐、请求数、耗时和时延分位数，不保存逐请求 JSONL。
@@ -135,21 +135,23 @@ bash vllm/vllmc.sh
 - 如果上次因 `HARD_STOP_RULES` 命中而停止，需要清空或调整该规则后再续测，否则会在相同阈值处再次停止。
 - 不设置 `RUN_ID` 会创建全新的结果目录，不会读取旧目录中的结果。
 
-单侧 Prefill 的回测会在基准 case 成功后自动执行 7 次，输入请求率分别为：
+单侧 Prefill 的回测会在基准 case 成功后自动执行 7 次。每次在上一次输入请求率的基础上累加对应的 delta：
 
 ```text
-baseline_rps * 0.9
-baseline_rps * 0.9
-baseline_rps * 0.9
-baseline_rps * 0.8
-baseline_rps * 0.8
-baseline_rps * 0.7
-baseline_rps * 0.5
+delta=-0.1
+delta=-0.1
+delta=-0.1
+delta=-0.2
+delta=-0.2
+delta=-0.3
+delta=-0.5
 ```
+
+例如 `baseline_rps=100` 时，7 次输入请求率为 `99.9、99.8、99.7、99.5、99.3、99.0、98.5`。
 
 回测结果不混入容量 `sum_all.csv`，保存在结果目录的
 `prefill_backtest/prefill_backtest.csv`，其中记录 `baseline_rps`、`input_request_rate`、
-`actual_rps`、回测序号、偏移比例和日志路径。
+`actual_rps`、回测序号、绝对步长 delta 和日志路径。
 
 ## 固定并发示例
 

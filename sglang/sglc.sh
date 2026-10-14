@@ -136,7 +136,7 @@ FIXED_CONCURRENCY="${FIXED_CONCURRENCY:-}"
 #   NUM_PROMPTS_MULTIPLIER=4 bash this_script.sh
 NUM_PROMPTS_MULTIPLIER="${NUM_PROMPTS_MULTIPLIER:-1}"
 
-# 单侧 Prefill（输出 1 token）回测：相对 inf 基准实际 RPS 独立降速。
+# 单侧 Prefill（输出 1 token）回测：从 inf 基准实际 RPS 按绝对步长累计回退。
 # 三次 -0.1、两次 -0.2、一次 -0.3、一次 -0.5，共 7 次。
 PREFILL_BACKTEST_DELTAS=(
   -0.1
@@ -1555,7 +1555,7 @@ run_prefill_backtests() {
   mkdir -p "${prefill_backtest_log_dir}"
   echo "[PREFILL-BACKTEST] case=${case_name} per_dp_bs=${per_dp_bs} baseline_rps=${baseline_rps}"
 
-  local trial delta request_rate rate_tag global_concurrency num_prompts warmup_requests
+  local trial delta request_rate current_request_rate rate_tag global_concurrency num_prompts warmup_requests
   local base_name log_file exit_file case_exit_code actual_rps status
   global_concurrency=$((DP_SIZE * per_dp_bs))
   num_prompts=$((global_concurrency * NUM_PROMPTS_MULTIPLIER))
@@ -1563,14 +1563,16 @@ run_prefill_backtests() {
   if (( per_dp_bs == 1 )); then
     warmup_requests=$((DP_SIZE * 16))
   fi
+  current_request_rate="${baseline_rps}"
 
   for ((trial=1; trial<=${#PREFILL_BACKTEST_DELTAS[@]}; trial++)); do
     delta="${PREFILL_BACKTEST_DELTAS[$((trial - 1))]}"
-    request_rate="$(awk -v base="${baseline_rps}" -v delta="${delta}" 'BEGIN {
-      rate = base * (1 + delta)
+    request_rate="$(awk -v base="${current_request_rate}" -v delta="${delta}" 'BEGIN {
+      rate = base + delta
       if (rate <= 0) rate = 0.000001
       printf "%.6f", rate
     }')"
+    current_request_rate="${request_rate}"
     rate_tag="${request_rate//./p}"
     base_name="${case_name}_in${input_len}_out${output_len}_perdp${per_dp_bs}_global${global_concurrency}_prefill_trial${trial}_rate${rate_tag}"
     log_file="${prefill_backtest_log_dir}/${base_name}.log"
