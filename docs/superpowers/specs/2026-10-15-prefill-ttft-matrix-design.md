@@ -66,12 +66,17 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 <result_dir>/prefill_ttft_matrix.csv
 ```
 
-`prefill_ttft_trials.csv` 保存所有基准和搜索 trial，保留实际 RPS、必要吞吐信息和全部 TTFT 指标；不提取 E2E 之后的 TPOT、ITL 等指标。至少包含以下字段：
+`prefill_ttft_trials.csv` 保存所有基准和搜索 trial。指标提取遵循 benchmark 日志顺序：保留 `Mean E2E Latency (ms)` 之前的全部字段；跳过 `Mean E2E Latency (ms)` 及其 E2E 指标；再保留后续完整 TTFT 指标，包括 Mean、Median、P50、P75、P90、P95、P99、P999 和 Max。TPOT、ITL 等指标不提取。不同日志 label 的 TTFT 字段按各自语义分别保存，不合并成一个指标。至少包含以下字段：
 
 ```text
 input_k,input_len,output_len,per_dp_bs,global_concurrency,
 target_ttft_ms,trial,search_phase,input_request_rate,actual_rps,
-successful_requests,input_throughput,
+backend,traffic_request_rate,max_request_concurrency,
+successful_requests,benchmark_duration_s,total_input_tokens,
+total_input_text_tokens,total_generated_tokens,
+total_generated_tokens_retokenized,request_throughput,
+input_throughput,output_throughput,peak_output_throughput,
+peak_concurrency,total_throughput,concurrency,accept_length,
 mean_ttft_ms,median_ttft_ms,p50_ttft_ms,p75_ttft_ms,p90_ttft_ms,
 p95_ttft_ms,p99_ttft_ms,p999_ttft_ms,max_ttft_ms,
 case_status,log_file
