@@ -4,7 +4,7 @@
 
 **Goal:** Add an independent SGLang Prefill TTFT matrix runner for 32K/64K/128K inputs and 3s/5s/10s Mean TTFT targets, while keeping `sglang/sglc.sh` unchanged from its pre-Prefill state.
 
-**Architecture:** `sglang/prefill_ttft.sh` will reuse the existing `sglc.sh` environment names, service discovery, `bench_serving` command arguments, token-unit conversion, flush-cache behavior, and RUN_ID conventions, but will select one per-DP BS per input and search request rate from high to low. It will keep the fixed client columns, retain Mean TTFT/P95 TTFT/P99 TTFT and Mean E2E, then use distinct TTFT fields in the post-E2E slots, and write detailed trials plus one best row per matrix point.
+**Architecture:** `sglang/prefill_ttft.sh` will reuse the existing `sglc.sh` environment names, service discovery, `bench_serving` command arguments, token-unit conversion, flush-cache behavior, and RUN_ID conventions, but will select one per-DP BS per input and search request rate from high to low. It will keep the fixed client columns, retain the standard TTFT/TPOT/ITL fields and Mean E2E, then use P50 plus distinct TTFT fields in the post-E2E slots, and write detailed trials plus one best row per matrix point.
 
 **Tech Stack:** Bash, `python3`, `curl`, `awk`, SGLang `bench_serving`, CSV files, Git Bash syntax checks.
 
@@ -18,7 +18,7 @@
 - Default BS rules are `8:256,16:128,32:64,64:32,128:16`, matched by the first input upper bound that contains the input.
 - Every Prefill probe uses `--flush-cache` and does not save per-request JSONL.
 - Final performance selection uses parsed `Request throughput (req/s)` as `actual_rps`, never the configured request rate.
-- Keep the fixed client fields aligned with `sglc.sh`, retain `Mean/P95/P99 TTFT`, `Mean/P95/P99 TPOT`, `Mean/P95/P99 ITL`, and `Mean E2E Latency`, then use distinct TTFT fields (`Std`/`P75`/`P90`/`P999`/`Max`) in the post-E2E slots; skip duplicate Median/P50 TTFT, other E2E percentiles, and extra TPOT/ITL percentiles.
+- Keep the fixed client fields aligned with `sglc.sh`, retain `Mean/P95/P99 TTFT`, `Mean/P95/P99 TPOT`, `Mean/P95/P99 ITL`, and `Mean E2E Latency`, then use `P50` plus distinct TTFT fields (`Std`/`P75`/`P90`/`P999`/`Max`) in the post-E2E slots; skip duplicate Median TTFT, other E2E percentiles, and extra TPOT/ITL percentiles.
 - Do not add or commit the unrelated untracked `sheet_*.json` files.
 
 ---
@@ -177,6 +177,7 @@ Mean ITL (ms)
 P95 ITL (ms)
 P99 ITL (ms)
 Mean E2E Latency (ms)
+P50 TTFT (ms)
 Std TTFT (ms)
 P75 TTFT (ms)
 P90 TTFT (ms)
@@ -184,7 +185,7 @@ P999 TTFT (ms)
 Max TTFT (ms)
 ```
 
-Retain `Mean E2E Latency`, standard Mean/P95/P99 TPOT and ITL fields, skip other E2E percentiles and duplicate Median/P50 TTFT, and use distinct TTFT fields in the post-E2E slots. Preserve distinct keys rather than merging labels. Set `actual_rps` from `Request throughput (req/s)` and use `mean_ttft_ms` for target decisions.
+Retain `Mean E2E Latency`, standard Mean/P95/P99 TPOT and ITL fields, skip other E2E percentiles and duplicate Median TTFT, and use P50 plus distinct TTFT fields in the post-E2E slots. Preserve distinct keys rather than merging labels. Set `actual_rps` from `Request throughput (req/s)` and use `mean_ttft_ms` for target decisions.
 
 - [ ] **Step 2: Add atomic trial CSV upsert**
 
@@ -255,7 +256,7 @@ Document that common `sglc.sh` service and benchmark variables retain their name
 
 - [ ] **Step 3: Document the exact metrics**
 
-State that the fixed client columns, Mean/P95/P99 TTFT, Mean/P95/P99 TPOT, Mean/P95/P99 ITL, and Mean E2E are retained; post-E2E slots use distinct Std/P75/P90/P999/Max TTFT fields, while duplicate Median/P50 TTFT, other E2E percentiles, and extra TPOT/ITL percentiles are excluded.
+State that the fixed client columns, Mean/P95/P99 TTFT, Mean/P95/P99 TPOT, Mean/P95/P99 ITL, and Mean E2E are retained; post-E2E slots use P50 plus distinct Std/P75/P90/P999/Max TTFT fields, while duplicate Median TTFT, other E2E percentiles, and extra TPOT/ITL percentiles are excluded.
 
 - [ ] **Step 4: Run the full static verification**
 

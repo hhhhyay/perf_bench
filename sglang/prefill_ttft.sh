@@ -296,6 +296,7 @@ ttft = {
     "Mean TTFT (ms)": "mean_ttft_ms",
     "P75 TTFT (ms)": "p75_ttft_ms",
     "P90 TTFT (ms)": "p90_ttft_ms",
+    "P50 TTFT (ms)": "p50_ttft_ms",
     "P95 TTFT (ms)": "p95_ttft_ms",
     "P99 TTFT (ms)": "p99_ttft_ms",
     "P999 TTFT (ms)": "p999_ttft_ms",
@@ -393,7 +394,7 @@ fieldnames = [
     "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
     "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
     "mean_itl_ms", "p95_itl_ms", "p99_itl_ms", "mean_e2e_latency_ms",
-    "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
+    "p50_ttft_ms", "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
     "max_ttft_ms", "case_status", "target_status", "log_file",
 ]
 row = {
@@ -582,7 +583,7 @@ fields = [
     "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
     "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
     "mean_itl_ms", "p95_itl_ms", "p99_itl_ms", "mean_e2e_latency_ms",
-    "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
+    "p50_ttft_ms", "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
     "max_ttft_ms", "case_status", "target_status", "log_file",
     "selection_status",
 ]
