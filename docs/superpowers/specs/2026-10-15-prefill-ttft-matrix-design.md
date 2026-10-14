@@ -23,11 +23,11 @@
 
 ## 脚本边界
 
-`sglang/sglc.sh` 只保留普通容量扫描；`sglang/prefill_ttft.sh` 是独立入口，不调用普通脚本的主循环，也不修改普通脚本的结果目录。Prefill 脚本只复用相同的服务端接口和 benchmark 日志口径，避免两类测试的 BS 扫描、续测和结果文件互相影响。
+`sglang/sglc.sh` 只保留普通容量扫描；`sglang/prefill_ttft.sh` 是独立入口，不调用普通脚本的主循环，也不修改普通脚本的结果目录。Prefill 脚本沿用 `sglc.sh` 的服务配置、模型、DP/容量兜底、并行配置、`TOKEN_UNIT`、`RUN_ID`、请求数量和 fake-prefill 等同名参数，以及同一组 `bench_serving` 参数；只改变输入长度、选定 BS、输出 1 token 和 `request_rate` 搜索方式。
 
 ## 配置接口
 
-SGLang 脚本新增以下环境变量，默认值如下：
+Prefill 脚本沿用 `sglc.sh` 的已有环境变量和默认值，并新增以下矩阵参数：
 
 ```bash
 PREFILL_TTFT_INPUTS="32 64 128"
@@ -41,6 +41,8 @@ PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16"
 TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒。
 
 `PREFILL_TTFT_BS_RULES` 使用 `输入上限K:per_dp_bs` 逗号分隔，按第一个满足 `input_k <= 上限K` 的规则选择 BS。例如默认规则表示：`8K` 以内使用 256，`8K~16K` 使用 128，`16K~32K` 使用 64，`32K~64K` 使用 32，`64K~128K` 使用 16。规则由环境变量覆盖，不在代码中固定单个 BS。
+
+除矩阵参数外，服务地址、模型、DP、容量、并行、请求数量、`USE_FAKE_PREFILL`、`TOKEN_UNIT` 和续测参数均使用与 `sglc.sh` 相同的名字和语义。benchmark 命令参数保持一致，仅由矩阵逻辑填充输入长度、输出长度、选定并发和限流请求率。
 
 ## 搜索算法
 
@@ -64,15 +66,18 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 <result_dir>/prefill_ttft_matrix.csv
 ```
 
-`prefill_ttft_trials.csv` 保存所有基准和搜索 trial，至少包含以下字段：
+`prefill_ttft_trials.csv` 保存所有基准和搜索 trial，保留实际 RPS、必要吞吐信息和全部 TTFT 指标；不提取 E2E 之后的 TPOT、ITL 等指标。至少包含以下字段：
 
 ```text
 input_k,input_len,output_len,per_dp_bs,global_concurrency,
 target_ttft_ms,trial,search_phase,input_request_rate,actual_rps,
-mean_ttft_ms,case_status,log_file
+successful_requests,input_throughput,
+mean_ttft_ms,median_ttft_ms,p50_ttft_ms,p75_ttft_ms,p90_ttft_ms,
+p95_ttft_ms,p99_ttft_ms,p999_ttft_ms,max_ttft_ms,
+case_status,log_file
 ```
 
-`prefill_ttft_matrix.csv` 每个输入长度和目标 TTFT 只保留最终最优达标结果，按 `actual_rps` 最大选择；已有成功日志且 `.exitcode=0` 时跳过并复用，失败或未完成测试重新执行。CSV 按输入、目标和 trial 去重，支持使用同一个 `RUN_ID` 续测。
+`prefill_ttft_matrix.csv` 每个输入长度和目标 TTFT 只保留最终最优达标结果，按 `actual_rps` 最大选择，并保留该结果的全部 TTFT 指标；已有成功日志且 `.exitcode=0` 时跳过并复用，失败或未完成测试重新执行。CSV 按输入、目标和 trial 去重，支持使用同一个 `RUN_ID` 续测。
 
 ## 失败处理
 
