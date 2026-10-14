@@ -2,21 +2,28 @@
 
 ## 背景
 
-现有单侧 Prefill（输出 1 token）回测使用固定的绝对 RPS 步长。该方式不能直接回答指定 Mean TTFT 约束下的最大 Prefill 实际 RPS，也无法覆盖多输入长度和多 TTFT 目标的组合。
+此前单侧 Prefill（输出 1 token）回测挂在 `sglc.sh` 的普通 BS 扫描中，并使用固定的绝对 RPS 步长。该方式不能直接回答指定 Mean TTFT 约束下的最大 Prefill 实际 RPS，也会让普通容量脚本混入专用回测逻辑。
 
 ## 目标
 
 - 删除旧的 `-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5` 固定回测。
+- 将 `sglc.sh` 恢复为加入 Prefill 回测前的普通容量扫描脚本。
+- 新增独立的 `sglang/prefill_ttft.sh`，只负责单侧 Prefill TTFT 矩阵。
 - 针对输入 `32K/64K/128K` 和 TTFT 目标 `3s/5s/10s` 建立 3 x 3 矩阵。
+- 不扫描所有 BS；根据输入长度规则自动选择一个 `per_dp_bs`。
 - 每个矩阵点从高请求率开始向下寻找 TTFT 达标区间，再在区间内细化临界请求率。
 - 报告满足目标的最大实际客户端 RPS，同时保留当时的输入请求率和 Mean TTFT。
 - 保留日志、`--flush-cache` 和 RUN_ID 续测能力，不保存逐请求 JSONL。
 
 ## 非目标
 
-- 不改变普通容量扫描、BS 扫描、SLA inline 扫描或 HARD_STOP_RULES 的判定逻辑。
+- 不改变 `sglc.sh` 的普通容量扫描、BS 扫描、SLA inline 扫描、HARD_STOP_RULES 或 `--flush-cache` 行为。
 - 不把 TTFT 矩阵结果混入容量汇总 `sum_all.csv`。
 - 不把配置的 `request_rate` 当作最终吞吐；最终吞吐必须来自日志中的实际 `Request throughput (req/s)`。
+
+## 脚本边界
+
+`sglang/sglc.sh` 只保留普通容量扫描；`sglang/prefill_ttft.sh` 是独立入口，不调用普通脚本的主循环，也不修改普通脚本的结果目录。Prefill 脚本只复用相同的服务端接口和 benchmark 日志口径，避免两类测试的 BS 扫描、续测和结果文件互相影响。
 
 ## 配置接口
 
@@ -26,15 +33,18 @@ SGLang 脚本新增以下环境变量，默认值如下：
 PREFILL_TTFT_INPUTS="32 64 128"
 PREFILL_TTFT_TARGETS_MS="3000 5000 10000"
 PREFILL_TTFT_SEARCH_ITERS=7
+PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16"
 ```
 
 输入值表示 K，实际 token 数继续由 `TOKEN_UNIT` 换算。输出长度固定为 1 token，默认通过 `0.000976562K` 表示；`TOKEN_UNIT=1000` 时使用等价的十进制换算。
 
 TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒。
 
+`PREFILL_TTFT_BS_RULES` 使用 `输入上限K:per_dp_bs` 逗号分隔，按第一个满足 `input_k <= 上限K` 的规则选择 BS。例如默认规则表示：`8K` 以内使用 256，`8K~16K` 使用 128，`16K~32K` 使用 64，`32K~64K` 使用 32，`64K~128K` 使用 16。规则由环境变量覆盖，不在代码中固定单个 BS。
+
 ## 搜索算法
 
-对每个输入长度先执行一次 `request_rate=inf` 基准测试，提取成功日志中的实际 RPS，作为高请求率上界。随后对每个 TTFT 目标执行临界值搜索：
+对每个输入长度先根据 `PREFILL_TTFT_BS_RULES` 选择一次 `per_dp_bs`，然后执行一次 `request_rate=inf` 基准测试，提取成功日志中的实际 RPS，作为高请求率上界。随后对每个 TTFT 目标执行临界值搜索：
 
 1. 先测试高请求率。若 `mean_ttft_ms <= target_ttft_ms`，直接将该结果作为当前目标的最大候选。
 2. 若高请求率超标，则继续向低请求率测试，直到找到一个达标点；维护“高点超标、低点达标”的区间。
@@ -42,28 +52,32 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 4. 在所有成功且达标的结果中，按 `actual_rps` 取最大值；若实际 RPS 相同，则优先选择 `mean_ttft_ms` 更低的结果。
 5. 若降到最小可执行请求率仍不达标，则该矩阵点标记为 `FAIL`，不伪造性能结果。
 
-搜索变量是命令行传入的 `request_rate`，最终性能指标是日志提取的 `actual_rps`。每次测试都使用 `--flush-cache`，并保留独立日志和 `.exitcode`。
+搜索变量是命令行传入的 `request_rate`，最终性能指标是日志提取的 `actual_rps`。每个输入长度不遍历其他 BS。每次测试都使用 `--flush-cache`，并保留独立日志和 `.exitcode`。
 
 ## 输出与续测
 
-结果写入：
+结果写入独立脚本自己的结果目录：
 
 ```text
-<result_dir>/prefill_backtest/prefill_ttft_matrix.csv
+<result_dir>/logs/
+<result_dir>/prefill_ttft_trials.csv
+<result_dir>/prefill_ttft_matrix.csv
 ```
 
-至少包含以下字段：
+`prefill_ttft_trials.csv` 保存所有基准和搜索 trial，至少包含以下字段：
 
 ```text
-case_name,input_len,output_len,target_ttft_ms,trial,
-input_request_rate,actual_rps,mean_ttft_ms,case_status,log_file
+input_k,input_len,output_len,per_dp_bs,global_concurrency,
+target_ttft_ms,trial,search_phase,input_request_rate,actual_rps,
+mean_ttft_ms,case_status,log_file
 ```
 
-每个输入长度和目标 TTFT 使用稳定的 case/target 标识。已有成功日志且 `.exitcode=0` 时跳过并复用；失败或未完成测试重新执行。CSV 按矩阵点和 trial 去重，支持使用同一个 `RUN_ID` 续测。
+`prefill_ttft_matrix.csv` 每个输入长度和目标 TTFT 只保留最终最优达标结果，按 `actual_rps` 最大选择；已有成功日志且 `.exitcode=0` 时跳过并复用，失败或未完成测试重新执行。CSV 按输入、目标和 trial 去重，支持使用同一个 `RUN_ID` 续测。
 
 ## 失败处理
 
-- 基准 `inf` 测试失败或无法提取实际 RPS：跳过该输入长度的矩阵搜索并保留失败日志。
+- BS 规则不覆盖输入长度：跳过该输入长度并报告配置错误。
+- 基准 `inf` 测试失败或无法提取实际 RPS/Mean TTFT：跳过该输入长度的矩阵搜索并保留失败日志。
 - 回测日志缺少 `Request throughput` 或 `Mean TTFT`：该 trial 标记为 `FAIL`。
 - benchmark 非 0 退出：保留日志和退出码，不作为候选结果。
 - 搜索过程中服务异常：停止当前矩阵点，保留已完成结果，不将部分结果标记为完整最优结果。
@@ -74,5 +88,5 @@ input_request_rate,actual_rps,mean_ttft_ms,case_status,log_file
 - 使用 `git diff --check` 检查补丁格式。
 - 用模拟的基准 RPS 和 TTFT 序列验证：搜索顺序先从高到低，最终只选择达标且实际 RPS 最大的结果。
 - 验证 9 个矩阵点的输入长度、目标 TTFT、日志命名和 CSV 字段互不串行。
+- 验证 `sglc.sh` 与恢复前提交 `007f969` 一致，且不再创建 Prefill 回测目录。
 - 验证相同 `RUN_ID` 下成功 trial 可跳过，失败 trial 可续测。
-
