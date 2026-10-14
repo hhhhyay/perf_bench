@@ -21,6 +21,8 @@ perf_bench/
 - 自动读取 `/server_info` 中的 TP / DP / PP / EP / ACP / KV cache dtype / CUDA Graph decode BS。
 - 理论 per-DP BS 同时受 KV token capacity 和 `max_running_requests` 约束。
 - 每个 benchmark case 使用 `--flush-cache`；warmup 完成后清理服务端 Prefix Cache，避免预热请求影响正式测量。
+- 默认单侧 Prefill case 使用 `output=0.000976562K`，在默认 `TOKEN_UNIT=1024` 下约等于 1 token。
+- 对输出 1 token 的 Prefill case，先用 `request_rate=inf` 获取实际客户端 RPS，再按 `-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5` 相对基准 RPS 独立回测 7 次。
 - 支持 `SLA_RULES` inline 加密扫描：当当前 BS 命中任一 SLA 规则后，连续补测到下一个基础 BS 前。
 - 支持 `HARD_STOP_RULES` 硬停止：指标命中阈值后停止当前 case 的后续 BS 测试。
 - 直接从 benchmark 日志提取 RPS、Token 吞吐、请求数、耗时和时延分位数，不保存逐请求 JSONL。
@@ -38,6 +40,8 @@ perf_bench/
 
 脚本中的 `CASES` 默认使用二进制 K，即 `TOKEN_UNIT=1024`。例如 `"4 1"` 表示输入
 `4096 tokens`、输出 `1024 tokens`；`"0.5 1"` 表示输入 `512 tokens`、输出 `1024 tokens`。
+单侧 Prefill 的 1 token 可写成 `"8 0.000976562"`，换算后输出长度为 `1 token`；如果设置
+`TOKEN_UNIT=1000`，对应的精确写法是 `0.001`。
 需要十进制口径时设置 `TOKEN_UNIT=1000`，此时 `"1 1"` 表示输入和输出各 `1000 tokens`。
 小数换算后会四舍五入为整数 token；结果可根据 `input_len/output_len` 与 `input_k/output_k` 判断实际口径。
 
@@ -131,6 +135,22 @@ bash vllm/vllmc.sh
 - 如果上次因 `HARD_STOP_RULES` 命中而停止，需要清空或调整该规则后再续测，否则会在相同阈值处再次停止。
 - 不设置 `RUN_ID` 会创建全新的结果目录，不会读取旧目录中的结果。
 
+单侧 Prefill 的回测会在基准 case 成功后自动执行 7 次，输入请求率分别为：
+
+```text
+baseline_rps * 0.9
+baseline_rps * 0.9
+baseline_rps * 0.9
+baseline_rps * 0.8
+baseline_rps * 0.8
+baseline_rps * 0.7
+baseline_rps * 0.5
+```
+
+回测结果不混入容量 `sum_all.csv`，保存在结果目录的
+`prefill_backtest/prefill_backtest.csv`，其中记录 `baseline_rps`、`input_request_rate`、
+`actual_rps`、回测序号、偏移比例和日志路径。
+
 ## 固定并发示例
 
 固定 per-DP BS：
@@ -153,5 +173,6 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 
 - `logs/`：每个 case / BS 的执行日志。
 - `sum_all.csv`：汇总后的核心指标表。
+- `prefill_backtest/prefill_backtest.csv`：输出 1 token case 的 7 次 RPS 回测结果。
 
 `all_result/` 是运行产物目录，建议不要提交到仓库。
