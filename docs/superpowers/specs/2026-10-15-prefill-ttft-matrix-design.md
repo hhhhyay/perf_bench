@@ -66,7 +66,7 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 <result_dir>/prefill_ttft_matrix.csv
 ```
 
-`prefill_ttft_trials.csv` 保存所有基准和搜索 trial。客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean TTFT`/`P95 TTFT`/`P99 TTFT` 和 `Mean E2E Latency`；在 `Mean E2E Latency` 后使用未重复的 `Std TTFT`/`P75 TTFT`/`P90 TTFT`/`P999 TTFT`/`Max TTFT`，替代 E2E 后续分位数位置。`Median/P50 TTFT`、其他 E2E 分位数、TPOT、ITL 等重复或非目标指标不提取。不同日志 label 的 TTFT 字段按各自语义分别保存，不合并成一个指标。至少包含以下字段：
+`prefill_ttft_trials.csv` 保存所有基准和搜索 trial。客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL` 和 `Mean E2E Latency`；在 `Mean E2E Latency` 后使用未重复的 `Std/P75/P90/P999/Max TTFT`，替代 E2E 后续分位数位置。`Median/P50 TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。不同日志 label 的字段按各自语义分别保存，不合并成一个指标。至少包含以下字段：
 
 ```text
 input_k,input_len,output_len,per_dp_bs,global_concurrency,
@@ -77,7 +77,9 @@ total_input_text_tokens,total_generated_tokens,
 total_generated_tokens_retokenized,request_throughput,
 input_throughput,output_throughput,peak_output_throughput,
 peak_concurrency,total_throughput,concurrency,accept_length,
-mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_e2e_latency_ms,
+mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,
+mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,
+mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms,
 std_ttft_ms,p75_ttft_ms,p90_ttft_ms,p999_ttft_ms,max_ttft_ms,
 case_status,log_file
 ```

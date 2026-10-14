@@ -301,7 +301,15 @@ ttft = {
     "P999 TTFT (ms)": "p999_ttft_ms",
     "Max TTFT (ms)": "max_ttft_ms",
 }
-labels = {**prefix, **ttft}
+client_latency = {
+    "Mean TPOT (ms)": "mean_tpot_ms",
+    "P95 TPOT (ms)": "p95_tpot_ms",
+    "P99 TPOT (ms)": "p99_tpot_ms",
+    "Mean ITL (ms)": "mean_itl_ms",
+    "P95 ITL (ms)": "p95_itl_ms",
+    "P99 ITL (ms)": "p99_itl_ms",
+}
+labels = {**prefix, **ttft, **client_latency}
 values = {}
 try:
     lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
@@ -382,7 +390,9 @@ fieldnames = [
     "total_generated_tokens_retokenized", "request_throughput",
     "input_throughput", "output_throughput", "peak_output_throughput",
     "peak_concurrency", "total_throughput", "concurrency", "accept_length",
-    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "mean_e2e_latency_ms",
+    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
+    "mean_itl_ms", "p95_itl_ms", "p99_itl_ms", "mean_e2e_latency_ms",
     "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
     "max_ttft_ms", "case_status", "target_status", "log_file",
 ]
@@ -569,7 +579,9 @@ fields = [
     "total_generated_tokens_retokenized", "request_throughput",
     "input_throughput", "output_throughput", "peak_output_throughput",
     "peak_concurrency", "total_throughput", "concurrency", "accept_length",
-    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "mean_e2e_latency_ms",
+    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
+    "mean_itl_ms", "p95_itl_ms", "p99_itl_ms", "mean_e2e_latency_ms",
     "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
     "max_ttft_ms", "case_status", "target_status", "log_file",
     "selection_status",

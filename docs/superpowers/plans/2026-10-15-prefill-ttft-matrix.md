@@ -18,7 +18,7 @@
 - Default BS rules are `8:256,16:128,32:64,64:32,128:16`, matched by the first input upper bound that contains the input.
 - Every Prefill probe uses `--flush-cache` and does not save per-request JSONL.
 - Final performance selection uses parsed `Request throughput (req/s)` as `actual_rps`, never the configured request rate.
-- Keep the fixed client fields aligned with `sglc.sh`, retain `Mean TTFT`/`P95 TTFT`/`P99 TTFT` and `Mean E2E Latency`, then use distinct TTFT fields (`Std`/`P75`/`P90`/`P999`/`Max`) in the post-E2E slots; skip duplicate Median/P50 TTFT, other E2E percentiles, TPOT, and ITL fields.
+- Keep the fixed client fields aligned with `sglc.sh`, retain `Mean/P95/P99 TTFT`, `Mean/P95/P99 TPOT`, `Mean/P95/P99 ITL`, and `Mean E2E Latency`, then use distinct TTFT fields (`Std`/`P75`/`P90`/`P999`/`Max`) in the post-E2E slots; skip duplicate Median/P50 TTFT, other E2E percentiles, and extra TPOT/ITL percentiles.
 - Do not add or commit the unrelated untracked `sheet_*.json` files.
 
 ---
@@ -170,6 +170,12 @@ Then keep these non-duplicated TTFT fields around the `Mean E2E` position:
 Mean TTFT (ms)
 P95 TTFT (ms)
 P99 TTFT (ms)
+Mean TPOT (ms)
+P95 TPOT (ms)
+P99 TPOT (ms)
+Mean ITL (ms)
+P95 ITL (ms)
+P99 ITL (ms)
 Mean E2E Latency (ms)
 Std TTFT (ms)
 P75 TTFT (ms)
@@ -178,7 +184,7 @@ P999 TTFT (ms)
 Max TTFT (ms)
 ```
 
-Retain `Mean E2E Latency`, skip other E2E percentiles, duplicate Median/P50 TTFT, every TPOT field, and every ITL field. Preserve distinct keys rather than merging labels. Set `actual_rps` from `Request throughput (req/s)` and use `mean_ttft_ms` for target decisions.
+Retain `Mean E2E Latency`, standard Mean/P95/P99 TPOT and ITL fields, skip other E2E percentiles and duplicate Median/P50 TTFT, and use distinct TTFT fields in the post-E2E slots. Preserve distinct keys rather than merging labels. Set `actual_rps` from `Request throughput (req/s)` and use `mean_ttft_ms` for target decisions.
 
 - [ ] **Step 2: Add atomic trial CSV upsert**
 
@@ -190,7 +196,7 @@ For each `(input_k, target_ttft_ms)`, select rows with successful benchmark exit
 
 - [ ] **Step 4: Test parsing with a synthetic log fixture**
 
-Use a temporary log containing prefix fields, E2E fields, all TTFT fields including `P90 TTFT (ms): 1234`, TPOT fields, and ITL fields. Assert the output contains `mean_e2e_latency_ms`, `p90_ttft_ms=1234`, contains the prefix throughput fields, and contains no other E2E/TPOT/ITL keys.
+Use a temporary log containing prefix fields, E2E fields, all selected TTFT fields including `P90 TTFT (ms): 1234`, and standard TPOT/ITL fields. Assert the output contains `mean_e2e_latency_ms`, `p90_ttft_ms=1234`, the standard TPOT/ITL fields, the prefix throughput fields, and no unselected E2E/TPOT/ITL keys.
 
 ### Task 4: Implement high-to-low TTFT search and resume
 
@@ -249,7 +255,7 @@ Document that common `sglc.sh` service and benchmark variables retain their name
 
 - [ ] **Step 3: Document the exact metrics**
 
-State that the fixed client columns, Mean TTFT/P95 TTFT/P99 TTFT, and Mean E2E are retained; post-E2E slots use distinct Std/P75/P90/P999/Max TTFT fields, while duplicate Median/P50 TTFT, other E2E percentiles, TPOT, and ITL are excluded.
+State that the fixed client columns, Mean/P95/P99 TTFT, Mean/P95/P99 TPOT, Mean/P95/P99 ITL, and Mean E2E are retained; post-E2E slots use distinct Std/P75/P90/P999/Max TTFT fields, while duplicate Median/P50 TTFT, other E2E percentiles, and extra TPOT/ITL percentiles are excluded.
 
 - [ ] **Step 4: Run the full static verification**
 
