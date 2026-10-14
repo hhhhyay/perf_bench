@@ -14,7 +14,6 @@
 # 5) 支持 mean_tpot_ms 硬停止阈值；达到阈值立即停止当前 case 后续 BS
 # 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL
 # 7) K 口径由 TOKEN_UNIT 控制，默认 1024；可设为 1000 使用十进制 K
-# 8) 输出 1 token 的单侧 Prefill：先跑 inf 基准，再按基准实际 RPS 做 7 次限流回测
 # ============================================================
 
 set -uo pipefail
@@ -27,9 +26,6 @@ run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 out_dir="./all_result/bench_theory_bs_${run_id}"
 log_dir="${out_dir}/logs"
-prefill_backtest_dir="${out_dir}/prefill_backtest"
-prefill_backtest_log_dir="${prefill_backtest_dir}/logs"
-prefill_backtest_csv="${prefill_backtest_dir}/prefill_backtest.csv"
 
 mkdir -p "${log_dir}"
 
@@ -136,18 +132,6 @@ FIXED_CONCURRENCY="${FIXED_CONCURRENCY:-}"
 #   NUM_PROMPTS_MULTIPLIER=4 bash this_script.sh
 NUM_PROMPTS_MULTIPLIER="${NUM_PROMPTS_MULTIPLIER:-1}"
 
-# 单侧 Prefill（输出 1 token）回测：从 inf 基准实际 RPS 按绝对步长累计回退。
-# 三次 -0.1、两次 -0.2、一次 -0.3、一次 -0.5，共 7 次。
-PREFILL_BACKTEST_DELTAS=(
-  -0.1
-  -0.1
-  -0.1
-  -0.2
-  -0.2
-  -0.3
-  -0.5
-)
-
 # K 的 token 定义：默认 1K=1024，可用 TOKEN_UNIT=1000 切换为十进制口径。
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
 if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
@@ -167,7 +151,7 @@ fi
 
 CASES=(
 #  "4 1"
-  "8 0.000976562"
+  "8 1"
 #  "16 1"
 #  "36 1"
 #  "64 16"
@@ -1369,9 +1353,6 @@ run_one_bs() {
   # 已有成功结果则跳过，方便续跑/补点。
   if [[ -s "${log_file}" && -f "${exit_file}" ]] && [[ "$(cat "${exit_file}" 2>/dev/null)" == "0" ]]; then
     echo "[SKIP] 已完成 ${case_name} per_dp_bs=${per_dp_bs}"
-    if (( output_len == 1 )); then
-      run_prefill_backtests "${per_dp_bs}" "${log_file}"
-    fi
     return 0
   fi
 
@@ -1391,7 +1372,6 @@ run_one_bs() {
   echo "Global Concurrency : ${global_concurrency}"
   echo "Num Prompts        : ${num_prompts} (${global_concurrency} x ${NUM_PROMPTS_MULTIPLIER})"
   echo "Warmup Requests    : ${warmup_requests}"
-  echo "Request Rate       : inf"
   echo "Start Time         : ${bs_start_time}"
   echo "LOG                : ${log_file}"
   echo "============================================================"
@@ -1440,184 +1420,11 @@ run_one_bs() {
   fi
 
   merge_results
-
-  if (( output_len == 1 )); then
-    run_prefill_backtests "${per_dp_bs}" "${log_file}"
-  fi
 }
+
+
 
 # ============================================================
-# 单侧 Prefill RPS 回测
-# 输出 1 token 的 inf 基准完成后，使用基准实际 RPS 的降速比例回测 7 次。
-# 回测结果独立写入 prefill_backtest/prefill_backtest.csv，不混入容量汇总。
-# ============================================================
-
-extract_request_rps() {
-  local log_file="$1"
-  python3 - "${log_file}" <<'PY_RPS'
-import math
-import re
-import sys
-
-path = sys.argv[1]
-pattern = re.compile(r"Request throughput \(req/s\)\s*:\s*([-+0-9.eE]+)")
-try:
-    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
-except OSError:
-    raise SystemExit(1)
-
-for line in reversed(lines):
-    match = pattern.search(line)
-    if not match:
-        continue
-    value = float(match.group(1))
-    if math.isfinite(value) and value > 0:
-        print(f"{value:.6f}")
-        raise SystemExit(0)
-raise SystemExit(1)
-PY_RPS
-}
-
-append_prefill_backtest_result() {
-  local case_name_arg="$1"
-  local input_len_arg="$2"
-  local output_len_arg="$3"
-  local per_dp_bs_arg="$4"
-  local global_concurrency_arg="$5"
-  local trial_arg="$6"
-  local delta_arg="$7"
-  local baseline_rps_arg="$8"
-  local input_rate_arg="$9"
-  local actual_rps_arg="${10}"
-  local status_arg="${11}"
-  local log_file_arg="${12}"
-
-  mkdir -p "${prefill_backtest_dir}"
-  python3 - "${prefill_backtest_csv}" \
-    "${case_name_arg}" "${input_len_arg}" "${output_len_arg}" \
-    "${per_dp_bs_arg}" "${global_concurrency_arg}" "${trial_arg}" \
-    "${delta_arg}" "${baseline_rps_arg}" "${input_rate_arg}" \
-    "${actual_rps_arg}" "${status_arg}" "${log_file_arg}" <<'PY_PREFILL_CSV'
-import csv
-import os
-import sys
-
-path = sys.argv[1]
-values = sys.argv[2:]
-fieldnames = [
-    "case_name", "input_len", "output_len", "per_dp_bs",
-    "global_concurrency", "trial", "delta", "baseline_rps",
-    "input_request_rate", "actual_rps", "case_status", "log_file",
-]
-key = tuple(values[:6])
-rows = []
-if os.path.exists(path):
-    try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.DictReader(f))
-    except (OSError, csv.Error):
-        rows = []
-
-rows = [
-    row for row in rows
-    if tuple(row.get(column, "") for column in fieldnames[:6]) != key
-]
-rows.append(dict(zip(fieldnames, values)))
-
-tmp = path + ".tmp"
-with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.DictWriter(f, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(rows)
-os.replace(tmp, path)
-PY_PREFILL_CSV
-}
-
-run_prefill_backtests() {
-  local per_dp_bs="$1"
-  local baseline_log="$2"
-  local baseline_exit=""
-  local baseline_rps=""
-
-  [[ -s "${baseline_log}" && -f "${baseline_log}.exitcode" ]] || return 0
-  baseline_exit="$(tr -d '[:space:]' < "${baseline_log}.exitcode" 2>/dev/null)"
-  [[ "${baseline_exit}" == "0" ]] || {
-    echo "[PREFILL-BACKTEST-SKIP] baseline 未成功: ${baseline_log}"
-    return 0
-  }
-
-  baseline_rps="$(extract_request_rps "${baseline_log}" 2>/dev/null || true)"
-  if [[ -z "${baseline_rps}" ]]; then
-    echo "[PREFILL-BACKTEST-SKIP] 无法从日志提取实际 RPS: ${baseline_log}"
-    return 0
-  fi
-
-  mkdir -p "${prefill_backtest_log_dir}"
-  echo "[PREFILL-BACKTEST] case=${case_name} per_dp_bs=${per_dp_bs} baseline_rps=${baseline_rps}"
-
-  local trial delta request_rate current_request_rate rate_tag global_concurrency num_prompts warmup_requests
-  local base_name log_file exit_file case_exit_code actual_rps status
-  global_concurrency=$((DP_SIZE * per_dp_bs))
-  num_prompts=$((global_concurrency * NUM_PROMPTS_MULTIPLIER))
-  warmup_requests=0
-  if (( per_dp_bs == 1 )); then
-    warmup_requests=$((DP_SIZE * 16))
-  fi
-  current_request_rate="${baseline_rps}"
-
-  for ((trial=1; trial<=${#PREFILL_BACKTEST_DELTAS[@]}; trial++)); do
-    delta="${PREFILL_BACKTEST_DELTAS[$((trial - 1))]}"
-    request_rate="$(awk -v base="${current_request_rate}" -v delta="${delta}" 'BEGIN {
-      rate = base + delta
-      if (rate <= 0) rate = 0.000001
-      printf "%.6f", rate
-    }')"
-    current_request_rate="${request_rate}"
-    rate_tag="${request_rate//./p}"
-    base_name="${case_name}_in${input_len}_out${output_len}_perdp${per_dp_bs}_global${global_concurrency}_prefill_trial${trial}_rate${rate_tag}"
-    log_file="${prefill_backtest_log_dir}/${base_name}.log"
-    exit_file="${log_file}.exitcode"
-
-    if [[ -s "${log_file}" && -f "${exit_file}" ]] && [[ "$(cat "${exit_file}" 2>/dev/null)" == "0" ]]; then
-      echo "[PREFILL-BACKTEST-SKIP] trial=${trial} input_rate=${request_rate}"
-    else
-      cmd=(
-        python3 -m sglang.bench_serving
-        --backend sglang
-        --base-url "${BASE_URL}"
-        --model "${MODEL}"
-        --dataset-name random-ids
-        --tokenize-prompt
-        --num-prompts "${num_prompts}"
-        --random-input-len "${input_len}"
-        --random-output-len "${output_len}"
-        --random-range-ratio 1.0
-        --request-rate "${request_rate}"
-        --max-concurrency "${global_concurrency}"
-        --warmup-requests "${warmup_requests}"
-        --flush-cache
-        --disable-tqdm
-      )
-      if (( USE_FAKE_PREFILL == 1 )); then
-        cmd+=(--fake-prefill)
-      fi
-      echo "[PREFILL-BACKTEST-RUN] trial=${trial} delta=${delta} input_rate=${request_rate} log=${log_file}"
-      "${cmd[@]}" 2>&1 | tee "${log_file}"
-      case_exit_code="${PIPESTATUS[0]}"
-      printf "%s\n" "${case_exit_code}" > "${exit_file}"
-    fi
-
-    actual_rps="$(extract_request_rps "${log_file}" 2>/dev/null || true)"
-    status="FAIL"
-    [[ "$(cat "${exit_file}" 2>/dev/null)" == "0" ]] && status="PASS"
-    append_prefill_backtest_result \
-      "${case_name}" "${input_len}" "${output_len}" "${per_dp_bs}" \
-      "${global_concurrency}" "${trial}" "${delta}" "${baseline_rps}" \
-      "${request_rate}" "${actual_rps}" "${status}" "${log_file}"
-  done
-}
-
-
 # Inline SLA dense helper
 # 当前 BS 测完后立即检查 SLA。
 # 任一指标进入 target±near，就把当前 BS 到下一个基础 BS 之间的整数 BS 连续跑完。
@@ -1760,9 +1567,6 @@ for case_config in "${CASES[@]}"; do
   echo "# CASE              : ${case_name}"
   echo "# Input             : ${input_k}K(${TOKEN_UNIT}) = ${input_len}"
   echo "# Output            : ${output_k}K(${TOKEN_UNIT}) = ${output_len}"
-  if (( output_len == 1 )); then
-    echo "# Prefill RPS Test  : inf baseline + 7 backtests (-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5)"
-  fi
   echo "# Tokens / Request  : ${tokens_per_request}"
   echo "# DP Size           : ${DP_SIZE}"
   echo "# Max Total Tokens  : ${MAX_TOTAL_TOKENS}"
