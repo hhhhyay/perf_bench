@@ -4,7 +4,7 @@
 
 **Goal:** Add an independent SGLang Prefill TTFT matrix runner for 32K/64K/128K inputs and 3s/5s/10s Mean TTFT targets, while keeping `sglang/sglc.sh` unchanged from its pre-Prefill state.
 
-**Architecture:** `sglang/prefill_ttft.sh` will reuse the existing `sglc.sh` environment names, service discovery, `bench_serving` command arguments, token-unit conversion, flush-cache behavior, and RUN_ID conventions, but will select one per-DP BS per input and search request rate from high to low. It will parse the log prefix before Mean E2E plus the complete TTFT family after the E2E block, then write detailed trials and one best row per matrix point.
+**Architecture:** `sglang/prefill_ttft.sh` will reuse the existing `sglc.sh` environment names, service discovery, `bench_serving` command arguments, token-unit conversion, flush-cache behavior, and RUN_ID conventions, but will select one per-DP BS per input and search request rate from high to low. It will keep the fixed client columns, retain Mean TTFT/P95 TTFT/P99 TTFT and Mean E2E, then use distinct TTFT fields in the post-E2E slots, and write detailed trials plus one best row per matrix point.
 
 **Tech Stack:** Bash, `python3`, `curl`, `awk`, SGLang `bench_serving`, CSV files, Git Bash syntax checks.
 
@@ -18,7 +18,7 @@
 - Default BS rules are `8:256,16:128,32:64,64:32,128:16`, matched by the first input upper bound that contains the input.
 - Every Prefill probe uses `--flush-cache` and does not save per-request JSONL.
 - Final performance selection uses parsed `Request throughput (req/s)` as `actual_rps`, never the configured request rate.
-- Keep all log fields before `Mean E2E Latency (ms)` and all TTFT fields after it; skip E2E, TPOT, and ITL fields.
+- Keep the fixed client fields aligned with `sglc.sh`, retain `Mean TTFT`/`P95 TTFT`/`P99 TTFT` and `Mean E2E Latency`, then use distinct TTFT fields (`Std`/`P75`/`P90`/`P999`/`Max`) in the post-E2E slots; skip duplicate Median/P50 TTFT, other E2E percentiles, TPOT, and ITL fields.
 - Do not add or commit the unrelated untracked `sheet_*.json` files.
 
 ---
@@ -164,21 +164,21 @@ Concurrency
 Accept length
 ```
 
-Then keep only this complete TTFT family:
+Then keep these non-duplicated TTFT fields around the `Mean E2E` position:
 
 ```text
 Mean TTFT (ms)
-Median TTFT (ms)
-P50 TTFT (ms)
-P75 TTFT (ms)
-P90 TTFT (ms)
 P95 TTFT (ms)
 P99 TTFT (ms)
+Mean E2E Latency (ms)
+Std TTFT (ms)
+P75 TTFT (ms)
+P90 TTFT (ms)
 P999 TTFT (ms)
 Max TTFT (ms)
 ```
 
-Skip `Mean E2E Latency`, all E2E percentiles, every TPOT field, and every ITL field. Preserve distinct keys rather than merging labels. Set `actual_rps` from `Request throughput (req/s)` and use `mean_ttft_ms` for target decisions.
+Retain `Mean E2E Latency`, skip other E2E percentiles, duplicate Median/P50 TTFT, every TPOT field, and every ITL field. Preserve distinct keys rather than merging labels. Set `actual_rps` from `Request throughput (req/s)` and use `mean_ttft_ms` for target decisions.
 
 - [ ] **Step 2: Add atomic trial CSV upsert**
 
@@ -190,7 +190,7 @@ For each `(input_k, target_ttft_ms)`, select rows with successful benchmark exit
 
 - [ ] **Step 4: Test parsing with a synthetic log fixture**
 
-Use a temporary log containing prefix fields, E2E fields, all TTFT fields including `P90 TTFT (ms): 1234`, TPOT fields, and ITL fields. Assert the output contains `p90_ttft_ms=1234`, contains the prefix throughput fields, and contains no E2E/TPOT/ITL keys.
+Use a temporary log containing prefix fields, E2E fields, all TTFT fields including `P90 TTFT (ms): 1234`, TPOT fields, and ITL fields. Assert the output contains `mean_e2e_latency_ms`, `p90_ttft_ms=1234`, contains the prefix throughput fields, and contains no other E2E/TPOT/ITL keys.
 
 ### Task 4: Implement high-to-low TTFT search and resume
 
@@ -249,7 +249,7 @@ Document that common `sglc.sh` service and benchmark variables retain their name
 
 - [ ] **Step 3: Document the exact metrics**
 
-State that all fields before Mean E2E are retained, all TTFT statistics are retained including P90, and E2E/TPOT/ITL fields are excluded from the Prefill CSV.
+State that the fixed client columns, Mean TTFT/P95 TTFT/P99 TTFT, and Mean E2E are retained; post-E2E slots use distinct Std/P75/P90/P999/Max TTFT fields, while duplicate Median/P50 TTFT, other E2E percentiles, TPOT, and ITL are excluded.
 
 - [ ] **Step 4: Run the full static verification**
 
@@ -268,4 +268,3 @@ Expected: both syntax checks and diff check pass, and the final `sglc.sh` diff i
 git add -- README.md sglang/prefill_ttft.sh
 git commit -m "新增Prefill TTFT矩阵回测"
 ```
-

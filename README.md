@@ -32,8 +32,9 @@ perf_bench/
 - 输出长度固定为 1 token，不再配置输出长度。
 - 默认测试输入 `32K/64K/128K`，按 `PREFILL_TTFT_BS_RULES` 自动选择一个 per-DP BS，不扫描全部 BS。
 - 对每个输入先跑 `request_rate=inf`，再从高请求率向下寻找满足 Mean TTFT 目标的临界值。
-- 默认目标为 `3s/5s/10s`，结果保留 E2E 前全部字段和完整 TTFT 指标（包括 P90/P95/P99/P999/Max）。
-- 不提取 E2E、TPOT、ITL 指标，不保存逐请求 JSONL。
+- 默认目标为 `3s/5s/10s`，结果字段按 `sglc.sh` 的数据平台布局整理。
+- 保留 `Mean TTFT/P95 TTFT/P99 TTFT`、`Mean E2E Latency`，并在其后放置不重复的 `Std/P75/P90/P999/Max TTFT`。
+- 不提取重复含义的 `Median/P50 TTFT`、其他 E2E 分位数、TPOT、ITL，不保存逐请求 JSONL。
 
 ### vLLM: `vllm/vllmc.sh`
 
@@ -195,6 +196,6 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 - `prefill_ttft_trials.csv`：Prefill 基准和搜索 trial 明细。
 - `prefill_ttft_matrix.csv`：每个输入长度和 TTFT 目标下的最优达标结果。
 
-Prefill CSV 保留 benchmark 日志中 `Mean E2E Latency (ms)` 之前的全部字段，以及后续完整 TTFT 指标：Mean、Median、P50、P75、P90、P95、P99、P999、Max。E2E、TPOT、ITL 字段不提取。
+Prefill CSV 的客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean TTFT/P95 TTFT/P99 TTFT`、`Mean E2E Latency`，并用不重复的 `Std/P75/P90/P999/Max TTFT` 替代 E2E 后续分位数位置。`Median/P50 TTFT`、其他 E2E 分位数、TPOT、ITL 字段不提取。
 
 `all_result/` 是运行产物目录，建议不要提交到仓库。

@@ -289,11 +289,11 @@ prefix = {
     "Total token throughput (tok/s)": "total_throughput",
     "Concurrency": "concurrency",
     "Accept length": "accept_length",
+    "Mean E2E Latency (ms)": "mean_e2e_latency_ms",
 }
 ttft = {
+    "Std TTFT (ms)": "std_ttft_ms",
     "Mean TTFT (ms)": "mean_ttft_ms",
-    "Median TTFT (ms)": "median_ttft_ms",
-    "P50 TTFT (ms)": "p50_ttft_ms",
     "P75 TTFT (ms)": "p75_ttft_ms",
     "P90 TTFT (ms)": "p90_ttft_ms",
     "P95 TTFT (ms)": "p95_ttft_ms",
@@ -382,8 +382,8 @@ fieldnames = [
     "total_generated_tokens_retokenized", "request_throughput",
     "input_throughput", "output_throughput", "peak_output_throughput",
     "peak_concurrency", "total_throughput", "concurrency", "accept_length",
-    "mean_ttft_ms", "median_ttft_ms", "p50_ttft_ms", "p75_ttft_ms",
-    "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "p999_ttft_ms",
+    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "mean_e2e_latency_ms",
+    "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
     "max_ttft_ms", "case_status", "target_status", "log_file",
 ]
 row = {
@@ -569,8 +569,8 @@ fields = [
     "total_generated_tokens_retokenized", "request_throughput",
     "input_throughput", "output_throughput", "peak_output_throughput",
     "peak_concurrency", "total_throughput", "concurrency", "accept_length",
-    "mean_ttft_ms", "median_ttft_ms", "p50_ttft_ms", "p75_ttft_ms",
-    "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "p999_ttft_ms",
+    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "mean_e2e_latency_ms",
+    "std_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p999_ttft_ms",
     "max_ttft_ms", "case_status", "target_status", "log_file",
     "selection_status",
 ]
