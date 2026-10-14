@@ -36,7 +36,8 @@ TOKEN_UNIT="${TOKEN_UNIT:-1024}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 PREFILL_TTFT_INPUTS="${PREFILL_TTFT_INPUTS:-32 64 128}"
-PREFILL_TTFT_TARGETS_MS="${PREFILL_TTFT_TARGETS_MS:-3000 5000 10000}"
+PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-}"
+PREFILL_TTFT_TARGETS_MS="${PREFILL_TTFT_TARGETS_MS:-}"
 PREFILL_TTFT_SEARCH_ITERS="${PREFILL_TTFT_SEARCH_ITERS:-7}"
 PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}"
 PREFILL_TTFT_TEST_MODE="${PREFILL_TTFT_TEST_MODE:-}"
@@ -50,6 +51,52 @@ if [[ ! "${PREFILL_TTFT_SEARCH_ITERS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] PREFILL_TTFT_SEARCH_ITERS 必须是正整数" >&2
   exit 1
 fi
+
+prefill_sla_rules_text() {
+  if [[ -n "${PREFILL_SLA_RULES}" ]]; then
+    printf "%s\n" "${PREFILL_SLA_RULES}"
+    return 0
+  fi
+
+  local target_list="${PREFILL_TTFT_TARGETS_MS:-3000 5000 10000}"
+  local target
+  for target in ${target_list//,/ }; do
+    printf "mean_ttft_ms:%s:0," "${target}"
+  done
+  printf "\n"
+}
+
+prefill_metric_supported() {
+  case "$1" in
+    mean_ttft_ms|p50_ttft_ms|std_ttft_ms|p75_ttft_ms|p90_ttft_ms|p95_ttft_ms|p99_ttft_ms|p999_ttft_ms|max_ttft_ms)
+      return 0 ;;
+    *)  return 1 ;;
+  esac
+}
+
+validate_prefill_sla_rules() {
+  local rules_text rule metric target near extra
+  rules_text="$(prefill_sla_rules_text)"
+  [[ -n "${rules_text//[[:space:],]/}" ]] || {
+    echo "[ERROR] PREFILL_SLA_RULES 不能为空" >&2
+    return 1
+  }
+
+  IFS=',' read -ra rules <<< "${rules_text}"
+  for rule in "${rules[@]}"; do
+    rule="${rule//[[:space:]]/}"
+    [[ -n "${rule}" ]] || continue
+    IFS=':' read -r metric target near extra <<< "${rule}"
+    if [[ -n "${extra:-}" ]] || ! prefill_metric_supported "${metric}" \
+      || [[ ! "${target}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+      || ! awk -v value="${target}" 'BEGIN { exit !(value > 0) }' \
+      || [[ ! "${near:-0}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      echo "[ERROR] 非法 PREFILL_SLA_RULES 规则: ${rule}" >&2
+      echo "[ERROR] 支持格式: metric:target:near，metric 必须是已提取的 TTFT 指标" >&2
+      return 1
+    fi
+  done
+}
 
 load_capacity_from_loads_api() {
   local loads_url="${BASE_URL%/}/v1/loads?include=all"
@@ -363,28 +410,30 @@ csv_upsert_trial() {
   local input_len="$2"
   local per_dp_bs="$3"
   local global_concurrency="$4"
-  local target_ms="$5"
-  local trial="$6"
-  local phase="$7"
-  local input_rate="$8"
-  local case_status="$9"
-  local log_file="${10}"
+  local target_metric="$5"
+  local target_value_ms="$6"
+  local target_near_ms="$7"
+  local trial="$8"
+  local phase="$9"
+  local input_rate="${10}"
+  local case_status="${11}"
+  local log_file="${12}"
   local metrics_json
   metrics_json="$(parse_benchmark_log "${log_file}")"
 
   mkdir -p "${out_dir}"
-  "${PYTHON_BIN}" - "${trials_csv}" "${input_k}" "${input_len}" "${per_dp_bs}" "${global_concurrency}" "${target_ms}" "${trial}" "${phase}" "${input_rate}" "${case_status}" "${log_file}" "${metrics_json}" <<'PY_CSV'
+  "${PYTHON_BIN}" - "${trials_csv}" "${input_k}" "${input_len}" "${per_dp_bs}" "${global_concurrency}" "${target_metric}" "${target_value_ms}" "${target_near_ms}" "${trial}" "${phase}" "${input_rate}" "${case_status}" "${log_file}" "${metrics_json}" <<'PY_CSV'
 import csv
 import json
 import os
 import sys
 
 path = sys.argv[1]
-input_k, input_len, per_dp_bs, global_concurrency, target_ms, trial, phase, input_rate, case_status, log_file = sys.argv[2:12]
-metrics = json.loads(sys.argv[12])
+input_k, input_len, per_dp_bs, global_concurrency, target_metric, target_value_ms, target_near_ms, trial, phase, input_rate, case_status, log_file = sys.argv[2:14]
+metrics = json.loads(sys.argv[14])
 fieldnames = [
     "input_k", "input_len", "output_len", "per_dp_bs", "global_concurrency",
-    "target_ttft_ms", "trial", "search_phase", "input_request_rate",
+    "target_metric", "target_value_ms", "target_near_ms", "trial", "search_phase", "input_request_rate",
     "actual_rps", "backend", "traffic_request_rate", "max_request_concurrency",
     "successful_requests", "benchmark_duration_s", "total_input_tokens",
     "total_input_text_tokens", "total_generated_tokens",
@@ -400,17 +449,18 @@ fieldnames = [
 row = {
     "input_k": input_k, "input_len": input_len, "output_len": "1",
     "per_dp_bs": per_dp_bs, "global_concurrency": global_concurrency,
-    "target_ttft_ms": target_ms, "trial": trial, "search_phase": phase,
+    "target_metric": target_metric, "target_value_ms": target_value_ms,
+    "target_near_ms": target_near_ms, "trial": trial, "search_phase": phase,
     "input_request_rate": input_rate, "case_status": case_status,
     "log_file": log_file,
 }
 row.update(metrics)
 row["actual_rps"] = metrics.get("request_throughput", "")
-mean = metrics.get("mean_ttft_ms")
-if not target_ms:
+target_value = metrics.get(target_metric) if target_metric else None
+if not target_metric or not target_value_ms:
     row["target_status"] = "BASELINE"
-elif isinstance(mean, (int, float)):
-    row["target_status"] = "MEET" if mean <= float(target_ms) else "EXCEED"
+elif isinstance(target_value, (int, float)):
+    row["target_status"] = "MEET" if target_value <= float(target_value_ms) else "EXCEED"
 else:
     row["target_status"] = "NO_METRIC"
 
@@ -421,11 +471,12 @@ if os.path.exists(path):
             rows = list(csv.DictReader(f))
     except (OSError, csv.Error):
         rows = []
-key = (input_k, target_ms, trial, input_rate, phase)
+key = (input_k, target_metric, target_value_ms, trial, input_rate, phase)
 rows = [
     old for old in rows
-    if (old.get("input_k", ""), old.get("target_ttft_ms", ""),
-        old.get("trial", ""), old.get("input_request_rate", ""),
+    if (old.get("input_k", ""), old.get("target_metric", ""),
+        old.get("target_value_ms", ""), old.get("trial", ""),
+        old.get("input_request_rate", ""),
         old.get("search_phase", "")) != key
 ]
 rows.append({name: row.get(name, "") for name in fieldnames})
@@ -442,10 +493,12 @@ run_probe() {
   local input_k="$1"
   local input_len="$2"
   local per_dp_bs="$3"
-  local target_ms="$4"
-  local trial="$5"
-  local phase="$6"
-  local request_rate="$7"
+  local target_metric="$4"
+  local target_value_ms="$5"
+  local target_near_ms="$6"
+  local trial="$7"
+  local phase="$8"
+  local request_rate="$9"
   local global_concurrency=$((DP_SIZE * per_dp_bs))
   local num_prompts=$((global_concurrency * NUM_PROMPTS_MULTIPLIER))
   local warmup_requests=0
@@ -454,7 +507,7 @@ run_probe() {
   if (( per_dp_bs == 1 )); then
     warmup_requests=$((DP_SIZE * 16))
   fi
-  target_tag="${target_ms:-baseline}"
+  target_tag="${target_metric:-baseline}_${target_value_ms:-baseline}_${target_near_ms:-0}"
   rate_tag="${request_rate//./p}"
   rate_tag="${rate_tag//-/m}"
   base_name="input${input_k}k_perdp${per_dp_bs}_target${target_tag}_trial${trial}_rate${rate_tag}"
@@ -462,10 +515,10 @@ run_probe() {
   exit_file="${log_file}.exitcode"
 
   if [[ -s "${log_file}" && -f "${exit_file}" ]] && [[ "$(cat "${exit_file}" 2>/dev/null)" == "0" ]]; then
-    echo "[SKIP] input=${input_k}K target=${target_ms:-baseline} rate=${request_rate}"
+    echo "[SKIP] input=${input_k}K target=${target_metric:-baseline}<=${target_value_ms:-inf} rate=${request_rate}"
   else
     build_bench_command "${input_len}" "${global_concurrency}" "${num_prompts}" "${warmup_requests}" "${request_rate}"
-    echo "[RUN] input=${input_k}K per_dp_bs=${per_dp_bs} target=${target_ms:-baseline} phase=${phase} rate=${request_rate}"
+    echo "[RUN] input=${input_k}K per_dp_bs=${per_dp_bs} target=${target_metric:-baseline}<=${target_value_ms:-inf} phase=${phase} rate=${request_rate}"
     if [[ "${PREFILL_TTFT_TEST_MODE}" == "command" ]]; then
       printf '%q ' "${cmd[@]}"
       echo
@@ -478,21 +531,21 @@ run_probe() {
   fi
 
   exit_code="$(cat "${exit_file}" 2>/dev/null || echo 1)"
-  local metrics_json actual_rps mean_ttft
+  local metrics_json actual_rps target_value
   metrics_json="$(parse_benchmark_log "${log_file}")"
   actual_rps="$(printf "%s" "${metrics_json}" | "${PYTHON_BIN}" -c 'import json,sys
 d=json.load(sys.stdin); v=d.get("request_throughput")
 print(v if v is not None else "")')"
-  mean_ttft="$(printf "%s" "${metrics_json}" | "${PYTHON_BIN}" -c 'import json,sys
-d=json.load(sys.stdin); v=d.get("mean_ttft_ms")
-print(v if v is not None else "")')"
+  target_value="$(printf "%s" "${metrics_json}" | "${PYTHON_BIN}" -c 'import json,sys
+d=json.load(sys.stdin); metric=sys.argv[1]; v=d.get(metric) if metric else None
+print(v if v is not None else "")' "${target_metric}")"
 
   local status="FAIL"
   [[ "${exit_code}" == "0" ]] && status="PASS"
-  csv_upsert_trial "${input_k}" "${input_len}" "${per_dp_bs}" "${global_concurrency}" "${target_ms}" "${trial}" "${phase}" "${request_rate}" "${status}" "${log_file}"
+  csv_upsert_trial "${input_k}" "${input_len}" "${per_dp_bs}" "${global_concurrency}" "${target_metric}" "${target_value_ms}" "${target_near_ms}" "${trial}" "${phase}" "${request_rate}" "${status}" "${log_file}"
 
   LAST_ACTUAL_RPS="${actual_rps}"
-  LAST_MEAN_TTFT="${mean_ttft}"
+  LAST_TARGET_VALUE="${target_value}"
   LAST_CASE_STATUS="${status}"
   LAST_LOG_FILE="${log_file}"
 }
@@ -501,22 +554,24 @@ search_target() {
   local input_k="$1"
   local input_len="$2"
   local per_dp_bs="$3"
-  local target_ms="$4"
-  local baseline_rps="$5"
-  local baseline_ttft="$6"
-  local baseline_log="$7"
+  local target_metric="$4"
+  local target_value_ms="$5"
+  local target_near_ms="$6"
+  local baseline_rps="$7"
+  local baseline_value="$8"
+  local baseline_log="$9"
   local high_rate="${baseline_rps}"
   local low_rate=""
   local low_rps=""
-  local low_ttft=""
+  local low_value=""
   local trial=0
   local probe_rate
   local target_met
 
-  if awk -v mean="${baseline_ttft}" -v target="${target_ms}" 'BEGIN { exit !(mean <= target) }' 2>/dev/null; then
+  if awk -v value="${baseline_value}" -v target="${target_value_ms}" 'BEGIN { exit !(value <= target) }' 2>/dev/null; then
     csv_upsert_trial "${input_k}" "${input_len}" "${per_dp_bs}" "$((DP_SIZE * per_dp_bs))" \
-      "${target_ms}" "0" "baseline-target" "inf" "PASS" "${baseline_log}"
-    echo "[TARGET-PASS] input=${input_k}K target=${target_ms}ms uses inf baseline actual_rps=${baseline_rps}"
+      "${target_metric}" "${target_value_ms}" "${target_near_ms}" "0" "baseline-target" "inf" "PASS" "${baseline_log}"
+    echo "[TARGET-PASS] input=${input_k}K ${target_metric}<=${target_value_ms}ms uses inf baseline actual_rps=${baseline_rps}"
     return 0
   fi
 
@@ -531,20 +586,20 @@ search_target() {
     fi
     if awk -v rate="${probe_rate}" 'BEGIN { exit !(rate > 0) }' 2>/dev/null; then :; else break; fi
 
-    run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "${target_ms}" "${trial}" "${phase}" "${probe_rate}"
+    run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "${target_metric}" "${target_value_ms}" "${target_near_ms}" "${trial}" "${phase}" "${probe_rate}"
     target_met=1
-    if [[ "${LAST_CASE_STATUS}" != "PASS" || -z "${LAST_MEAN_TTFT}" ]]; then
+    if [[ "${LAST_CASE_STATUS}" != "PASS" || -z "${LAST_TARGET_VALUE}" ]]; then
       target_met=0
-    elif ! awk -v mean="${LAST_MEAN_TTFT}" -v target="${target_ms}" 'BEGIN { exit !(mean <= target) }' 2>/dev/null; then
+    elif ! awk -v value="${LAST_TARGET_VALUE}" -v target="${target_value_ms}" 'BEGIN { exit !(value <= target) }' 2>/dev/null; then
       target_met=0
     fi
 
     if (( target_met == 1 )); then
       low_rate="${probe_rate}"
       low_rps="${LAST_ACTUAL_RPS}"
-      low_ttft="${LAST_MEAN_TTFT}"
+      low_value="${LAST_TARGET_VALUE}"
       if [[ "${phase}" == "descending" ]]; then
-        echo "[BRACKET] input=${input_k}K target=${target_ms}ms fail_rate=${high_rate} pass_rate=${low_rate}"
+        echo "[BRACKET] input=${input_k}K ${target_metric}<=${target_value_ms}ms fail_rate=${high_rate} pass_rate=${low_rate}"
       fi
     else
       high_rate="${probe_rate}"
@@ -558,9 +613,9 @@ search_target() {
   done
 
   if [[ -n "${low_rate}" ]]; then
-    echo "[TARGET-PASS] input=${input_k}K target=${target_ms}ms candidate_rps=${low_rps} rate=${low_rate} mean_ttft=${low_ttft}"
+    echo "[TARGET-PASS] input=${input_k}K ${target_metric}<=${target_value_ms}ms candidate_rps=${low_rps} rate=${low_rate} value=${low_value}"
   else
-    echo "[TARGET-FAIL] input=${input_k}K target=${target_ms}ms no passing request rate"
+    echo "[TARGET-FAIL] input=${input_k}K ${target_metric}<=${target_value_ms}ms no passing request rate"
   fi
 }
 
@@ -573,7 +628,7 @@ import sys
 trials_path, matrix_path = sys.argv[1:]
 fields = [
     "input_k", "input_len", "output_len", "per_dp_bs", "global_concurrency",
-    "target_ttft_ms", "trial", "search_phase", "input_request_rate",
+    "target_metric", "target_value_ms", "target_near_ms", "trial", "search_phase", "input_request_rate",
     "actual_rps", "backend", "traffic_request_rate", "max_request_concurrency",
     "successful_requests", "benchmark_duration_s", "total_input_tokens",
     "total_input_text_tokens", "total_generated_tokens",
@@ -601,43 +656,53 @@ def num(row, key):
 
 inputs = sorted({row.get("input_k", "") for row in rows if row.get("input_k")})
 targets = sorted({
-    row.get("target_ttft_ms", "") for row in rows
-    if row.get("target_ttft_ms", "")
-}, key=lambda x: float(x))
+    (row.get("target_metric", ""), row.get("target_value_ms", ""), row.get("target_near_ms", ""))
+    for row in rows
+    if row.get("target_metric", "") and row.get("target_value_ms", "")
+}, key=lambda x: (x[0], float(x[1]), float(x[2] or 0)))
 out = []
 for input_k in inputs:
     baseline = next(
         (row for row in rows
          if row.get("input_k") == input_k
-         and row.get("target_ttft_ms", "") == ""
+         and row.get("target_metric", "") == ""
          and row.get("case_status") == "PASS"),
         None,
     )
     target_values = [t for t in targets if any(
-        row.get("input_k") == input_k and row.get("target_ttft_ms") == t
+        row.get("input_k") == input_k
+        and row.get("target_metric") == t[0]
+        and row.get("target_value_ms") == t[1]
+        and row.get("target_near_ms", "") == t[2]
         for row in rows
     )]
-    for target in target_values:
+    for target_metric, target_value, target_near in target_values:
         candidates = [
             row for row in rows
             if row.get("input_k") == input_k
-            and row.get("target_ttft_ms") == target
+            and row.get("target_metric") == target_metric
+            and row.get("target_value_ms") == target_value
+            and row.get("target_near_ms", "") == target_near
             and row.get("case_status") == "PASS"
             and row.get("target_status") == "MEET"
             and num(row, "actual_rps") is not None
         ]
-        if baseline and num(baseline, "mean_ttft_ms") is not None and num(baseline, "mean_ttft_ms") <= float(target):
+        baseline_value = num(baseline, target_metric) if baseline else None
+        if baseline and baseline_value is not None and baseline_value <= float(target_value):
             base = dict(baseline)
-            base["target_ttft_ms"] = target
+            base["target_metric"] = target_metric
+            base["target_value_ms"] = target_value
+            base["target_near_ms"] = target_near
             base["target_status"] = "MEET"
             candidates.append(base)
         if candidates:
-            best = max(candidates, key=lambda row: (num(row, "actual_rps"), -num(row, "mean_ttft_ms")))
+            best = max(candidates, key=lambda row: (num(row, "actual_rps"), -num(row, target_metric)))
             best["selection_status"] = "BEST"
             out.append({field: best.get(field, "") for field in fields})
         else:
             out.append({
-                "input_k": input_k, "target_ttft_ms": target,
+                "input_k": input_k, "target_metric": target_metric,
+                "target_value_ms": target_value, "target_near_ms": target_near,
                 "case_status": "NO_PASS", "target_status": "NO_PASS",
                 "selection_status": "NO_PASS",
             })
@@ -654,7 +719,8 @@ PY_SUMMARY
 
 run_input_matrix() {
   local input_k="$1"
-  local input_len per_dp_bs baseline_rps baseline_ttft baseline_log target
+  local input_len per_dp_bs baseline_rps baseline_log
+  local rules_text rule target_metric target_value_ms target_near_ms extra baseline_value
 
   input_len="$(tokens_from_k "${input_k}")" || {
     echo "[ERROR] 无法转换输入长度 ${input_k}K" >&2
@@ -669,28 +735,33 @@ run_input_matrix() {
   echo "PREFILL GLOBAL CONC : $((DP_SIZE * per_dp_bs))"
   echo "============================================================"
 
-  run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "" "0" "baseline" "inf"
+  run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "" "" "" "0" "baseline" "inf"
   baseline_rps="${LAST_ACTUAL_RPS}"
-  baseline_ttft="${LAST_MEAN_TTFT}"
   baseline_log="${LAST_LOG_FILE}"
-  if [[ "${LAST_CASE_STATUS}" != "PASS" || -z "${baseline_rps}" || -z "${baseline_ttft}" ]]; then
-    echo "[ERROR] input=${input_k}K 的 inf 基准缺少实际 RPS 或 Mean TTFT，跳过矩阵" >&2
+  if [[ "${LAST_CASE_STATUS}" != "PASS" || -z "${baseline_rps}" ]]; then
+    echo "[ERROR] input=${input_k}K 的 inf 基准缺少实际 RPS，跳过矩阵" >&2
     return 1
   fi
 
-  local target_list="${PREFILL_TTFT_TARGETS_MS//,/ }"
-  for target in ${target_list}; do
-    if [[ "${target}" =~ ^[1-9][0-9]*$ ]]; then
-      search_target "${input_k}" "${input_len}" "${per_dp_bs}" "${target}" "${baseline_rps}" "${baseline_ttft}" "${baseline_log}"
-    else
-      echo "[ERROR] 非法 TTFT 目标: ${target}" >&2
-      return 1
+  rules_text="$(prefill_sla_rules_text)"
+  IFS=',' read -ra rules <<< "${rules_text}"
+  for rule in "${rules[@]}"; do
+    rule="${rule//[[:space:]]/}"
+    [[ -n "${rule}" ]] || continue
+    IFS=':' read -r target_metric target_value_ms target_near_ms extra <<< "${rule}"
+    target_near_ms="${target_near_ms:-0}"
+    baseline_value="$(extract_metric "${baseline_log}" "${target_metric}" 2>/dev/null || true)"
+    if [[ -z "${baseline_value}" ]]; then
+      echo "[ERROR] input=${input_k}K 的基准日志缺少 ${target_metric}，跳过规则 ${rule}" >&2
+      continue
     fi
+    search_target "${input_k}" "${input_len}" "${per_dp_bs}" "${target_metric}" "${target_value_ms}" "${target_near_ms}" "${baseline_rps}" "${baseline_value}" "${baseline_log}"
   done
 }
 
 main() {
   mkdir -p "${log_dir}"
+  validate_prefill_sla_rules || return 1
   if [[ "${PREFILL_TTFT_TEST_MODE}" == "command" ]]; then
     DP_SIZE="${DP_SIZE:-2}"
     local input_len=32768
@@ -717,7 +788,7 @@ main() {
   echo "[INFO] DP_SIZE=${DP_SIZE}"
   echo "[INFO] TOKEN_UNIT=${TOKEN_UNIT}"
   echo "[INFO] INPUTS=${PREFILL_TTFT_INPUTS}"
-  echo "[INFO] TARGETS_MS=${PREFILL_TTFT_TARGETS_MS}"
+  echo "[INFO] SLA_RULES=$(prefill_sla_rules_text)"
   echo "[INFO] BS_RULES=${PREFILL_TTFT_BS_RULES}"
   echo "[INFO] OUTPUT_DIR=${out_dir}"
 

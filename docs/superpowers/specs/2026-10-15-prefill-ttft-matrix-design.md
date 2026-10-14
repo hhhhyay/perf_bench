@@ -31,7 +31,7 @@ Prefill 脚本沿用 `sglc.sh` 的已有环境变量和默认值，并新增以�
 
 ```bash
 PREFILL_TTFT_INPUTS="32 64 128"
-PREFILL_TTFT_TARGETS_MS="3000 5000 10000"
+PREFILL_SLA_RULES="mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0"
 PREFILL_TTFT_SEARCH_ITERS=7
 PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16"
 ```
@@ -42,13 +42,15 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 
 `PREFILL_TTFT_BS_RULES` 使用 `输入上限K:per_dp_bs` 逗号分隔，按第一个满足 `input_k <= 上限K` 的规则选择 BS。例如默认规则表示：`8K` 以内使用 256，`8K~16K` 使用 128，`16K~32K` 使用 64，`32K~64K` 使用 32，`64K~128K` 使用 16。规则由环境变量覆盖，不在代码中固定单个 BS。
 
+`PREFILL_SLA_RULES` 使用 `metric:target:near` 逗号分隔。`metric` 可使用已提取的 TTFT 字段，例如 `mean_ttft_ms`、`p50_ttft_ms`、`p95_ttft_ms`、`p99_ttft_ms`；回测按 `metric <= target` 判断达标，`near` 保留为规则元数据。未设置时默认生成 Mean TTFT 的 `3000/5000/10000ms` 三条规则。
+
 除矩阵参数外，服务地址、模型、DP、容量、并行、请求数量、`USE_FAKE_PREFILL`、`TOKEN_UNIT` 和续测参数均使用与 `sglc.sh` 相同的名字和语义。benchmark 命令参数保持一致，仅由矩阵逻辑填充输入长度、输出长度、选定并发和限流请求率。
 
 ## 搜索算法
 
 对每个输入长度先根据 `PREFILL_TTFT_BS_RULES` 选择一次 `per_dp_bs`，然后执行一次 `request_rate=inf` 基准测试，提取成功日志中的实际 RPS，作为高请求率上界。随后对每个 TTFT 目标执行临界值搜索：
 
-1. 先测试高请求率。若 `mean_ttft_ms <= target_ttft_ms`，直接将该结果作为当前目标的最大候选。
+1. 先测试高请求率。若规则指定的 `target_metric <= target_value_ms`，直接将该结果作为当前目标的最大候选。
 2. 若高请求率超标，则继续向低请求率测试，直到找到一个达标点；维护“高点超标、低点达标”的区间。
 3. 在该区间内二分请求率，最多执行 `PREFILL_TTFT_SEARCH_ITERS` 次搜索测试。达标时提高低点，超标时降低高点。
 4. 在所有成功且达标的结果中，按 `actual_rps` 取最大值；若实际 RPS 相同，则优先选择 `mean_ttft_ms` 更低的结果。
@@ -66,11 +68,11 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 <result_dir>/prefill_ttft_matrix.csv
 ```
 
-`prefill_ttft_trials.csv` 保存所有基准和搜索 trial。客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL` 和 `Mean E2E Latency`；在 `Mean E2E Latency` 后放置 `P50/Std/P75/P90/P999/Max TTFT`，替代 E2E 后续分位数位置。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。不同日志 label 的字段按各自语义分别保存，不合并成一个指标。至少包含以下字段：
+`prefill_ttft_trials.csv` 保存所有基准和搜索 trial。客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL` 和 `Mean E2E Latency`；在 `Mean E2E Latency` 后放置 `P50/Std/P75/P90/P999/Max TTFT`，替代 E2E 后续分位数位置。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。不同日志 label 的字段按各自语义分别保存，不合并成一个指标。每条规则同时记录 `target_metric`、`target_value_ms`、`target_near_ms`。至少包含以下字段：
 
 ```text
 input_k,input_len,output_len,per_dp_bs,global_concurrency,
-target_ttft_ms,trial,search_phase,input_request_rate,actual_rps,
+target_metric,target_value_ms,target_near_ms,trial,search_phase,input_request_rate,actual_rps,
 backend,traffic_request_rate,max_request_concurrency,
 successful_requests,benchmark_duration_s,total_input_tokens,
 total_input_text_tokens,total_generated_tokens,

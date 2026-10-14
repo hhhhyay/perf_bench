@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an independent SGLang Prefill TTFT matrix runner for 32K/64K/128K inputs and 3s/5s/10s Mean TTFT targets, while keeping `sglang/sglc.sh` unchanged from its pre-Prefill state.
+**Goal:** Add an independent SGLang Prefill TTFT matrix runner for configurable inputs and SLA metric/threshold rules, with default 32K/64K/128K inputs and 3s/5s/10s Mean TTFT targets, while keeping `sglang/sglc.sh` unchanged from its pre-Prefill state.
 
 **Architecture:** `sglang/prefill_ttft.sh` will reuse the existing `sglc.sh` environment names, service discovery, `bench_serving` command arguments, token-unit conversion, flush-cache behavior, and RUN_ID conventions, but will select one per-DP BS per input and search request rate from high to low. It will keep the fixed client columns, retain the standard TTFT/TPOT/ITL fields and Mean E2E, then use P50 plus distinct TTFT fields in the post-E2E slots, and write detailed trials plus one best row per matrix point.
 
@@ -14,7 +14,8 @@
 - The Prefill runner must use the same benchmark command parameters as `sglc.sh`; only input length, output length, selected BS, and request-rate search change.
 - Default `TOKEN_UNIT=1024`; `TOKEN_UNIT=1000` remains an explicit decimal-K option.
 - Prefill output length is exactly 1 token.
-- Default matrix inputs are `32 64 128`; default TTFT targets are `3000 5000 10000` milliseconds.
+- Default matrix inputs are `32 64 128`; default SLA rules are Mean TTFT targets `3000/5000/10000` milliseconds.
+- `PREFILL_SLA_RULES` accepts `metric:target:near` rules and drives both target judgment and matrix dimensions; supported target metrics include extracted TTFT fields such as `mean_ttft_ms`, `p50_ttft_ms`, `p95_ttft_ms`, and `p99_ttft_ms`.
 - Default BS rules are `8:256,16:128,32:64,64:32,128:16`, matched by the first input upper bound that contains the input.
 - Every Prefill probe uses `--flush-cache` and does not save per-request JSONL.
 - Final performance selection uses parsed `Request throughput (req/s)` as `actual_rps`, never the configured request rate.
@@ -51,7 +52,7 @@ Add the following defaults near the top of `sglang/prefill_ttft.sh`:
 ```bash
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PREFILL_TTFT_INPUTS="${PREFILL_TTFT_INPUTS:-32 64 128}"
-PREFILL_TTFT_TARGETS_MS="${PREFILL_TTFT_TARGETS_MS:-3000 5000 10000}"
+PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0}"
 PREFILL_TTFT_SEARCH_ITERS="${PREFILL_TTFT_SEARCH_ITERS:-7}"
 PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}"
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
@@ -189,11 +190,11 @@ Retain `Mean E2E Latency`, standard Mean/P95/P99 TPOT and ITL fields, skip other
 
 - [ ] **Step 2: Add atomic trial CSV upsert**
 
-Write UTF-8 CSV through a temporary file and `os.replace`. Deduplicate by `(input_k, target_ttft_ms, trial, input_request_rate)` and include the metadata, all prefix metrics, all TTFT metrics, `case_status`, and `log_file`.
+Write UTF-8 CSV through a temporary file and `os.replace`. Deduplicate by `(input_k, target_metric, target_value_ms, target_near_ms, trial, input_request_rate)` and include the metadata, all prefix metrics, all TTFT metrics, `case_status`, and `log_file`.
 
 - [ ] **Step 3: Add best-row matrix summary**
 
-For each `(input_k, target_ttft_ms)`, select rows with successful benchmark exit and `mean_ttft_ms <= target_ttft_ms`; choose maximum `actual_rps`, then lower `mean_ttft_ms` as the tie breaker. Write a `FAIL`/`NO_PASS` summary when no valid candidate exists.
+For each `(input_k, target_metric, target_value_ms, target_near_ms)`, select rows with successful benchmark exit and `target_metric <= target_value_ms`; choose maximum `actual_rps`, then lower target metric value as the tie breaker. Write a `FAIL`/`NO_PASS` summary when no valid candidate exists.
 
 - [ ] **Step 4: Test parsing with a synthetic log fixture**
 
@@ -247,7 +248,7 @@ Add a runnable example:
 
 ```bash
 PREFILL_TTFT_INPUTS="32 64 128" \
-PREFILL_TTFT_TARGETS_MS="3000 5000 10000" \
+PREFILL_SLA_RULES="mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0" \
 PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16" \
 bash sglang/prefill_ttft.sh
 ```

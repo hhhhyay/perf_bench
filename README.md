@@ -31,8 +31,8 @@ perf_bench/
 - 使用与 `sglc.sh` 相同的服务配置和 `bench_serving` 参数。
 - 输出长度固定为 1 token，不再配置输出长度。
 - 默认测试输入 `32K/64K/128K`，按 `PREFILL_TTFT_BS_RULES` 自动选择一个 per-DP BS，不扫描全部 BS。
-- 对每个输入先跑 `request_rate=inf`，再从高请求率向下寻找满足 Mean TTFT 目标的临界值。
-- 默认目标为 `3s/5s/10s`，结果字段按 `sglc.sh` 的数据平台布局整理。
+- 对每个输入先跑 `request_rate=inf`，再从高请求率向下寻找满足每条 SLA 规则的临界值。
+- 默认 SLA 规则为 `mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0`，也可按规则切换为 P50/P95/P99 等 TTFT 指标。
 - 保留平台固定的 `Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL` 和 `Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。
 - 不提取与 `P50 TTFT` 重复的 `Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数，不保存逐请求 JSONL。
 
@@ -71,7 +71,7 @@ cd perf_bench
 BASE_URL=http://127.0.0.1:30000 \
 MODEL=/path/to/model \
 PREFILL_TTFT_INPUTS="32 64 128" \
-PREFILL_TTFT_TARGETS_MS="3000 5000 10000" \
+PREFILL_SLA_RULES="mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0" \
 PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16" \
 bash sglang/prefill_ttft.sh
 ```
@@ -103,7 +103,7 @@ bash vllm/vllmc.sh
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
 | `TOKEN_UNIT` | K 的 token 定义，默认 `1024`；设为 `1000` 使用十进制 K。 |
 | `PREFILL_TTFT_INPUTS` | Prefill 输入长度，默认 `32 64 128`，单位为 K。 |
-| `PREFILL_TTFT_TARGETS_MS` | Prefill Mean TTFT 目标，默认 `3000 5000 10000`。 |
+| `PREFILL_SLA_RULES` | Prefill SLA 规则，格式为 `metric:target:near`，例如 `p95_ttft_ms:5000:0`；默认使用 Mean TTFT 的 3s/5s/10s。 |
 | `PREFILL_TTFT_SEARCH_ITERS` | 每个 TTFT 目标最多搜索次数，默认 `7`。 |
 | `PREFILL_TTFT_BS_RULES` | 输入上限 K 到 per-DP BS 的规则，默认 `8:256,16:128,32:64,64:32,128:16`。 |
 
@@ -196,6 +196,6 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 - `prefill_ttft_trials.csv`：Prefill 基准和搜索 trial 明细。
 - `prefill_ttft_matrix.csv`：每个输入长度和 TTFT 目标下的最优达标结果。
 
-Prefill CSV 的客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL`、`Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。
+Prefill CSV 的客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL`、`Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。矩阵目标列同时记录 `target_metric`、`target_value_ms` 和 `target_near_ms`。
 
 `all_result/` 是运行产物目录，建议不要提交到仓库。
