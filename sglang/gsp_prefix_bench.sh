@@ -801,7 +801,12 @@ for raw_case in "${CASES[@]}"; do
 done
 
 write_summary
-plot_summary
+if ! plot_summary; then
+  if (( plot_requested == 1 )); then
+    echo "[ERROR] --plot requested but the matrix image was not generated" >&2
+    exit 1
+  fi
+fi
 
 echo
 echo "============================================================"
