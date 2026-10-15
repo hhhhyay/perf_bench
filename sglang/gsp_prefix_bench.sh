@@ -13,6 +13,8 @@ TOKEN_UNIT="${TOKEN_UNIT:-1024}"
 GSP_NUM_GROUPS="${GSP_NUM_GROUPS:-32}"
 GSP_PROMPTS_PER_GROUP="${GSP_PROMPTS_PER_GROUP:-16}"
 GSP_MAX_CONCURRENCY="${GSP_MAX_CONCURRENCY:-}"
+GSP_PAGE_SIZE="${GSP_PAGE_SIZE:-}"
+GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
@@ -28,6 +30,7 @@ summary_csv="${out_dir}/gsp_prefix_summary.csv"
 plot_requested=0
 plot_cell="rps"
 dry_run=0
+run_failure=0
 
 declare -a CASES=()
 
@@ -56,6 +59,8 @@ Environment:
   GSP_NUM_GROUPS=32               Official GSP group count
   GSP_PROMPTS_PER_GROUP=16        Official prompts per group
   GSP_MAX_CONCURRENCY=            Optional global max concurrency
+  GSP_PAGE_SIZE=                  KV cache page size; auto-read from /server_info, fallback 64
+  GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
   GSP_RATE_OFFSETS=0,-0.1,...     Cumulative high-to-low offsets after inf baseline
   GSP_RATE_STEP=0.1               Minimum finite-rate step
@@ -168,21 +173,82 @@ sanitize_slug() {
 }
 
 derive_gsp_lengths() {
-  local input_len="$1" hit_pct="$2" prompts="$3"
-  "${PYTHON_BIN}" - "$input_len" "$hit_pct" "$prompts" <<'PY' | tr -d '\r'
+  local input_len="$1" hit_pct="$2" prompts="$3" page_size="$4" page_align="$5"
+  "${PYTHON_BIN}" - "$input_len" "$hit_pct" "$prompts" "$page_size" "$page_align" <<'PY' | tr -d '\r'
 import math
 import sys
 
 length, hit_pct, prompts = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+page_size, page_align = int(sys.argv[4]), sys.argv[5] == "1"
 if prompts <= 1:
     raise SystemExit("prompts_per_group must be greater than 1")
-system_len = int(math.floor((hit_pct / 100.0) * prompts * length / (prompts - 1) + 0.5))
+desired_system_len = (hit_pct / 100.0) * prompts * length / (prompts - 1)
+rounded_system_len = int(math.floor(desired_system_len + 0.5))
+system_len = rounded_system_len
+if page_align and page_size > 1:
+    candidates = {
+        max(1, (rounded_system_len // page_size) * page_size),
+        min(length - 1, ((rounded_system_len + page_size - 1) // page_size) * page_size),
+    }
+    candidates = [x for x in candidates if 0 < x < length]
+    if candidates:
+        system_len = min(
+            candidates,
+            key=lambda x: abs(100.0 * (prompts - 1) * x / (prompts * length) - hit_pct),
+        )
 question_len = length - system_len
 if system_len <= 0 or question_len <= 0 or system_len >= length:
     raise SystemExit("target hit rate cannot produce positive system/question lengths")
 theory = 100.0 * (prompts - 1) * system_len / (prompts * length)
-print(system_len, question_len, f"{theory:.6f}")
+requested_theory = 100.0 * (prompts - 1) * rounded_system_len / (prompts * length)
+print(system_len, question_len, f"{theory:.6f}", f"{requested_theory:.6f}")
 PY
+}
+
+resolve_page_size() {
+  if [[ -n "${GSP_PAGE_SIZE}" ]]; then
+    [[ "${GSP_PAGE_SIZE}" =~ ^[1-9][0-9]*$ ]] || {
+      echo "[ERROR] GSP_PAGE_SIZE 必须是正整数" >&2
+      return 1
+    }
+    return 0
+  fi
+
+  GSP_PAGE_SIZE=""
+  if (( dry_run == 0 )); then
+    GSP_PAGE_SIZE="$(${PYTHON_BIN} - "${BASE_URL%/}/server_info" <<'PY'
+import json
+import sys
+import urllib.request
+
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=2) as response:
+        obj = json.load(response)
+except Exception:
+    obj = {}
+
+def positive_int(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return str(value) if value > 0 else ""
+
+if isinstance(obj, dict):
+    page = positive_int(obj.get("page_size"))
+    if not page and isinstance(obj.get("server_args"), dict):
+        page = positive_int(obj["server_args"].get("page_size"))
+    if not page and isinstance(obj.get("internal_states"), list):
+        for state in obj["internal_states"]:
+            if isinstance(state, dict):
+                page = positive_int(state.get("page_size"))
+                if page:
+                    break
+    print(page)
+PY
+    )"
+  fi
+  [[ "${GSP_PAGE_SIZE}" =~ ^[1-9][0-9]*$ ]] || GSP_PAGE_SIZE=64
 }
 
 parse_case() {
@@ -251,8 +317,9 @@ parse_case() {
     echo "[ERROR] 无法解析输出长度: ${raw}" >&2
     return 1
   }
-  read -r CASE_SYSTEM_LEN CASE_QUESTION_LEN CASE_THEORY_HIT_PCT < <(
-    derive_gsp_lengths "${CASE_INPUT_LEN}" "${CASE_HIT_PCT}" "${GSP_PROMPTS_PER_GROUP}"
+  read -r CASE_SYSTEM_LEN CASE_QUESTION_LEN CASE_THEORY_HIT_PCT CASE_REQUESTED_THEORY_HIT_PCT < <(
+    derive_gsp_lengths "${CASE_INPUT_LEN}" "${CASE_HIT_PCT}" "${GSP_PROMPTS_PER_GROUP}" \
+      "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}"
   ) || {
     echo "[ERROR] 无法根据命中率生成 GSP system/question 长度: ${raw}" >&2
     return 1
@@ -268,6 +335,7 @@ validate_global_config() {
   [[ "${GSP_PROMPTS_PER_GROUP}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须是正整数" >&2; return 1; }
   (( GSP_PROMPTS_PER_GROUP >= 2 )) || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须不小于 2" >&2; return 1; }
   [[ "${SEED}" =~ ^[0-9]+$ ]] || { echo "[ERROR] SEED 必须是非负整数" >&2; return 1; }
+  [[ "${GSP_PAGE_ALIGN}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_PAGE_ALIGN 必须是 0 或 1" >&2; return 1; }
   is_positive_decimal "${RATE_STEP}" || { echo "[ERROR] GSP_RATE_STEP 必须是正数" >&2; return 1; }
   awk -v v="${RATE_STEP}" 'BEGIN { exit !(v >= 0.1) }' || { echo "[ERROR] GSP_RATE_STEP 不能小于 0.1" >&2; return 1; }
   is_positive_decimal "${HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
@@ -277,13 +345,15 @@ validate_global_config() {
 }
 
 validate_global_config || exit 1
+resolve_page_size || exit 1
 
 print_case() {
   echo "CASE                 : ${CASE_ID}"
   echo "Input                : ${CASE_INPUT_RAW} = ${CASE_INPUT_LEN} tokens"
   echo "Output               : ${CASE_OUTPUT_RAW} = ${CASE_OUTPUT_LEN} tokens"
   echo "Target hit rate      : ${CASE_HIT_PCT}%"
-  echo "Theoretical hit rate : ${CASE_THEORY_HIT_PCT}%"
+  echo "Target theory (raw)  : ${CASE_REQUESTED_THEORY_HIT_PCT}%"
+  echo "Theoretical hit rate : ${CASE_THEORY_HIT_PCT}% (page size ${GSP_PAGE_SIZE})"
   echo "System/question      : ${CASE_SYSTEM_LEN}/${CASE_QUESTION_LEN}"
   echo "Groups/prompts       : ${GSP_NUM_GROUPS}/${GSP_PROMPTS_PER_GROUP}"
   echo "Num prompts          : ${CASE_NUM_PROMPTS}"
@@ -464,6 +534,8 @@ append_trial_row() {
   mkdir -p "${out_dir}"
   "${PYTHON_BIN}" - "${trials_csv}" "${CASE_ID}" "${CASE_INPUT_RAW}" "${CASE_OUTPUT_RAW}" \
     "${CASE_HIT_PCT}" "${CASE_SYSTEM_LEN}" "${CASE_QUESTION_LEN}" "${CASE_THEORY_HIT_PCT}" \
+    "${CASE_REQUESTED_THEORY_HIT_PCT}" \
+    "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}" \
     "${GSP_NUM_GROUPS}" "${GSP_PROMPTS_PER_GROUP}" "${CASE_NUM_PROMPTS}" "${CASE_TTFT_METRIC}" \
     "${CASE_TTFT_TARGETS}" "${CASE_TPOT_METRIC}" "${CASE_TPOT_TARGET_MS}" "${request_rate}" \
     "${phase}" "${CASE_CONCURRENCY:-}" "${log_file}" "${exit_code}" "${metrics_json}" <<'PY'
@@ -473,7 +545,7 @@ import os
 import sys
 
 (path, case_id, input_raw, output_raw, target_hit, system_len, question_len,
- theory_hit, groups, prompts_per_group, num_prompts, ttft_metric, ttft_targets,
+ theory_hit, requested_theory_hit, page_size, page_aligned, groups, prompts_per_group, num_prompts, ttft_metric, ttft_targets,
  tpot_metric, tpot_target, request_rate, phase, max_concurrency, log_file,
  exit_code, metrics_raw) = sys.argv[1:]
 try:
@@ -482,7 +554,9 @@ except json.JSONDecodeError:
     metrics = {}
 fields = [
     "case_id", "input", "output", "specified_cache_hit_rate_pct", "system_prompt_len",
-    "question_len", "theoretical_cache_hit_rate_pct", "gsp_num_groups",
+    "question_len", "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
+    "gsp_page_size", "page_aligned",
+    "gsp_num_groups",
     "gsp_prompts_per_group", "num_prompts", "ttft_metric", "ttft_targets_s",
     "tpot_metric", "tpot_target_ms", "configured_request_rate", "search_phase",
     "exit_code", "actual_rps", "backend", "traffic_request_rate", "max_request_concurrency",
@@ -502,6 +576,8 @@ row.update({
     "case_id": case_id, "input": input_raw, "output": output_raw,
     "specified_cache_hit_rate_pct": target_hit, "system_prompt_len": system_len,
     "question_len": question_len, "theoretical_cache_hit_rate_pct": theory_hit,
+    "requested_theoretical_cache_hit_rate_pct": requested_theory_hit,
+    "gsp_page_size": page_size, "page_aligned": page_aligned,
     "gsp_num_groups": groups, "gsp_prompts_per_group": prompts_per_group,
     "num_prompts": num_prompts, "ttft_metric": ttft_metric,
     "ttft_targets_s": ttft_targets, "tpot_metric": tpot_metric,
@@ -558,6 +634,9 @@ run_trial() {
 
   "${cmd[@]}" 2>&1 | tee "${log_file}"
   exit_code="${PIPESTATUS[0]}"
+  if [[ "${exit_code}" != "0" ]]; then
+    run_failure=1
+  fi
   printf '%s\n' "${exit_code}" > "${exit_file}"
   metrics_json="$(parse_benchmark_log "${log_file}")"
   append_trial_row "${request_rate}" "${phase}" "${log_file}" "${exit_code}" "${metrics_json}"
@@ -613,6 +692,7 @@ trials_path, summary_path, tolerance_s = sys.argv[1:]
 tolerance = float(tolerance_s)
 fields = [
     "case_id", "input", "output", "specified_cache_hit_rate_pct", "theoretical_cache_hit_rate_pct",
+    "requested_theoretical_cache_hit_rate_pct", "gsp_page_size", "page_aligned",
     "measured_hit_rate_pct", "hit_rate_delta_pct", "ttft_metric", "ttft_target_s",
     "selected_actual_rps", "selected_input_throughput", "selected_ttft_ms",
     "selected_tpot_ms", "selected_configured_request_rate", "status", "log_file",
@@ -666,6 +746,9 @@ for case_id, case_rows in groups.items():
                 "case_id": case_id, "input": base.get("input", ""), "output": base.get("output", ""),
                 "specified_cache_hit_rate_pct": base.get("specified_cache_hit_rate_pct", ""),
                 "theoretical_cache_hit_rate_pct": base.get("theoretical_cache_hit_rate_pct", ""),
+                "requested_theoretical_cache_hit_rate_pct": base.get("requested_theoretical_cache_hit_rate_pct", ""),
+                "gsp_page_size": base.get("gsp_page_size", ""),
+                "page_aligned": base.get("page_aligned", ""),
                 "measured_hit_rate_pct": f"{measured:.4f}", "hit_rate_delta_pct": f"{delta:.4f}",
                 "ttft_metric": base.get("ttft_metric", ""), "ttft_target_s": target_s,
                 "selected_actual_rps": f"{actual_rps:.2f}",
@@ -688,6 +771,9 @@ for case_id, case_rows in groups.items():
             "case_id": case_id, "input": base.get("input", ""), "output": base.get("output", ""),
             "specified_cache_hit_rate_pct": base.get("specified_cache_hit_rate_pct", ""),
             "theoretical_cache_hit_rate_pct": base.get("theoretical_cache_hit_rate_pct", ""),
+            "requested_theoretical_cache_hit_rate_pct": base.get("requested_theoretical_cache_hit_rate_pct", ""),
+            "gsp_page_size": base.get("gsp_page_size", ""),
+            "page_aligned": base.get("page_aligned", ""),
             "measured_hit_rate_pct": f"{max(measured_values):.4f}" if measured_values else "",
             "hit_rate_delta_pct": "", "ttft_metric": base.get("ttft_metric", ""),
             "ttft_target_s": target_s, "selected_actual_rps": "",
@@ -786,11 +872,13 @@ for raw_case in "${CASES[@]}"; do
   run_trial inf baseline
   if [[ ! -s "${inf_log}" ]]; then
     echo "[WARN] inf baseline 没有生成日志，跳过后续 rate: ${CASE_ID}" >&2
+    run_failure=1
     continue
   fi
   baseline_rps="$(read_actual_rps "${inf_log}" 2>/dev/null || true)"
   if [[ -z "${baseline_rps}" ]]; then
     echo "[WARN] 无法从 inf baseline 读取实际 RPS，跳过后续 rate: ${CASE_ID}" >&2
+    run_failure=1
     continue
   fi
 
@@ -818,3 +906,7 @@ if (( plot_requested == 1 )); then
   echo "Plot             : ${out_dir}/gsp_prefix_matrix.png"
 fi
 echo "============================================================"
+if (( run_failure != 0 )); then
+  echo "[ERROR] 至少一个官方 benchmark trial 失败，详见日志和 exitcode 文件" >&2
+  exit 1
+fi

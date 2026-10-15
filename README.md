@@ -51,13 +51,19 @@ perf_bench/
 ```
 
 脚本使用 `--gsp-ordered`，并把每个 prefix group 的首个请求视为冷 miss。给定总输入
-长度 `L`、目标命中率 `H` 和每组请求数 `P`，自动计算：
+长度 `L`、目标命中率 `H` 和每组请求数 `P`，先自动计算目标共享前缀：
 
 ```text
-system_prompt_len = round((H / 100) * P * L / (P - 1))
+raw_system_prompt_len = round((H / 100) * P * L / (P - 1))
+system_prompt_len = page 对齐后的最接近长度
 question_len = L - system_prompt_len
 理论命中率 = (P - 1) * system_prompt_len / (P * L)
 ```
+
+真实 KV cache 按 page 命中。脚本默认从 `/server_info` 读取 `page_size`，读取失败时回退到
+`64`，并选择最接近目标的 page 对齐长度；CSV 同时记录未对齐理论值、page 对齐后的理论值
+和官方 `--cache-report` 实测值。设置 `GSP_PAGE_ALIGN=0` 可关闭对齐，设置
+`GSP_PAGE_SIZE` 可显式指定 page 大小。理论值只用于解释 workload，容量筛选始终使用实测命中率。
 
 默认使用 `32` 个 group、每组 `16` 个 prompt，即 `512` 个请求；默认 `TOKEN_UNIT=1024`，
 需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
@@ -99,8 +105,8 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 结果位于 `all_result/bench_gsp_prefix_<RUN_ID>/`：
 
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
-- `gsp_prefix_trials.csv`：所有请求率 trial、指定/理论/实际 cache 命中率、总 prompt/cache token、通用客户端吞吐、请求数、TTFT、TPOT、ITL、Mean E2E 和日志路径；Mean E2E 及之前的固定客户端指标顺序与现有脚本保持一致。
-- `gsp_prefix_summary.csv`：每个 case/TTFT SLA 下满足 cache hit、TTFT、TPOT 的最大实际 RPS。
+- `gsp_prefix_trials.csv`：所有请求率 trial、指定/未对齐理论/page 对齐理论/实际 cache 命中率、page 信息、总 prompt/cache token、通用客户端吞吐、请求数、TTFT、TPOT、ITL、Mean E2E 和日志路径；Mean E2E 及之前的固定客户端指标顺序与现有脚本保持一致。
+- `gsp_prefix_summary.csv`：每个 case/TTFT SLA 下满足实测 cache hit、TTFT、TPOT 的最大实际 RPS。
 - `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
 
 脚本支持 `--dry-run` 核对官方命令而不连接服务；同一 `RUN_ID` 重新执行时会跳过已有成功
@@ -211,6 +217,11 @@ bash vllm/vllmc.sh
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
 | `TOKEN_UNIT` | K 的 token 定义，默认 `1024`；设为 `1000` 使用十进制 K。 |
+| `GSP_PAGE_SIZE` | GSP KV page 大小；真实执行默认从 `/server_info` 读取，失败回退 `64`。 |
+| `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
+| `GSP_HIT_RATE_TOLERANCE_PCT` | 实测 cache 命中率相对指定命中率的允许误差，默认 `2.0` 个百分点。 |
+| `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
+| `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`。 |
 | `PREFILL_TTFT_INPUTS` | Prefill 输入长度，默认 `32 64 128`，单位为 K。 |
 | `PREFILL_SLA_RULES` | Prefill SLA 规则，格式为 `input_k:metric:target_seconds:near_seconds`，例如 `8:p99_ttft_ms:5:0.5`；默认对每个输入使用 Mean TTFT 的 3s/5s/10s。 |
 | `PREFILL_TTFT_TARGETS_S` | 未显式设置 `PREFILL_SLA_RULES` 时使用的默认目标秒数，默认 `3 5 10`。 |
