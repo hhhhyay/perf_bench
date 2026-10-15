@@ -8,7 +8,8 @@ SGLang / vLLM 推理服务容量压测脚本集合，重点用于按照 per-DP b
 perf_bench/
 ├── sglang/
 │   ├── sglc.sh      # SGLang 客户端容量压测
-│   └── prefill_ttft.sh # 单侧 Prefill TTFT 矩阵压测
+│   ├── prefill_ttft.sh # 单侧 Prefill TTFT 矩阵压测
+│   └── gsp_prefix_bench.sh # GSP prefix 命中率下的 TTFT/TPOT 容量压测
 └── vllm/
     └── vllmc.sh     # vLLM Prefix-Salt 标准容量压测
 ```
@@ -36,6 +37,74 @@ perf_bench/
 - SLA 规则按输入长度绑定，格式为 `input_k:metric:target_seconds:near_seconds`；target 和 near 使用秒，可填写小数。
 - 保留平台固定的 `Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL` 和 `Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。
 - 不提取与 `P50 TTFT` 重复的 `Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数，不保存逐请求 JSONL。
+
+### SGLang GSP Prefix: `sglang/gsp_prefix_bench.sh`
+
+只要测试需求包含 prefix/cache 命中率，就使用这个脚本。它调用官方
+`generated-shared-prefix` 数据集，同时支持 Prefill、输出大于 1 的普通推理和后续 PD
+分离场景，不把请求数命中比例当成 token 级 cache 命中率。
+
+命中率按官方 `--cache-report` 的结果计算：
+
+```text
+实际命中率 = total_cached_tokens / total_prompt_tokens
+```
+
+脚本使用 `--gsp-ordered`，并把每个 prefix group 的首个请求视为冷 miss。给定总输入
+长度 `L`、目标命中率 `H` 和每组请求数 `P`，自动计算：
+
+```text
+system_prompt_len = round((H / 100) * P * L / (P - 1))
+question_len = L - system_prompt_len
+理论命中率 = (P - 1) * system_prompt_len / (P * L)
+```
+
+默认使用 `32` 个 group、每组 `16` 个 prompt，即 `512` 个请求；默认 `TOKEN_UNIT=1024`，
+需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
+
+一个命令可以连续测试多个输入/输出、命中率和 SLA：
+
+```bash
+BASE_URL=http://127.0.0.1:30000 \
+MODEL=/path/to/model \
+bash sglang/gsp_prefix_bench.sh \
+  --case '16k,1k,80,mean_ttft_ms,3|5,mean_tpot_ms,30' \
+  --case '32k,0.5k,80,mean_ttft_ms,5|7,mean_tpot_ms,50'
+```
+
+case 格式为：
+
+```text
+INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S,TPOT_METRIC,TPOT_TARGET_MS[,MAX_CONCURRENCY]
+```
+
+例如 `3|5` 表示分别查找 TTFT 小于 3 秒和 5 秒时的最大实际客户端 RPS；TPOT
+限制为 30ms。有限请求率从高到低回测，记录实际 `request_throughput`，保留两位小数，
+最小步长不低于 `0.1 req/s`。只有实测命中率在目标容差内、TTFT 和 TPOT 同时满足的点
+才会进入容量结果。
+
+默认只生成 CSV 和日志；需要矩阵图时指定格子中央显示的指标：
+
+```bash
+# 格子显示最大实际客户端 RPS
+bash sglang/gsp_prefix_bench.sh --plot --cell rps \
+  --case '16k,1k,80,mean_ttft_ms,3|5,mean_tpot_ms,30' \
+  --case '32k,0.5k,80,mean_ttft_ms,5|7,mean_tpot_ms,50'
+
+# 格子显示客户端输入 token throughput
+bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
+  --case '16k,1k,80,mean_ttft_ms,3|5,mean_tpot_ms,30'
+```
+
+结果位于 `all_result/bench_gsp_prefix_<RUN_ID>/`：
+
+- `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
+- `gsp_prefix_trials.csv`：所有请求率 trial、指定/理论/实际 cache 命中率、总 prompt/cache token、通用客户端吞吐、请求数、TTFT、TPOT、ITL、Mean E2E 和日志路径；Mean E2E 及之前的固定客户端指标顺序与现有脚本保持一致。
+- `gsp_prefix_summary.csv`：每个 case/TTFT SLA 下满足 cache hit、TTFT、TPOT 的最大实际 RPS。
+- `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
+
+脚本支持 `--dry-run` 核对官方命令而不连接服务；同一 `RUN_ID` 重新执行时会跳过已有成功
+日志。缺少 `--cache-report` 或 benchmark 失败时保留日志并标记为失败，不用理论值伪造实测命中率。
 
 ### vLLM: `vllm/vllmc.sh`
 
