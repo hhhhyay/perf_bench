@@ -8,6 +8,8 @@
 
 set -uo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 out_dir="./all_result/bench_prefill_ttft_${run_id}"
 log_dir="${out_dir}/logs"
@@ -39,8 +41,67 @@ PREFILL_TTFT_INPUTS="${PREFILL_TTFT_INPUTS:-32 64 128}"
 PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-}"
 PREFILL_TTFT_TARGETS_S="${PREFILL_TTFT_TARGETS_S:-3 5 10}"
 PREFILL_TTFT_SEARCH_ITERS="${PREFILL_TTFT_SEARCH_ITERS:-7}"
+PREFILL_TTFT_RATE_STEP="${PREFILL_TTFT_RATE_STEP:-0.1}"
 PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}"
 PREFILL_TTFT_TEST_MODE="${PREFILL_TTFT_TEST_MODE:-}"
+PLOT_REQUESTS=()
+PLOT_CELL="${PLOT_CELL:-rps}"
+
+usage() {
+  cat <<'USAGE'
+Usage: bash sglang/prefill_ttft.sh [--plot MODE]
+
+MODE:
+  mean       生成 Mean TTFT 容量矩阵
+  p99        生成 P99 TTFT 容量矩阵
+  sla        按每个输入 case 自己的 target_metric/target_value 生成容量矩阵
+  line       生成 TTFT 随请求率变化曲线
+  heatmap    生成原始 TTFT 热力图
+
+格子维度：--cell rps|input_throughput（简写 input_tp）。列始终按输入 token/BS 展示。
+有限请求率默认保留两位小数，搜索最小区间为 0.1 req/s（可用 PREFILL_TTFT_RATE_STEP 调大）。
+未指定 --plot 时只生成 CSV。--plot 可重复指定多个 MODE。
+USAGE
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --plot)
+      [[ $# -ge 2 ]] || { echo "[ERROR] --plot 需要一个模式" >&2; usage >&2; exit 1; }
+      case "$2" in
+        mean|p99|sla|line|heatmap) PLOT_REQUESTS+=("$2") ;;
+        *) echo "[ERROR] 不支持的 --plot 模式: $2" >&2; usage >&2; exit 1 ;;
+      esac
+      shift 2
+      ;;
+    --plot=*)
+      plot_mode="${1#*=}"
+      case "${plot_mode}" in
+        mean|p99|sla|line|heatmap) PLOT_REQUESTS+=("${plot_mode}") ;;
+        *) echo "[ERROR] 不支持的 --plot 模式: ${plot_mode}" >&2; usage >&2; exit 1 ;;
+      esac
+      shift
+      ;;
+    --cell)
+      [[ $# -ge 2 ]] || { echo "[ERROR] --cell 需要 rps 或 input_throughput" >&2; usage >&2; exit 1; }
+      case "$2" in
+        rps) PLOT_CELL="rps" ;;
+        input_throughput|input_tp) PLOT_CELL="input_throughput" ;;
+        *) echo "[ERROR] 不支持的 --cell 值: $2" >&2; usage >&2; exit 1 ;;
+      esac
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[ERROR] 未知参数: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] TOKEN_UNIT 必须是正整数，当前为: ${TOKEN_UNIT}" >&2
@@ -49,6 +110,14 @@ fi
 
 if [[ ! "${PREFILL_TTFT_SEARCH_ITERS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] PREFILL_TTFT_SEARCH_ITERS 必须是正整数" >&2
+  exit 1
+fi
+
+if ! awk -v value="${PREFILL_TTFT_RATE_STEP}" 'BEGIN {
+  if (value !~ /^[0-9]+([.][0-9]*)?$/ && value !~ /^[.][0-9]+$/) exit 1
+  exit !(value >= 0.1)
+}' 2>/dev/null; then
+  echo "[ERROR] PREFILL_TTFT_RATE_STEP 必须是不小于 0.1 的数字，当前为: ${PREFILL_TTFT_RATE_STEP}" >&2
   exit 1
 fi
 
@@ -299,6 +368,18 @@ format_k_name() {
   }'
 }
 
+format_request_rate() {
+  local value="$1"
+  if [[ "${value}" == "inf" ]]; then
+    printf "inf\n"
+    return 0
+  fi
+  LC_ALL=C awk -v value="${value}" 'BEGIN {
+    if (value <= 0) exit 1
+    printf "%.2f\n", value
+  }'
+}
+
 select_prefill_bs() {
   local input_k="$1"
   local raw rule upper bs
@@ -493,6 +574,8 @@ row = {
 }
 row.update(metrics)
 row["actual_rps"] = metrics.get("request_throughput", "")
+if input_rate != "inf":
+    row["traffic_request_rate"] = input_rate
 target_value = metrics.get(target_metric) if target_metric else None
 if not target_metric or not target_value_ms:
     row["target_status"] = "BASELINE"
@@ -535,7 +618,8 @@ run_probe() {
   local target_near_ms="$6"
   local trial="$7"
   local phase="$8"
-  local request_rate="$9"
+  local request_rate
+  request_rate="$(format_request_rate "$9")" || return 1
   local global_concurrency=$((DP_SIZE * per_dp_bs))
   local num_prompts=$((global_concurrency * NUM_PROMPTS_MULTIPLIER))
   local warmup_requests=0
@@ -597,7 +681,8 @@ search_target() {
   local baseline_rps="$7"
   local baseline_value="$8"
   local baseline_log="$9"
-  local high_rate="${baseline_rps}"
+  local high_rate
+  high_rate="$(format_request_rate "${baseline_rps}")"
   local low_rate=""
   local low_rps=""
   local low_value=""
@@ -615,13 +700,16 @@ search_target() {
   while (( trial < PREFILL_TTFT_SEARCH_ITERS )); do
     trial=$((trial + 1))
     if [[ -z "${low_rate}" ]]; then
-      probe_rate="$(awk -v high="${high_rate}" 'BEGIN { printf "%.6f", high / 2 }')"
+      probe_rate="$(format_request_rate "$(awk -v high="${high_rate}" 'BEGIN { print high / 2 }')")"
       phase="descending"
     else
-      probe_rate="$(awk -v low="${low_rate}" -v high="${high_rate}" 'BEGIN { printf "%.6f", (low + high) / 2 }')"
+      probe_rate="$(format_request_rate "$(awk -v low="${low_rate}" -v high="${high_rate}" 'BEGIN { print (low + high) / 2 }')")"
       phase="binary"
     fi
     if awk -v rate="${probe_rate}" 'BEGIN { exit !(rate > 0) }' 2>/dev/null; then :; else break; fi
+    if [[ "${probe_rate}" == "${low_rate}" || "${probe_rate}" == "${high_rate}" ]]; then
+      break
+    fi
 
     run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "${target_metric}" "${target_value_ms}" "${target_near_ms}" "${trial}" "${phase}" "${probe_rate}"
     target_met=1
@@ -641,6 +729,10 @@ search_target() {
     else
       high_rate="${probe_rate}"
       if [[ -n "${low_rate}" ]] && awk -v low="${low_rate}" -v high="${high_rate}" 'BEGIN { exit !(high > low) }' 2>/dev/null; then :; fi
+    fi
+
+    if [[ -n "${low_rate}" ]] && awk -v low="${low_rate}" -v high="${high_rate}" -v step="${PREFILL_TTFT_RATE_STEP}" 'BEGIN { exit !((high - low) > step) }' 2>/dev/null; then
+      break
     fi
 
     [[ -n "${low_rate}" ]] || continue
@@ -798,6 +890,52 @@ run_input_matrix() {
   fi
 }
 
+render_plots() {
+  (( ${#PLOT_REQUESTS[@]} > 0 )) || return 0
+  [[ -s "${trials_csv}" ]] || {
+    echo "[ERROR] 没有 Prefill CSV，无法作图: ${trials_csv}" >&2
+    return 1
+  }
+  [[ -f "${script_dir}/plot_prefill_ttft.py" ]] || {
+    echo "[ERROR] 找不到绘图脚本: ${script_dir}/plot_prefill_ttft.py" >&2
+    return 1
+  }
+
+  local mode kind metric suffix output
+  for mode in "${PLOT_REQUESTS[@]}"; do
+    kind="${mode}"
+    metric=""
+    suffix="${mode}"
+    case "${mode}" in
+      mean)
+        kind="capacity"
+        metric="mean_ttft_ms"
+        suffix="mean_capacity_matrix_${PLOT_CELL}"
+        ;;
+      p99)
+        kind="capacity"
+        metric="p99_ttft_ms"
+        suffix="p99_capacity_matrix_${PLOT_CELL}"
+        ;;
+      sla)
+        kind="capacity"
+        metric="auto"
+        suffix="sla_capacity_matrix_${PLOT_CELL}"
+        ;;
+    esac
+    output="${out_dir}/prefill_ttft_${suffix}.png"
+    echo "[INFO] 绘制 ${mode}: ${output}"
+    if [[ "${kind}" == "capacity" ]]; then
+      "${PYTHON_BIN}" "${script_dir}/plot_prefill_ttft.py" "${trials_csv}" \
+        --kind "${kind}" --metric "${metric}" --targets auto \
+        --cell "${PLOT_CELL}" -o "${output}" || return 1
+    else
+      "${PYTHON_BIN}" "${script_dir}/plot_prefill_ttft.py" "${trials_csv}" \
+        --kind "${kind}" -o "${output}" || return 1
+    fi
+  done
+}
+
 main() {
   mkdir -p "${log_dir}"
   validate_prefill_sla_rules || return 1
@@ -840,6 +978,7 @@ main() {
     run_input_matrix "${input_k}" || true
   done
   write_matrix_summary
+  render_plots || return 1
   echo "[DONE] trials=${trials_csv}"
   echo "[DONE] matrix=${matrix_csv}"
 }

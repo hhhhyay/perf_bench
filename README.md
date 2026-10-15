@@ -32,6 +32,7 @@ perf_bench/
 - 输出长度固定为 1 token，不再配置输出长度。
 - 默认测试输入 `32K/64K/128K`，按 `PREFILL_TTFT_BS_RULES` 自动选择一个 per-DP BS，不扫描全部 BS。
 - 对每个输入先跑 `request_rate=inf`，再从高请求率向下寻找满足每条 SLA 规则的临界值。
+- 试探请求率统一保留两位小数；二分搜索区间默认缩小到 `0.1 req/s` 后停止，避免用过小步长制造没有实际意义的伪精度。
 - SLA 规则按输入长度绑定，格式为 `input_k:metric:target_seconds:near_seconds`；target 和 near 使用秒，可填写小数。
 - 保留平台固定的 `Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL` 和 `Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。
 - 不提取与 `P50 TTFT` 重复的 `Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数，不保存逐请求 JSONL。
@@ -82,8 +83,36 @@ bash sglang/prefill_ttft.sh
 PREFILL_TTFT_INPUTS="8 32" \
 PREFILL_TTFT_BS_RULES="8:64,32:16" \
 PREFILL_SLA_RULES="8:p99_ttft_ms:5:0.5,8:p99_ttft_ms:6:0.5,32:mean_ttft_ms:4:0.5,32:mean_ttft_ms:5:0.5" \
-bash sglang/prefill_ttft.sh
+PREFILL_TTFT_RATE_STEP=0.1 \
+bash sglang/prefill_ttft.sh --plot sla
 ```
+
+请求率搜索示例输出如下，`inf` 仅用于基线，有限请求率均保留两位小数；当当前通过点和失败点的区间不超过 `0.1 req/s` 时停止继续细分：
+
+```text
+[RUN] input=8K per_dp_bs=64 target=p99_ttft_ms<=5000 phase=binary rate=2.70
+[RUN] input=8K per_dp_bs=64 target=p99_ttft_ms<=5000 phase=binary rate=2.60
+[TARGET-PASS] input=8K p99_ttft_ms<=5000ms candidate_rps=2.70 rate=2.60 value=2990.44
+```
+
+Prefill 默认只输出 CSV。需要画图时，在同一次测试命令后追加 `--plot`：
+
+```bash
+# 参考容量矩阵：行是 TTFT SLA，列是输入长度/BS，格子是最大实际客户端 RPS
+bash sglang/prefill_ttft.sh --plot mean
+bash sglang/prefill_ttft.sh --plot p99
+
+# 每个输入 case 使用自己的 SLA 指标，例如 8K=P99、32K=Mean
+bash sglang/prefill_ttft.sh --plot sla
+
+# 切换格子中央的数值：显示客户端输入 token 吞吐（tok/s）
+bash sglang/prefill_ttft.sh --plot mean --cell input_throughput
+
+# 也可以一次生成多种图
+bash sglang/prefill_ttft.sh --plot mean --plot p99 --plot line
+```
+
+其中 `mean` 和 `p99` 分别按统一的 Mean TTFT、P99 TTFT 生成容量矩阵；`sla` 按每个输入 case 的 `target_metric` 和 `target_value_ms` 使用各自 SLA。列始终显示输入 token/BS；默认 `--cell rps`，格子显示日志提取的最大实际客户端 RPS；使用 `--cell input_throughput` 时，格子显示客户端输入 token 吞吐（tok/s），也可简写为 `--cell input_tp`。`line` 生成 TTFT-请求率曲线，`heatmap` 生成原始 TTFT 热力图。图片与 CSV 位于同一个结果目录；不指定 `--plot` 时不会生成图片。
 
 脚本内部会把秒换算成毫秒参与判断，例如 `5.5` 秒变成 `5500ms`，`0.25` 秒变成 `250ms`。CSV 仍保留 `target_value_ms` 和 `target_near_ms` 字段，以兼容现有数据平台。
 
@@ -117,7 +146,10 @@ bash vllm/vllmc.sh
 | `PREFILL_SLA_RULES` | Prefill SLA 规则，格式为 `input_k:metric:target_seconds:near_seconds`，例如 `8:p99_ttft_ms:5:0.5`；默认对每个输入使用 Mean TTFT 的 3s/5s/10s。 |
 | `PREFILL_TTFT_TARGETS_S` | 未显式设置 `PREFILL_SLA_RULES` 时使用的默认目标秒数，默认 `3 5 10`。 |
 | `PREFILL_TTFT_SEARCH_ITERS` | 每个 TTFT 目标最多搜索次数，默认 `7`。 |
+| `PREFILL_TTFT_RATE_STEP` | 请求率搜索的最小区间，默认 `0.1 req/s`；不允许设置小于 `0.1`。有限请求率传给 benchmark 并写入 CSV 时保留两位小数。 |
 | `PREFILL_TTFT_BS_RULES` | 输入上限 K 到 per-DP BS 的规则，默认 `8:256,16:128,32:64,64:32,128:16`。 |
+| `--plot mean` / `--plot p99` / `--plot sla` | 可选作图入口，生成统一指标或按 case SLA 的容量矩阵；也支持 `--plot line` 和 `--plot heatmap`。可重复指定多个模式。 |
+| `--cell` | 容量矩阵格子中央的数值，支持 `rps`、`input_throughput`（简写 `input_tp`）；默认 `rps`。列固定为输入 token/BS。 |
 
 `SLA_RULES` 示例：
 
@@ -207,6 +239,8 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 - `sum_all.csv`：汇总后的核心指标表。
 - `prefill_ttft_trials.csv`：Prefill 基准和搜索 trial 明细。
 - `prefill_ttft_matrix.csv`：每个输入长度和 TTFT 目标下的最优达标结果。
+- `prefill_ttft_*_capacity_matrix_*.png`：指定 `--plot mean` 或 `--plot p99` 时生成的容量矩阵，文件名末尾标记中央指标。
+- `prefill_ttft_line.png` / `prefill_ttft_heatmap.png`：指定对应绘图模式时生成的辅助图。
 
 Prefill CSV 的客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL`、`Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。矩阵目标列同时记录 `target_metric`、`target_value_ms` 和 `target_near_ms`。
 
