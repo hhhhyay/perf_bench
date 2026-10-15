@@ -15,7 +15,7 @@
 - Default `TOKEN_UNIT=1024`; `TOKEN_UNIT=1000` remains an explicit decimal-K option.
 - Prefill output length is exactly 1 token.
 - Default matrix inputs are `32 64 128`; default SLA rules are Mean TTFT targets `3000/5000/10000` milliseconds.
-- `PREFILL_SLA_RULES` accepts `metric:target:near` rules and drives both target judgment and matrix dimensions; supported target metrics include extracted TTFT fields such as `mean_ttft_ms`, `p50_ttft_ms`, `p95_ttft_ms`, and `p99_ttft_ms`.
+- `PREFILL_SLA_RULES` accepts `input_k:metric:target_seconds:near_seconds` rules and drives both target judgment and matrix dimensions; supported target metrics include extracted TTFT fields such as `mean_ttft_ms`, `p50_ttft_ms`, `p95_ttft_ms`, and `p99_ttft_ms`.
 - Default BS rules are `8:256,16:128,32:64,64:32,128:16`, matched by the first input upper bound that contains the input.
 - Every Prefill probe uses `--flush-cache` and does not save per-request JSONL.
 - Final performance selection uses parsed `Request throughput (req/s)` as `actual_rps`, never the configured request rate.
@@ -52,7 +52,7 @@ Add the following defaults near the top of `sglang/prefill_ttft.sh`:
 ```bash
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PREFILL_TTFT_INPUTS="${PREFILL_TTFT_INPUTS:-32 64 128}"
-PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0}"
+PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-32:mean_ttft_ms:3:0,32:mean_ttft_ms:5:0,32:mean_ttft_ms:10:0}"
 PREFILL_TTFT_SEARCH_ITERS="${PREFILL_TTFT_SEARCH_ITERS:-7}"
 PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}"
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
@@ -248,7 +248,7 @@ Add a runnable example:
 
 ```bash
 PREFILL_TTFT_INPUTS="32 64 128" \
-PREFILL_SLA_RULES="mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0" \
+PREFILL_SLA_RULES="32:mean_ttft_ms:3:0,32:mean_ttft_ms:5:0,32:mean_ttft_ms:10:0" \
 PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16" \
 bash sglang/prefill_ttft.sh
 ```

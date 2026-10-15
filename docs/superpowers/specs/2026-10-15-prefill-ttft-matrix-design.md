@@ -31,7 +31,7 @@ Prefill 脚本沿用 `sglc.sh` 的已有环境变量和默认值，并新增以�
 
 ```bash
 PREFILL_TTFT_INPUTS="32 64 128"
-PREFILL_SLA_RULES="mean_ttft_ms:3000:0,mean_ttft_ms:5000:0,mean_ttft_ms:10000:0"
+PREFILL_SLA_RULES="32:mean_ttft_ms:3:0,32:mean_ttft_ms:5:0,32:mean_ttft_ms:10:0"
 PREFILL_TTFT_SEARCH_ITERS=7
 PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16"
 ```
@@ -42,7 +42,7 @@ TTFT 目标使用毫秒，`3000/5000/10000` 分别对应 3 秒、5 秒、10 秒�
 
 `PREFILL_TTFT_BS_RULES` 使用 `输入上限K:per_dp_bs` 逗号分隔，按第一个满足 `input_k <= 上限K` 的规则选择 BS。例如默认规则表示：`8K` 以内使用 256，`8K~16K` 使用 128，`16K~32K` 使用 64，`32K~64K` 使用 32，`64K~128K` 使用 16。规则由环境变量覆盖，不在代码中固定单个 BS。
 
-`PREFILL_SLA_RULES` 使用 `metric:target:near` 逗号分隔。`metric` 可使用已提取的 TTFT 字段，例如 `mean_ttft_ms`、`p50_ttft_ms`、`p95_ttft_ms`、`p99_ttft_ms`；回测按 `metric <= target` 判断达标，`near` 保留为规则元数据。未设置时默认生成 Mean TTFT 的 `3000/5000/10000ms` 三条规则。
+`PREFILL_SLA_RULES` 使用 `input_k:metric:target_seconds:near_seconds` 逗号分隔。`metric` 可使用已提取的 TTFT 字段，例如 `mean_ttft_ms`、`p50_ttft_ms`、`p95_ttft_ms`、`p99_ttft_ms`；target 和 near 使用秒并允许小数，脚本内部转换为毫秒后按 `metric <= target` 判断达标。未设置时对每个输入默认生成 Mean TTFT 的 `3/5/10` 秒三条规则。
 
 除矩阵参数外，服务地址、模型、DP、容量、并行、请求数量、`USE_FAKE_PREFILL`、`TOKEN_UNIT` 和续测参数均使用与 `sglc.sh` 相同的名字和语义。benchmark 命令参数保持一致，仅由矩阵逻辑填充输入长度、输出长度、选定并发和限流请求率。
 

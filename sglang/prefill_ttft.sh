@@ -37,7 +37,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 PREFILL_TTFT_INPUTS="${PREFILL_TTFT_INPUTS:-32 64 128}"
 PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-}"
-PREFILL_TTFT_TARGETS_MS="${PREFILL_TTFT_TARGETS_MS:-}"
+PREFILL_TTFT_TARGETS_S="${PREFILL_TTFT_TARGETS_S:-3 5 10}"
 PREFILL_TTFT_SEARCH_ITERS="${PREFILL_TTFT_SEARCH_ITERS:-7}"
 PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}"
 PREFILL_TTFT_TEST_MODE="${PREFILL_TTFT_TEST_MODE:-}"
@@ -58,12 +58,47 @@ prefill_sla_rules_text() {
     return 0
   fi
 
-  local target_list="${PREFILL_TTFT_TARGETS_MS:-3000 5000 10000}"
-  local target
-  for target in ${target_list//,/ }; do
-    printf "mean_ttft_ms:%s:0," "${target}"
+  local target_list="${PREFILL_TTFT_TARGETS_S}"
+  local input_list="${PREFILL_TTFT_INPUTS//,/ }"
+  local input_k target
+  for input_k in ${input_list}; do
+    for target in ${target_list//,/ }; do
+      printf "%s:mean_ttft_ms:%s:0," "${input_k}" "${target}"
+    done
   done
   printf "\n"
+}
+
+seconds_to_ms() {
+  local seconds="$1"
+  LC_ALL=C awk -v value="${seconds}" 'BEGIN { printf "%.6f", value * 1000 }' \
+    | sed -E 's/0+$//; s/[.]$//'
+}
+
+prefill_sla_rules_for_input() {
+  local wanted_input="$1"
+  local rules_text rule input_k metric target_seconds near_seconds extra
+  rules_text="$(prefill_sla_rules_text)"
+  IFS=',' read -ra rules <<< "${rules_text}"
+  for rule in "${rules[@]}"; do
+    rule="${rule//[[:space:]]/}"
+    [[ -n "${rule}" ]] || continue
+    IFS=':' read -r input_k metric target_seconds near_seconds extra <<< "${rule}"
+    [[ "${input_k}" == "${wanted_input}" ]] || continue
+    printf "%s|%s|%s\n" "${metric}" "$(seconds_to_ms "${target_seconds}")" "$(seconds_to_ms "${near_seconds}")"
+  done
+}
+
+decimal_value() {
+  [[ "$1" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
+}
+
+positive_decimal_value() {
+  decimal_value "$1" && awk -v value="$1" 'BEGIN { exit !(value > 0) }'
+}
+
+nonnegative_decimal_value() {
+  decimal_value "$1" && awk -v value="$1" 'BEGIN { exit !(value >= 0) }'
 }
 
 prefill_metric_supported() {
@@ -75,7 +110,7 @@ prefill_metric_supported() {
 }
 
 validate_prefill_sla_rules() {
-  local rules_text rule metric target near extra
+  local rules_text rule input_k metric target_seconds near_seconds extra
   rules_text="$(prefill_sla_rules_text)"
   [[ -n "${rules_text//[[:space:],]/}" ]] || {
     echo "[ERROR] PREFILL_SLA_RULES 不能为空" >&2
@@ -86,13 +121,15 @@ validate_prefill_sla_rules() {
   for rule in "${rules[@]}"; do
     rule="${rule//[[:space:]]/}"
     [[ -n "${rule}" ]] || continue
-    IFS=':' read -r metric target near extra <<< "${rule}"
-    if [[ -n "${extra:-}" ]] || ! prefill_metric_supported "${metric}" \
-      || [[ ! "${target}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
-      || ! awk -v value="${target}" 'BEGIN { exit !(value > 0) }' \
-      || [[ ! "${near:-0}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    IFS=':' read -r input_k metric target_seconds near_seconds extra <<< "${rule}"
+    if [[ -n "${extra:-}" ]] || ! decimal_value "${input_k}" \
+      || ! positive_decimal_value "${input_k}" \
+      || ! prefill_metric_supported "${metric}" \
+      || ! positive_decimal_value "${target_seconds}" \
+      || ! nonnegative_decimal_value "${near_seconds}"; then
       echo "[ERROR] 非法 PREFILL_SLA_RULES 规则: ${rule}" >&2
-      echo "[ERROR] 支持格式: metric:target:near，metric 必须是已提取的 TTFT 指标" >&2
+      echo "[ERROR] 支持格式: input_k:metric:target_seconds:near_seconds" >&2
+      echo "[ERROR] target/near 使用秒，可填写小数；metric 必须是已提取的 TTFT 指标" >&2
       return 1
     fi
   done
@@ -720,7 +757,8 @@ PY_SUMMARY
 run_input_matrix() {
   local input_k="$1"
   local input_len per_dp_bs baseline_rps baseline_log
-  local rules_text rule target_metric target_value_ms target_near_ms extra baseline_value
+  local target_metric target_value_ms target_near_ms baseline_value
+  local matched_rules=0
 
   input_len="$(tokens_from_k "${input_k}")" || {
     echo "[ERROR] 无法转换输入长度 ${input_k}K" >&2
@@ -743,20 +781,21 @@ run_input_matrix() {
     return 1
   fi
 
-  rules_text="$(prefill_sla_rules_text)"
-  IFS=',' read -ra rules <<< "${rules_text}"
-  for rule in "${rules[@]}"; do
-    rule="${rule//[[:space:]]/}"
-    [[ -n "${rule}" ]] || continue
-    IFS=':' read -r target_metric target_value_ms target_near_ms extra <<< "${rule}"
-    target_near_ms="${target_near_ms:-0}"
+  while IFS='|' read -r target_metric target_value_ms target_near_ms; do
+    [[ -n "${target_metric}" ]] || continue
+    matched_rules=1
     baseline_value="$(extract_metric "${baseline_log}" "${target_metric}" 2>/dev/null || true)"
     if [[ -z "${baseline_value}" ]]; then
-      echo "[ERROR] input=${input_k}K 的基准日志缺少 ${target_metric}，跳过规则 ${rule}" >&2
+      echo "[ERROR] input=${input_k}K 的基准日志缺少 ${target_metric}，跳过该规则" >&2
       continue
     fi
     search_target "${input_k}" "${input_len}" "${per_dp_bs}" "${target_metric}" "${target_value_ms}" "${target_near_ms}" "${baseline_rps}" "${baseline_value}" "${baseline_log}"
-  done
+  done < <(prefill_sla_rules_for_input "${input_k}")
+
+  if (( matched_rules == 0 )); then
+    echo "[ERROR] input=${input_k}K 没有匹配的 PREFILL_SLA_RULES 规则" >&2
+    return 1
+  fi
 }
 
 main() {
