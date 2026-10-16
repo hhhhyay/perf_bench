@@ -31,6 +31,7 @@ perf_bench/
 
 - 使用与 `sglc.sh` 相同的服务配置和 `bench_serving` 参数。
 - 输出长度固定为 1 token，不再配置输出长度。
+- 不设置 `--max-concurrency`，让 Prefill 测试按请求率自然形成并发；`DP_SIZE × per-DP BS` 只用于计算请求数量和记录 BS。
 - 默认测试输入 `32K/64K/128K`，按 `PREFILL_TTFT_BS_RULES` 自动选择一个 per-DP BS，不扫描全部 BS。
 - 对每个输入先跑 `request_rate=inf`，再从高请求率向下寻找满足每条 SLA 规则的临界值。
 - 试探请求率统一保留两位小数；二分搜索区间默认缩小到 `0.1 req/s` 后停止，避免用过小步长制造没有实际意义的伪精度。
@@ -67,6 +68,16 @@ question_len = L - system_prompt_len
 
 默认使用 `32` 个 group、每组 `16` 个 prompt，即 `512` 个请求；默认 `TOKEN_UNIT=1024`，
 需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
+默认使用官方 `--gsp-input-ids` 直接发送 token ID，避免随机 token 经文本解码和重新编码后产生输入长度漂移；
+如需兼容不支持该参数的旧版 SGLang，可设置 `GSP_INPUT_IDS=0`。
+
+`--case` 的基本格式为 `INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S`；TPOT 条件可选，
+需要约束 TPOT 时再追加 `TPOT_METRIC,TPOT_TARGET_MS`，例如：
+
+```bash
+--case '16k,1,80,mean_ttft_ms,5'
+--case '32k,1,90,mean_ttft_ms,5,mean_tpot_ms,100'
+```
 
 一个命令可以连续测试多个输入/输出、命中率和 SLA：
 
@@ -217,9 +228,10 @@ bash vllm/vllmc.sh
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
 | `TOKEN_UNIT` | K 的 token 定义，默认 `1024`；设为 `1000` 使用十进制 K。 |
+| `GSP_INPUT_IDS` | 是否使用官方 `--gsp-input-ids` 直接发送 token ID，默认 `1`；设为 `0` 关闭。 |
 | `GSP_PAGE_SIZE` | GSP KV page 大小；真实执行默认从 `/server_info` 读取，失败回退 `64`。 |
 | `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
-| `GSP_HIT_RATE_TOLERANCE_PCT` | 实测 cache 命中率相对指定命中率的允许误差，默认 `2.0` 个百分点。 |
+| `GSP_HIT_RATE_TOLERANCE_PCT` | 实测 cache 命中率相对指定命中率的允许误差，默认 `0.5` 个百分点；只有落在该范围内才算命中率达标。 |
 | `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
 | `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`。 |
 | `PREFILL_TTFT_INPUTS` | Prefill 输入长度，默认 `32 64 128`，单位为 K。 |

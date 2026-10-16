@@ -13,6 +13,7 @@ TOKEN_UNIT="${TOKEN_UNIT:-1024}"
 GSP_NUM_GROUPS="${GSP_NUM_GROUPS:-32}"
 GSP_PROMPTS_PER_GROUP="${GSP_PROMPTS_PER_GROUP:-16}"
 GSP_MAX_CONCURRENCY="${GSP_MAX_CONCURRENCY:-}"
+GSP_INPUT_IDS="${GSP_INPUT_IDS:-1}"
 GSP_PAGE_SIZE="${GSP_PAGE_SIZE:-}"
 GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
 SEED="${SEED:-42}"
@@ -20,7 +21,7 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
 RATE_OFFSETS="${GSP_RATE_OFFSETS:-0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5}"
 RATE_STEP="${GSP_RATE_STEP:-0.1}"
-HIT_RATE_TOLERANCE="${GSP_HIT_RATE_TOLERANCE_PCT:-2.0}"
+HIT_RATE_TOLERANCE="${GSP_HIT_RATE_TOLERANCE_PCT:-0.5}"
 EXPLICIT_RATES="${GSP_REQUEST_RATES:-}"
 
 out_dir="./all_result/bench_gsp_prefix_${RUN_ID}"
@@ -41,7 +42,7 @@ Usage:
 
 Options:
   --case CASE       Repeatable case:
-                    INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S,TPOT_METRIC,TPOT_TARGET_MS[,MAX_CONCURRENCY]
+                    INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S[,TPOT_METRIC,TPOT_TARGET_MS[,MAX_CONCURRENCY]]
   --plot            Generate a heatmap after CSV summary is written
   --cell CELL       Heatmap cell: rps|input_throughput (alias: input_tp)
   --dry-run         Validate and print official commands without calling the server
@@ -59,12 +60,13 @@ Environment:
   GSP_NUM_GROUPS=32               Official GSP group count
   GSP_PROMPTS_PER_GROUP=16        Official prompts per group
   GSP_MAX_CONCURRENCY=            Optional global max concurrency
+  GSP_INPUT_IDS=1                 Pass raw token IDs with official --gsp-input-ids
   GSP_PAGE_SIZE=                  KV cache page size; auto-read from /server_info, fallback 64
   GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
   GSP_RATE_OFFSETS=0,-0.1,...     Cumulative high-to-low offsets after inf baseline
   GSP_RATE_STEP=0.1               Minimum finite-rate step
-  GSP_HIT_RATE_TOLERANCE_PCT=2.0  Allowed measured/target hit-rate difference
+  GSP_HIT_RATE_TOLERANCE_PCT=0.5  Allowed measured/target hit-rate difference
   RUN_ID=...                       Result directory suffix
 
 The hit rate is token-level: total_cached_tokens / total_prompt_tokens.
@@ -263,11 +265,16 @@ parse_case() {
     return 1
   }
   [[ -n "${CASE_INPUT_RAW:-}" && -n "${CASE_OUTPUT_RAW:-}" && -n "${CASE_HIT_PCT:-}" \
-    && -n "${CASE_TTFT_METRIC:-}" && -n "${CASE_TTFT_TARGETS:-}" \
-    && -n "${CASE_TPOT_METRIC:-}" && -n "${CASE_TPOT_TARGET_MS:-}" ]] || {
+    && -n "${CASE_TTFT_METRIC:-}" && -n "${CASE_TTFT_TARGETS:-}" ]] || {
     echo "[ERROR] 非法 case: ${raw}" >&2
     return 1
   }
+  if [[ -n "${CASE_TPOT_METRIC:-}" || -n "${CASE_TPOT_TARGET_MS:-}" ]]; then
+    [[ -n "${CASE_TPOT_METRIC:-}" && -n "${CASE_TPOT_TARGET_MS:-}" ]] || {
+      echo "[ERROR] TPOT 指标和阈值必须同时设置: ${raw}" >&2
+      return 1
+    }
+  fi
   is_positive_decimal "${CASE_HIT_PCT}" || {
     echo "[ERROR] HIT_RATE 必须是正数: ${raw}" >&2
     return 1
@@ -289,10 +296,12 @@ parse_case() {
     mean_ttft_ms|p50_ttft_ms|p90_ttft_ms|p95_ttft_ms|p99_ttft_ms|max_ttft_ms) ;;
     *) echo "[ERROR] 不支持的 TTFT 指标: ${CASE_TTFT_METRIC}" >&2; return 1 ;;
   esac
-  case "${CASE_TPOT_METRIC}" in
-    mean_tpot_ms|p50_tpot_ms|p90_tpot_ms|p95_tpot_ms|p99_tpot_ms) ;;
-    *) echo "[ERROR] 不支持的 TPOT 指标: ${CASE_TPOT_METRIC}" >&2; return 1 ;
-  esac
+  if [[ -n "${CASE_TPOT_METRIC}" ]]; then
+    case "${CASE_TPOT_METRIC}" in
+      mean_tpot_ms|p50_tpot_ms|p90_tpot_ms|p95_tpot_ms|p99_tpot_ms) ;;
+      *) echo "[ERROR] 不支持的 TPOT 指标: ${CASE_TPOT_METRIC}" >&2; return 1 ;;
+    esac
+  fi
 
   CASE_TTFT_TARGET_MS_LIST=()
   local target
@@ -304,10 +313,12 @@ parse_case() {
     }
     CASE_TTFT_TARGET_MS_LIST+=("$(awk -v v="$target" 'BEGIN { printf "%.6f", v * 1000 }' | sed -E 's/0+$//; s/[.]$//')")
   done
-  is_positive_decimal "${CASE_TPOT_TARGET_MS}" || {
-    echo "[ERROR] TPOT SLA 必须是正数毫秒: ${raw}" >&2
-    return 1
-  }
+  if [[ -n "${CASE_TPOT_METRIC}" ]]; then
+    is_positive_decimal "${CASE_TPOT_TARGET_MS}" || {
+      echo "[ERROR] TPOT SLA 必须是正数毫秒: ${raw}" >&2
+      return 1
+    }
+  fi
 
   CASE_INPUT_LEN="$(tokens_from_k "${CASE_INPUT_RAW}")" || {
     echo "[ERROR] 无法解析输入长度: ${raw}" >&2
@@ -333,6 +344,7 @@ validate_global_config() {
   [[ "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] TOKEN_UNIT 必须是正整数" >&2; return 1; }
   [[ "${GSP_NUM_GROUPS}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_NUM_GROUPS 必须是正整数" >&2; return 1; }
   [[ "${GSP_PROMPTS_PER_GROUP}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须是正整数" >&2; return 1; }
+  [[ "${GSP_INPUT_IDS}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_INPUT_IDS 必须是 0 或 1" >&2; return 1; }
   (( GSP_PROMPTS_PER_GROUP >= 2 )) || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须不小于 2" >&2; return 1; }
   [[ "${SEED}" =~ ^[0-9]+$ ]] || { echo "[ERROR] SEED 必须是非负整数" >&2; return 1; }
   [[ "${GSP_PAGE_ALIGN}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_PAGE_ALIGN 必须是 0 或 1" >&2; return 1; }
@@ -358,7 +370,11 @@ print_case() {
   echo "Groups/prompts       : ${GSP_NUM_GROUPS}/${GSP_PROMPTS_PER_GROUP}"
   echo "Num prompts          : ${CASE_NUM_PROMPTS}"
   echo "TTFT                 : ${CASE_TTFT_METRIC} < ${CASE_TTFT_TARGETS} s"
-  echo "TPOT                 : ${CASE_TPOT_METRIC} < ${CASE_TPOT_TARGET_MS} ms"
+  if [[ -n "${CASE_TPOT_METRIC}" ]]; then
+    echo "TPOT                 : ${CASE_TPOT_METRIC} < ${CASE_TPOT_TARGET_MS} ms"
+  else
+    echo "TPOT                 : not constrained"
+  fi
   echo "Max concurrency      : ${CASE_CONCURRENCY:-UNLIMITED}"
 }
 
@@ -376,6 +392,9 @@ print_dry_run_case() {
   printf ' %q' --gsp-output-len "${CASE_OUTPUT_LEN}"
   printf ' %q' --gsp-ordered --num-prompts "${CASE_NUM_PROMPTS}"
   printf ' %q' --flush-cache --seed "${SEED}" --cache-report
+  if [[ "${GSP_INPUT_IDS}" == "1" ]]; then
+    printf ' %q' --gsp-input-ids
+  fi
   printf ' %q' --request-rate "${request_rate}" --disable-tqdm --output-file /dev/null
   if [[ -n "${CASE_CONCURRENCY:-}" ]]; then
     printf ' %q' --max-concurrency "${CASE_CONCURRENCY}"
@@ -411,6 +430,10 @@ check_bench_flags() {
       missing=1
     fi
   done
+  if [[ "${GSP_INPUT_IDS}" == "1" ]] && ! grep -Fq -- "--gsp-input-ids" <<< "${help_text}"; then
+    echo "[ERROR] 当前 bench_serving 缺少官方参数: --gsp-input-ids" >&2
+    missing=1
+  fi
   (( missing == 0 ))
 }
 
@@ -524,6 +547,9 @@ build_bench_command() {
     --disable-tqdm
     --output-file /dev/null
   )
+  if [[ "${GSP_INPUT_IDS}" == "1" ]]; then
+    cmd+=(--gsp-input-ids)
+  fi
   if [[ -n "${CASE_CONCURRENCY:-}" ]]; then
     cmd+=(--max-concurrency "${CASE_CONCURRENCY}")
   fi
@@ -732,12 +758,16 @@ for case_id, case_rows in groups.items():
             measured_hit = num(row, "actual_cache_hit_rate_pct")
             target_hit = num(row, "specified_cache_hit_rate_pct")
             selected_ttft = num(row, row.get("ttft_metric", ""))
-            selected_tpot = num(row, row.get("tpot_metric", ""))
-            tpot_limit = num(row, "tpot_target_ms")
-            if None in (actual_rps, measured_hit, target_hit, selected_ttft, selected_tpot, tpot_limit):
+            tpot_metric = row.get("tpot_metric", "")
+            selected_tpot = num(row, tpot_metric) if tpot_metric else None
+            tpot_limit = num(row, "tpot_target_ms") if tpot_metric else None
+            if None in (actual_rps, measured_hit, target_hit, selected_ttft):
                 continue
             delta = abs(measured_hit - target_hit)
-            if delta <= tolerance and selected_ttft <= target_ms and selected_tpot <= tpot_limit:
+            tpot_ok = not tpot_metric or (
+                selected_tpot is not None and tpot_limit is not None and selected_tpot <= tpot_limit
+            )
+            if delta <= tolerance and selected_ttft <= target_ms and tpot_ok:
                 candidates.append((actual_rps, row, selected_ttft, selected_tpot, delta))
         if candidates:
             actual_rps, row, ttft, tpot, delta = max(candidates, key=lambda x: x[0])
@@ -753,7 +783,8 @@ for case_id, case_rows in groups.items():
                 "ttft_metric": base.get("ttft_metric", ""), "ttft_target_s": target_s,
                 "selected_actual_rps": f"{actual_rps:.2f}",
                 "selected_input_throughput": row.get("input_throughput", ""),
-                "selected_ttft_ms": f"{ttft:.4f}", "selected_tpot_ms": f"{tpot:.4f}",
+                "selected_ttft_ms": f"{ttft:.4f}",
+                "selected_tpot_ms": f"{tpot:.4f}" if tpot is not None else "",
                 "selected_configured_request_rate": row.get("configured_request_rate", ""),
                 "status": "MEET", "log_file": row.get("log_file", ""),
             })

@@ -418,7 +418,6 @@ build_bench_command() {
     --random-output-len 1
     --random-range-ratio 1.0
     --request-rate "${request_rate}"
-    --max-concurrency "${global_concurrency}"
     --warmup-requests "${warmup_requests}"
     --flush-cache
     --disable-tqdm
