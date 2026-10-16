@@ -16,6 +16,7 @@ GSP_MAX_CONCURRENCY="${GSP_MAX_CONCURRENCY:-}"
 GSP_INPUT_IDS="${GSP_INPUT_IDS:-1}"
 GSP_PAGE_SIZE="${GSP_PAGE_SIZE:-}"
 GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
+GSP_SYSTEM_LEN_EXTRA_TOKENS="${GSP_SYSTEM_LEN_EXTRA_TOKENS:-0}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
@@ -63,6 +64,7 @@ Environment:
   GSP_INPUT_IDS=1                 Pass raw token IDs with official --gsp-input-ids
   GSP_PAGE_SIZE=                  KV cache page size; auto-read from /server_info, fallback 64
   GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
+  GSP_SYSTEM_LEN_EXTRA_TOKENS=0   Optional page-aligned cache-report calibration tokens
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
   GSP_RATE_OFFSETS=0,-0.1,...     Cumulative high-to-low offsets after inf baseline
   GSP_RATE_STEP=0.1               Minimum finite-rate step
@@ -175,15 +177,17 @@ sanitize_slug() {
 }
 
 derive_gsp_lengths() {
-  local input_len="$1" hit_pct="$2" prompts="$3" page_size="$4" page_align="$5"
-  "${PYTHON_BIN}" - "$input_len" "$hit_pct" "$prompts" "$page_size" "$page_align" <<'PY' | tr -d '\r'
+  local input_len="$1" hit_pct="$2" prompts="$3" page_size="$4" page_align="$5" extra_tokens="$6"
+  "${PYTHON_BIN}" - "$input_len" "$hit_pct" "$prompts" "$page_size" "$page_align" "$extra_tokens" <<'PY' | tr -d '\r'
 import math
 import sys
 
 length, hit_pct, prompts = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
-page_size, page_align = int(sys.argv[4]), sys.argv[5] == "1"
+page_size, page_align, extra_tokens = int(sys.argv[4]), sys.argv[5] == "1", int(sys.argv[6])
 if prompts <= 1:
     raise SystemExit("prompts_per_group must be greater than 1")
+if extra_tokens < 0:
+    raise SystemExit("extra system tokens must be non-negative")
 desired_system_len = (hit_pct / 100.0) * prompts * length / (prompts - 1)
 rounded_system_len = int(math.floor(desired_system_len + 0.5))
 system_len = rounded_system_len
@@ -198,6 +202,8 @@ if page_align and page_size > 1:
             candidates,
             key=lambda x: abs(100.0 * (prompts - 1) * x / (prompts * length) - hit_pct),
         )
+system_len += extra_tokens
+rounded_system_len += extra_tokens
 question_len = length - system_len
 if system_len <= 0 or question_len <= 0 or system_len >= length:
     raise SystemExit("target hit rate cannot produce positive system/question lengths")
@@ -330,7 +336,7 @@ parse_case() {
   }
   read -r CASE_SYSTEM_LEN CASE_QUESTION_LEN CASE_THEORY_HIT_PCT CASE_REQUESTED_THEORY_HIT_PCT < <(
     derive_gsp_lengths "${CASE_INPUT_LEN}" "${CASE_HIT_PCT}" "${GSP_PROMPTS_PER_GROUP}" \
-      "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}"
+      "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}" "${GSP_SYSTEM_LEN_EXTRA_TOKENS}"
   ) || {
     echo "[ERROR] 无法根据命中率生成 GSP system/question 长度: ${raw}" >&2
     return 1
@@ -348,6 +354,7 @@ validate_global_config() {
   (( GSP_PROMPTS_PER_GROUP >= 2 )) || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须不小于 2" >&2; return 1; }
   [[ "${SEED}" =~ ^[0-9]+$ ]] || { echo "[ERROR] SEED 必须是非负整数" >&2; return 1; }
   [[ "${GSP_PAGE_ALIGN}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_PAGE_ALIGN 必须是 0 或 1" >&2; return 1; }
+  [[ "${GSP_SYSTEM_LEN_EXTRA_TOKENS}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_SYSTEM_LEN_EXTRA_TOKENS 必须是非负整数" >&2; return 1; }
   is_positive_decimal "${RATE_STEP}" || { echo "[ERROR] GSP_RATE_STEP 必须是正数" >&2; return 1; }
   awk -v v="${RATE_STEP}" 'BEGIN { exit !(v >= 0.1) }' || { echo "[ERROR] GSP_RATE_STEP 不能小于 0.1" >&2; return 1; }
   is_positive_decimal "${HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }

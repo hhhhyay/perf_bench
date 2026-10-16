@@ -65,6 +65,9 @@ question_len = L - system_prompt_len
 `64`，并选择最接近目标的 page 对齐长度；CSV 同时记录未对齐理论值、page 对齐后的理论值
 和官方 `--cache-report` 实测值。设置 `GSP_PAGE_ALIGN=0` 可关闭对齐，设置
 `GSP_PAGE_SIZE` 可显式指定 page 大小。理论值只用于解释 workload，容量筛选始终使用实测命中率。
+如果特定服务版本的 `cache-report` 相对理论值存在稳定的 page/token 偏差，可显式设置
+`GSP_SYSTEM_LEN_EXTRA_TOKENS` 在基础 page 对齐长度上追加共享前缀 token，默认 `0`，不自动修改目标；
+校准值应使用 page 大小的整数倍。
 
 默认使用 `32` 个 group、每组 `16` 个 prompt，即 `512` 个请求；默认 `TOKEN_UNIT=1024`，
 需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
@@ -78,6 +81,25 @@ question_len = L - system_prompt_len
 --case '16k,1,80,mean_ttft_ms,5'
 --case '32k,1,90,mean_ttft_ms,5,mean_tpot_ms,100'
 ```
+
+#### 811 节点官方 GSP 验证记录
+
+`m09r3n06` 上使用 Qwen3-8B、TP4、官方 `generated-shared-prefix`，固定 `32` 个 group、
+每组 `16` 个 prompt，共 `512` 个请求；不设置 `max-concurrency`，使用
+`--gsp-input-ids --gsp-ordered --flush-cache --cache-report`。低速验收行使用
+`0.20 req/s`，命中率始终按官方 `cache-report` 实测 token 比例判定。
+
+| 场景 | 指定命中率 | 实测命中率 | Mean TTFT | Mean TPOT | 结果 |
+|---|---:|---:|---:|---:|---|
+| 8K/1 | 90% | 89.7% | 97.73ms | - | MEET |
+| 10K/1 | 90% | 89.9% | 101.34ms | - | MEET |
+| 20K/1 | 90% | 90.1% | 138.10ms | - | MEET |
+| 32K/1 | 90% | 90.1% | 251.81ms | - | MEET |
+| 8K/1K | 80% | 79.5% | 106.04ms | 9.50ms | MEET |
+
+该版本在 20K/1 和 32K/1 的 `cache-report` 与理论 page 比例存在稳定偏差，复测时分别使用
+`GSP_SYSTEM_LEN_EXTRA_TOKENS=192` 和 `320` 做 page 对齐后的前缀校准；这不是放宽命中率
+容差，CSV 仍按实测命中率和默认 `0.5` 个百分点容差筛选。
 
 一个命令可以连续测试多个输入/输出、命中率和 SLA：
 
@@ -231,6 +253,7 @@ bash vllm/vllmc.sh
 | `GSP_INPUT_IDS` | 是否使用官方 `--gsp-input-ids` 直接发送 token ID，默认 `1`；设为 `0` 关闭。 |
 | `GSP_PAGE_SIZE` | GSP KV page 大小；真实执行默认从 `/server_info` 读取，失败回退 `64`。 |
 | `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
+| `GSP_SYSTEM_LEN_EXTRA_TOKENS` | 在基础 page 对齐长度上追加的共享前缀 token 数，默认 `0`；仅用于已由官方 `cache-report` 证实的稳定偏差校准，建议使用 page 大小的整数倍。 |
 | `GSP_HIT_RATE_TOLERANCE_PCT` | 实测 cache 命中率相对指定命中率的允许误差，默认 `0.5` 个百分点；只有落在该范围内才算命中率达标。 |
 | `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
 | `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`。 |
