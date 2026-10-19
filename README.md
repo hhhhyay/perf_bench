@@ -73,7 +73,7 @@ question_len = L - system_prompt_len
 以减少请求数并覆盖高命中率场景；默认 `TOKEN_UNIT=1024`，
 需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
 默认使用官方 `--gsp-input-ids` 直接发送 token ID，避免随机 token 经文本解码和重新编码后产生输入长度漂移；
-如需兼容不支持该参数的旧版 SGLang，可设置 `GSP_INPUT_IDS=0`。
+如需兼容不支持该参数的旧版 SGLang，可设置 `GSP_INPUT_IDS=0`，但实际输入长度和命中率可能发生偏差。
 
 `--case` 的基本格式为 `INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S`；TPOT 条件可选，
 需要约束 TPOT 时再追加 `TPOT_METRIC,TPOT_TARGET_MS`，例如：
