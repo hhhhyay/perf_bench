@@ -69,7 +69,8 @@ question_len = L - system_prompt_len
 `GSP_SYSTEM_LEN_EXTRA_TOKENS` 在基础 page 对齐长度上追加共享前缀 token，默认 `0`，不自动修改目标；
 校准值应使用 page 大小的整数倍。
 
-默认使用 `32` 个 group、每组 `16` 个 prompt，即 `512` 个请求；默认 `TOKEN_UNIT=1024`，
+默认使用 `2` 个 group，并根据目标命中率在每组 `16/32/64` 个 prompt 中自动选择，
+以减少请求数并覆盖高命中率场景；默认 `TOKEN_UNIT=1024`，
 需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
 默认使用官方 `--gsp-input-ids` 直接发送 token ID，避免随机 token 经文本解码和重新编码后产生输入长度漂移；
 如需兼容不支持该参数的旧版 SGLang，可设置 `GSP_INPUT_IDS=0`。
@@ -84,22 +85,45 @@ question_len = L - system_prompt_len
 
 #### 811 节点官方 GSP 验证记录
 
-`m09r3n06` 上使用 Qwen3-8B、TP4、官方 `generated-shared-prefix`，固定 `32` 个 group、
-每组 `16` 个 prompt，共 `512` 个请求；不设置 `max-concurrency`，使用
-`--gsp-input-ids --gsp-ordered --flush-cache --cache-report`。低速验收行使用
-`0.20 req/s`，命中率始终按官方 `cache-report` 实测 token 比例判定。
+`m09r3n06` 上使用 Qwen3-8B、TP4、官方 `generated-shared-prefix`，默认使用
+`2` 个 group，并按目标命中率自动尝试每组 `16 -> 32 -> 64` 个 prompt；不设置
+`max-concurrency`，使用 `--gsp-input-ids --gsp-ordered --flush-cache --cache-report`。
+每个 case 的 `inf` baseline 必须先满足目标命中率，之后才从该 baseline 的实际 RPS
+向下回测；命中率始终按官方 `cache-report` 实测 token 比例判定。
 
-| 场景 | 指定命中率 | 实测命中率 | Mean TTFT | Mean TPOT | 结果 |
-|---|---:|---:|---:|---:|---|
-| 8K/1 | 90% | 89.7% | 97.73ms | - | MEET |
-| 10K/1 | 90% | 89.9% | 101.34ms | - | MEET |
-| 20K/1 | 90% | 90.1% | 138.10ms | - | MEET |
-| 32K/1 | 90% | 90.1% | 251.81ms | - | MEET |
-| 8K/1K | 80% | 79.5% | 106.04ms | 9.50ms | MEET |
+旧版固定 `32x16` 的结果不能作为新版 `inf` 硬门槛结果：此前 `inf` 命中率约为
+`84%`。在无限请求率下，每组可能有约两个并发请求未命中，因此脚本按
+`GSP_CACHE_MISS_REQUESTS_PER_GROUP=2` 校准共享前缀长度；例如 8K/90% 使用
+`7872/320`、32K/90% 使用 `31424/1344`。新版脚本会重新验证每个 case；如果所有
+prompt/group 候选的 `inf` 命中率都不达标，summary 必须标记为 `BASELINE_HIT_RATE_MISMATCH`，不再
+用低速结果标记 `MEET`。
 
-该版本在 20K/1 和 32K/1 的 `cache-report` 与理论 page 比例存在稳定偏差，复测时分别使用
-`GSP_SYSTEM_LEN_EXTRA_TOKENS=192` 和 `320` 做 page 对齐后的前缀校准；这不是放宽命中率
-容差，CSV 仍按实测命中率和默认 `0.5` 个百分点容差筛选。
+本次 `m09r3n06` TP4 实测：8K/1、目标 90% 使用 `2x32`，实测命中率 `90.1%`、`inf`
+实际 RPS `34.75`、Mean TTFT `1411 ms`；32K/1、目标 90% 使用 `2x32` 和
+`31424/1344`，实测命中率 `89.9%`、`inf` 实际 RPS `6.26`、Mean TTFT `7437.55 ms`。
+两组均未设置 `max-concurrency`，结果目录和完整日志保存在节点容器的
+`/all_result/bench_gsp_prefix_20261019_inf_calibrated_8k90/` 和
+`/all_result/bench_gsp_prefix_20261019_inf_calibrated_32k90_floor/`。
+
+动态时长实测（`GSP_TARGET_DURATION_S=60`）：8K/1 自动扩展为 `66x32=2112` 请求，
+`inf` 耗时 `61.78s`、实际 RPS `34.18`、命中率 `90.1%`；32K/1 自动扩展为
+`12x32=384` 请求，`inf` 耗时 `61.28s`、实际 RPS `6.27`、命中率 `89.9%`。
+同请求数回测耗时分别为 `63.78s` 和 `60.66s`，说明请求数会随 case 的 pilot RPS
+自动变化，而不会固定为 64。
+
+多请求率回测也已在同一轮验证：默认 `GSP_RATE_OFFSETS` 会从动态 `inf` 实际 RPS
+依次生成 `0、-0.1、-0.1、-0.1、-0.2、-0.2、-0.3、-0.5` 八个有限请求率，
+其中 `inf` 只作为命中率基线，不作为最终容量点。8K/1 的配置请求率为
+`34.18、34.08、33.98、33.88、33.68、33.48、33.18、32.68 req/s`，32K/1
+的配置请求率为 `6.27、6.17、6.07、5.97、5.77、5.57、5.27、4.77 req/s`。
+在 `m09r3n06` 的实测中，8K 所有回测点均为 `90.1%`，32K 所有回测点均为
+`89.9%`；两组共 `20` 个完整日志，全部 `exitcode=0`。这说明在固定 GSP 分组、
+共享前缀长度和 `--flush-cache` 口径下，请求率变化会影响 TTFT/RPS，但不会改变
+该 workload 的 token-level cache hit rate。对应结果目录为
+`/all_result/bench_gsp_prefix_20261019_dynamic_duration_60/`。
+
+`GSP_SYSTEM_LEN_EXTRA_TOKENS` 仍可用于已有服务的实测校准，但默认不追加额外 token；这不是
+放宽命中率容差，CSV 仍按实测命中率和默认 `0.5` 个百分点容差筛选。
 
 一个命令可以连续测试多个输入/输出、命中率和 SLA：
 
@@ -118,9 +142,32 @@ INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S,TPOT_METRIC,TPOT_TARGET_MS[,MAX
 ```
 
 例如 `3|5` 表示分别查找 TTFT 小于 3 秒和 5 秒时的最大实际客户端 RPS；TPOT
-限制为 30ms。有限请求率从高到低回测，记录实际 `request_throughput`，保留两位小数，
-最小步长不低于 `0.1 req/s`。只有实测命中率在目标容差内、TTFT 和 TPOT 同时满足的点
-才会进入容量结果。
+限制为 30ms。每个 case 先按 `GSP_PROMPTS_PER_GROUP_CANDIDATES` 从小到大计算可行的共享前缀，
+使用 `GSP_NUM_GROUPS_CANDIDATES` 组合测试 `inf`，选择首个实际命中率达标的组合；显式设置
+`GSP_PROMPTS_PER_GROUP` 或 `GSP_NUM_GROUPS` 时只使用固定值。然后以该次 `inf` 的实际
+`request_throughput` 为起点从高到低回测，记录实际请求率，保留两位小数，最小步长不低于
+`0.1 req/s`。只有 baseline 和候选点都满足实测命中率、TTFT、TPOT，才会进入容量结果。
+默认先用小请求数得到 pilot RPS，再按 `GSP_TARGET_DURATION_S` 动态扩展当前 case 的
+`gsp_num_groups/num_prompts`；默认目标为 60 秒，最终每个 case 的 benchmark duration
+通常落在 1～2 分钟。扩展时保持 prompts/group、system/question 长度和命中率口径不变。
+
+只验证一组输入/输出的多请求率回测可以直接使用：
+
+```bash
+BASE_URL=http://127.0.0.1:30000 \
+MODEL=/path/to/model \
+GSP_TARGET_DURATION_S=60 \
+RUN_ID=gsp_rate_sweep_demo \
+bash sglang/gsp_prefix_bench.sh \
+  --case '8k,1,90,mean_ttft_ms,3' \
+  --case '32k,1,90,mean_ttft_ms,5'
+```
+
+不设置 `GSP_REQUEST_RATES` 时使用默认降速序列；如果只想指定有限请求率，设置
+`GSP_REQUEST_RATES=34.18,33.98,33.48`，脚本仍会先执行 `inf` 命中率基线，再执行这些
+有限请求率。每个有限点都会写入 `gsp_prefix_trials.csv`，其中
+`configured_request_rate` 是客户端配置值，`request_throughput` 是实际客户端输出 RPS；
+容量筛选使用后者。
 
 默认只生成 CSV 和日志；需要矩阵图时指定格子中央显示的指标：
 
@@ -139,7 +186,8 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
 - `gsp_prefix_trials.csv`：所有请求率 trial、指定/未对齐理论/page 对齐理论/实际 cache 命中率、page 信息、总 prompt/cache token、通用客户端吞吐、请求数、TTFT、TPOT、ITL、Mean E2E 和日志路径；Mean E2E 及之前的固定客户端指标顺序与现有脚本保持一致。
-- `gsp_prefix_summary.csv`：每个 case/TTFT SLA 下满足实测 cache hit、TTFT、TPOT 的最大实际 RPS。
+- `gsp_prefix_summary.csv`：每个 case/TTFT SLA 下的 baseline 命中率、baseline RPS、实际选择的
+  groups/请求数，以及满足实测 cache hit、TTFT、TPOT 的最大实际 RPS；baseline 不通过时明确记录失败状态。
 - `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
 
 脚本支持 `--dry-run` 核对官方命令而不连接服务；同一 `RUN_ID` 重新执行时会跳过已有成功
@@ -250,6 +298,12 @@ bash vllm/vllmc.sh
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
 | `TOKEN_UNIT` | K 的 token 定义，默认 `1024`；设为 `1000` 使用十进制 K。 |
+| `GSP_NUM_GROUPS_CANDIDATES` | `inf` 命中率校验的 groups 候选，默认 `2`；可逗号分隔多个值，设置 `GSP_NUM_GROUPS` 时只使用该固定值。 |
+| `GSP_PROMPTS_PER_GROUP_CANDIDATES` | 每组 prompt 候选，默认 `16,32,64`，从小到大尝试；用于按目标命中率减少请求数。 |
+| `GSP_PROMPTS_PER_GROUP` | 固定每组 prompt 数；设置后只使用该值，不再自动选择候选。 |
+| `GSP_CACHE_MISS_REQUESTS_PER_GROUP` | `inf` 校准时每组预估的并发未命中请求数，默认 `2`；最终仍以官方 `cache-report` 实测命中率为准。 |
+| `GSP_AUTO_DURATION` | 是否按 pilot RPS 动态扩展每个 case 的请求数，默认 `1`；显式设置 `GSP_NUM_GROUPS` 时不扩展 groups。 |
+| `GSP_TARGET_DURATION_S` | 每个 case 的目标 benchmark 时长，默认 `60` 秒，允许 `60-120` 秒；按 prompts/group 向上取整请求数。 |
 | `GSP_INPUT_IDS` | 是否使用官方 `--gsp-input-ids` 直接发送 token ID，默认 `1`；设为 `0` 关闭。 |
 | `GSP_PAGE_SIZE` | GSP KV page 大小；真实执行默认从 `/server_info` 读取，失败回退 `64`。 |
 | `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
