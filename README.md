@@ -438,7 +438,7 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 - `prefill_ttft_line.png` / `prefill_ttft_heatmap.png`：指定对应绘图模式时生成的辅助图。
 
 GSP 的 `gsp_prefix_summary.csv` 面向结果平台使用，保留输入/输出、指定和实际 cache 命中率、确认后的 workload 参数、请求率、吞吐和性能指标；执行过程字段如 `page_aligned`、`search_phase`、`log_file`、`backend`、`ttft_metric`、`ttft_targets_s` 等不放入 summary，原始排查信息仍保留在 `gsp_prefix_trials.csv`。`SLO_ms` 将 TTFT 目标合并为 JSON，例如 `{"mean":[5000,6000]}` 或 `{"99":10000}`。
-summary 的客户端指标按统一顺序排列：请求数/并发、请求率/时长、RPS/吞吐、TTFT/TPOT/ITL 的 `mean → p90 → p99`、E2E、cache/token 统计，`p50/p95/max` 等额外分位数统一放到 E2E 后面，便于与其他 benchmark 结果直接对齐。
+summary 的客户端指标按统一顺序排列：请求数/并发、请求率/时长、RPS/吞吐、TTFT/TPOT/ITL 的 `mean → p95 → p99`、E2E、cache/token 统计，`p50/p90/max` 等额外分位数统一放到 E2E 后面，便于与其他 benchmark 结果直接对齐。
 
 Prefill CSV 的客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL`、`Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。矩阵目标列同时记录 `target_metric`、`target_value_ms` 和 `target_near_ms`。
 
