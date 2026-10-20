@@ -1248,17 +1248,16 @@ metadata_fields = [
 preferred_fields = [
     "case_id", "input", "output",
     "specified_cache_hit_rate_pct", "SLO_ms", "system_prompt_len", "question_len",
-    "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
     "gsp_page_size", "gsp_num_groups", "gsp_prompts_per_group",
-    "num_prompts", "confirmed_inf_cache_hit_rate_pct",
-    "configured_request_rate", "actual_cache_hit_rate_pct",
-    "successful_requests", "benchmark_duration_s", "request_throughput", "input_throughput",
+    "successful_requests", "num_prompts",
+    "request_rate", "actual_cache_hit_rate_pct",
+    "duration_s", "request_throughput", "input_throughput",
     "output_throughput", "total_throughput", "peak_output_throughput", "peak_concurrency",
     "max_concurrency", "concurrency", "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
     "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms", "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
     "accept_length", "mean_e2e_latency_ms", "total_prompt_tokens", "total_cached_tokens",
     "p50_ttft_ms", "p90_ttft_ms", "max_ttft_ms", "p50_tpot_ms", "p90_tpot_ms",
-    "p50_itl_ms", "p90_itl_ms", "max_itl_ms", "duration_s",
+    "p50_itl_ms", "p90_itl_ms", "max_itl_ms",
     "total_input_tokens", "total_input_text_tokens", "total_generated_tokens",
     "total_generated_tokens_retokenized",
 ]
@@ -1267,6 +1266,8 @@ excluded_fields = {
     "actual_cache_hit_rate_delta_pct", "exit_code", "actual_rps", "traffic_request_rate",
     "page_aligned", "confirmed_inf_actual_rps", "search_phase", "log_file", "backend",
     "max_request_concurrency", "ttft_metric", "ttft_targets_s", "tpot_metric", "tpot_target_ms",
+    "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
+    "confirmed_inf_cache_hit_rate_pct", "configured_request_rate", "benchmark_duration_s",
 }
 fields = preferred_fields + [
     field for field in source_fields
@@ -1337,6 +1338,8 @@ for case_id, case_rows in case_groups.items():
             "result_type": result_type,
             "parameter_status": "confirmed",
             "SLO_ms": slo_json,
+            "request_rate": row.get("configured_request_rate", ""),
+            "duration_s": row.get("benchmark_duration_s", row.get("duration_s", "")),
             "confirmed_inf_actual_rps": f"{inf_rps:.2f}" if inf_rps is not None else "",
             "confirmed_inf_cache_hit_rate_pct": f"{inf_hit:.4f}" if inf_hit is not None else "",
             "confirmed_inf_phase": baseline.get("search_phase", ""),
