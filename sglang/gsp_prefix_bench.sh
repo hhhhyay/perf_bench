@@ -1102,6 +1102,7 @@ finite_rate_candidates() {
 write_summary_legacy() {
   "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" "${HIT_RATE_TOLERANCE}" <<'PY'
 import csv
+import json
 import math
 import os
 import sys
@@ -1215,6 +1216,7 @@ write_summary() {
   "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" \
     "${BASELINE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
+import json
 import math
 import os
 import sys
@@ -1245,12 +1247,11 @@ metadata_fields = [
 ]
 preferred_fields = [
     "case_id", "input", "output",
-    "specified_cache_hit_rate_pct", "system_prompt_len", "question_len",
+    "specified_cache_hit_rate_pct", "SLO_ms", "system_prompt_len", "question_len",
     "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
-    "gsp_page_size", "page_aligned", "gsp_num_groups", "gsp_prompts_per_group",
-    "num_prompts", "confirmed_inf_actual_rps", "confirmed_inf_cache_hit_rate_pct",
-    "configured_request_rate", "search_phase", "log_file", "actual_cache_hit_rate_pct",
-    "ttft_metric", "ttft_targets_s", "backend", "max_request_concurrency",
+    "gsp_page_size", "gsp_num_groups", "gsp_prompts_per_group",
+    "num_prompts", "confirmed_inf_cache_hit_rate_pct",
+    "configured_request_rate", "actual_cache_hit_rate_pct",
     "successful_requests", "benchmark_duration_s", "request_throughput", "input_throughput",
     "output_throughput", "total_throughput", "peak_output_throughput", "peak_concurrency",
     "max_concurrency", "concurrency", "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
@@ -1264,7 +1265,8 @@ preferred_fields = [
 excluded_fields = {
     "result_type", "parameter_status", "confirmed_inf_phase", "request_rate_order",
     "actual_cache_hit_rate_delta_pct", "exit_code", "actual_rps", "traffic_request_rate",
-    "tpot_metric", "tpot_target_ms",
+    "page_aligned", "confirmed_inf_actual_rps", "search_phase", "log_file", "backend",
+    "max_request_concurrency", "ttft_metric", "ttft_targets_s", "tpot_metric", "tpot_target_ms",
 }
 fields = preferred_fields + [
     field for field in source_fields
@@ -1298,6 +1300,30 @@ for case_id, case_rows in case_groups.items():
     ]
     inf_rps = num(baseline, "request_throughput")
     inf_hit = num(baseline, "actual_cache_hit_rate_pct")
+    metric = baseline.get("ttft_metric", "")
+    if metric == "mean_ttft_ms":
+        slo_key = "mean"
+    elif metric.startswith("p") and metric.endswith("_ttft_ms"):
+        slo_key = metric[1:-len("_ttft_ms")]
+    else:
+        slo_key = metric
+    slo_values = []
+    for target_s in baseline.get("ttft_targets_s", "").split("|"):
+        if not target_s:
+            continue
+        try:
+            target_ms = float(target_s) * 1000.0
+        except ValueError:
+            continue
+        slo_values.append(int(target_ms) if target_ms.is_integer() else target_ms)
+    slo_payload = {slo_key: slo_values[0] if len(slo_values) == 1 else slo_values} if slo_key and slo_values else {}
+    if baseline.get("tpot_metric") and baseline.get("tpot_target_ms"):
+        try:
+            tpot_target = float(baseline["tpot_target_ms"])
+            slo_payload["tpot"] = int(tpot_target) if tpot_target.is_integer() else tpot_target
+        except ValueError:
+            pass
+    slo_json = json.dumps(slo_payload, ensure_ascii=False, separators=(",", ":"))
     final_rows = [(baseline, "inf")] + [(row, "finite") for row in finite_rows]
     final_rows.sort(key=lambda item: (
         0 if item[1] == "inf" else 1,
@@ -1310,6 +1336,7 @@ for case_id, case_rows in case_groups.items():
         output.update({
             "result_type": result_type,
             "parameter_status": "confirmed",
+            "SLO_ms": slo_json,
             "confirmed_inf_actual_rps": f"{inf_rps:.2f}" if inf_rps is not None else "",
             "confirmed_inf_cache_hit_rate_pct": f"{inf_hit:.4f}" if inf_hit is not None else "",
             "confirmed_inf_phase": baseline.get("search_phase", ""),
