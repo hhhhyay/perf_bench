@@ -78,7 +78,8 @@ question_len = L - system_prompt_len
 默认开启自动命中率校准：每个 `inf` 候选先执行一次短 probe；如果实测命中率不满足，
 脚本按 `目标命中率 / 实测命中率` 修正共享前缀长度，并按 page size 对齐，最多再修正两轮；
 仍不达标时自动切换 `prompts/group` 和 `groups` 候选布局。校准 trial 会保留在
-`gsp_prefix_trials.csv`，但不会混入最终有限请求率容量结果。布局切换只改变请求组织方式，
+`gsp_prefix_trials.csv`，用于保留命中率修正前后的完整试探过程；确认参数后，最终的 `inf` 和有限请求率结果会单独整理到
+`gsp_prefix_summary.csv`。布局切换只改变请求组织方式，
 不改变单请求输入总 token 数和输出长度。
 
 `--case` 的基本格式为 `INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S`；TPOT 条件可选，
@@ -176,7 +177,7 @@ bash sglang/gsp_prefix_bench.sh \
 `GSP_REQUEST_RATES=34.18,33.98,33.48`，脚本仍会先执行 `inf` 命中率基线，再执行这些
 有限请求率。每个有限点都会写入 `gsp_prefix_trials.csv`，其中
 `configured_request_rate` 是客户端配置值，`request_throughput` 是实际客户端输出 RPS；
-容量筛选使用后者。
+容量筛选和 summary 排序使用后者。
 
 默认只生成 CSV 和日志；需要矩阵图时指定格子中央显示的指标：
 
@@ -194,9 +195,8 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 结果位于 `all_result/bench_gsp_prefix_<RUN_ID>/`：
 
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
-- `gsp_prefix_trials.csv`：所有请求率 trial、指定/未对齐理论/page 对齐理论/实际 cache 命中率、page 信息、总 prompt/cache token、通用客户端吞吐、请求数、TTFT、TPOT、ITL、Mean E2E 和日志路径；Mean E2E 及之前的固定客户端指标顺序与现有脚本保持一致。
-- `gsp_prefix_summary.csv`：每个 case/TTFT SLA 下的 baseline 命中率、baseline RPS、实际选择的
-  groups/请求数，以及满足实测 cache hit、TTFT、TPOT 的最大实际 RPS；baseline 不通过时明确记录失败状态。
+- `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准 probe；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
+- `gsp_prefix_summary.csv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `configured_request_rate=inf` 或 `search_phase` 区分基线/回测，并保留确认后的长度/分组/请求数、`confirmed_inf_actual_rps`、`configured_request_rate`、`request_throughput`、实际 cache 命中率和完整客户端指标。重复的状态、排序序号、RPS、请求率和 TPOT 规则字段不再放入 summary。先按 `confirmed_inf_actual_rps` 降序排列，同一参数块内再按配置请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
 - `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
 
 脚本支持 `--dry-run` 核对官方命令而不连接服务；同一 `RUN_ID` 重新执行时会跳过已有成功

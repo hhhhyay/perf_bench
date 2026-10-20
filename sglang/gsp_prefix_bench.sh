@@ -1098,25 +1098,14 @@ PY
 
 write_summary() {
   "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" \
-    "${BASELINE_HIT_RATE_TOLERANCE}" "${FINITE_HIT_RATE_TOLERANCE}" <<'PY'
+    "${BASELINE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
 import math
 import os
 import sys
 
-trials_path, summary_path, baseline_tolerance_s, finite_tolerance_s = sys.argv[1:]
+trials_path, summary_path, baseline_tolerance_s = sys.argv[1:]
 baseline_tolerance = float(baseline_tolerance_s)
-finite_tolerance = float(finite_tolerance_s)
-fields = [
-    "case_id", "input", "output", "specified_cache_hit_rate_pct", "theoretical_cache_hit_rate_pct",
-    "requested_theoretical_cache_hit_rate_pct", "gsp_page_size", "page_aligned",
-    "selected_gsp_num_groups", "selected_gsp_prompts_per_group", "selected_num_prompts",
-    "baseline_actual_rps", "baseline_actual_cache_hit_rate_pct", "baseline_hit_rate_delta_pct",
-    "baseline_mean_ttft_ms", "baseline_duration_s", "baseline_status",
-    "measured_hit_rate_pct", "hit_rate_delta_pct", "ttft_metric", "ttft_target_s",
-    "selected_actual_rps", "selected_input_throughput", "selected_ttft_ms",
-    "selected_tpot_ms", "selected_configured_request_rate", "status", "log_file",
-]
 rows = []
 if os.path.exists(trials_path):
     with open(trials_path, newline="", encoding="utf-8-sig") as f:
@@ -1129,39 +1118,43 @@ def num(row, key):
     except (TypeError, ValueError):
         return None
 
-def group_num(row):
-    value = num(row, "gsp_num_groups")
-    return int(value) if value is not None else -1
+def same_parameters(row, baseline):
+    keys = ("gsp_num_groups", "gsp_prompts_per_group", "system_prompt_len", "question_len")
+    return all(row.get(key, "") == baseline.get(key, "") for key in keys)
 
-def summary_row(base, target_s, baseline, baseline_status, status, **extra):
-    target_hit = num(base, "specified_cache_hit_rate_pct")
-    baseline_hit = num(baseline, "actual_cache_hit_rate_pct") if baseline else None
-    baseline_delta = abs(baseline_hit - target_hit) if baseline_hit is not None and target_hit is not None else None
-    selected_groups = baseline.get("gsp_num_groups", "") if baseline else ""
-    prompts = baseline.get("gsp_prompts_per_group", "") if baseline else ""
-    num_prompts = baseline.get("num_prompts", "") if baseline else ""
-    result = {
-        "case_id": base.get("case_id", ""), "input": base.get("input", ""), "output": base.get("output", ""),
-        "specified_cache_hit_rate_pct": base.get("specified_cache_hit_rate_pct", ""),
-        "theoretical_cache_hit_rate_pct": baseline.get("theoretical_cache_hit_rate_pct", base.get("theoretical_cache_hit_rate_pct", "")) if baseline else base.get("theoretical_cache_hit_rate_pct", ""),
-        "requested_theoretical_cache_hit_rate_pct": baseline.get("requested_theoretical_cache_hit_rate_pct", base.get("requested_theoretical_cache_hit_rate_pct", "")) if baseline else base.get("requested_theoretical_cache_hit_rate_pct", ""),
-        "gsp_page_size": base.get("gsp_page_size", ""), "page_aligned": base.get("page_aligned", ""),
-        "selected_gsp_num_groups": selected_groups, "selected_gsp_prompts_per_group": prompts,
-        "selected_num_prompts": num_prompts,
-        "baseline_actual_rps": baseline.get("request_throughput", "") if baseline else "",
-        "baseline_actual_cache_hit_rate_pct": f"{baseline_hit:.4f}" if baseline_hit is not None else "",
-        "baseline_hit_rate_delta_pct": f"{baseline_delta:.4f}" if baseline_delta is not None else "",
-        "baseline_mean_ttft_ms": baseline.get("mean_ttft_ms", "") if baseline else "",
-        "baseline_duration_s": baseline.get("benchmark_duration_s", "") if baseline else "",
-        "baseline_status": baseline_status,
-        "measured_hit_rate_pct": "", "hit_rate_delta_pct": "",
-        "ttft_metric": base.get("ttft_metric", ""), "ttft_target_s": target_s,
-        "selected_actual_rps": "", "selected_input_throughput": "", "selected_ttft_ms": "",
-        "selected_tpot_ms": "", "selected_configured_request_rate": "", "status": status,
-        "log_file": "",
-    }
-    result.update(extra)
-    return result
+source_fields = list(rows[0].keys()) if rows else []
+metadata_fields = [
+    "result_type", "parameter_status", "confirmed_inf_actual_rps",
+    "confirmed_inf_cache_hit_rate_pct", "confirmed_inf_phase", "request_rate_order",
+    "actual_cache_hit_rate_delta_pct",
+]
+preferred_fields = [
+    "case_id", "input", "output",
+    "specified_cache_hit_rate_pct", "system_prompt_len", "question_len",
+    "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
+    "gsp_page_size", "page_aligned", "gsp_num_groups", "gsp_prompts_per_group",
+    "num_prompts", "confirmed_inf_actual_rps", "confirmed_inf_cache_hit_rate_pct",
+    "configured_request_rate", "search_phase", "log_file", "actual_cache_hit_rate_pct",
+    "ttft_metric", "ttft_targets_s", "backend", "max_request_concurrency",
+    "successful_requests", "benchmark_duration_s", "request_throughput", "input_throughput",
+    "output_throughput", "total_throughput", "peak_output_throughput", "peak_concurrency",
+    "max_concurrency", "concurrency", "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms", "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
+    "accept_length", "mean_e2e_latency_ms", "total_prompt_tokens", "total_cached_tokens",
+    "p50_ttft_ms", "p90_ttft_ms", "max_ttft_ms", "p50_tpot_ms", "p90_tpot_ms",
+    "p50_itl_ms", "p90_itl_ms", "max_itl_ms", "duration_s",
+    "total_input_tokens", "total_input_text_tokens", "total_generated_tokens",
+    "total_generated_tokens_retokenized",
+]
+excluded_fields = {
+    "result_type", "parameter_status", "confirmed_inf_phase", "request_rate_order",
+    "actual_cache_hit_rate_delta_pct", "exit_code", "actual_rps", "traffic_request_rate",
+    "tpot_metric", "tpot_target_ms",
+}
+fields = preferred_fields + [
+    field for field in source_fields
+    if field not in preferred_fields and field not in metadata_fields and field not in excluded_fields
+]
 
 summary = []
 case_groups = {}
@@ -1169,106 +1162,109 @@ for row in rows:
     case_groups.setdefault(row.get("case_id", ""), []).append(row)
 
 for case_id, case_rows in case_groups.items():
-    if not case_rows:
-        continue
-    base = case_rows[0]
-    target_hit = num(base, "specified_cache_hit_rate_pct")
     baseline_rows = [
         row for row in case_rows
         if row.get("configured_request_rate", "") == "inf"
-        and (
-            row.get("search_phase", "").startswith("baseline")
-            or row.get("search_phase", "").startswith("duration_baseline")
-        )
+        and row.get("exit_code", "") == "0"
+        and num(row, "actual_cache_hit_rate_pct") is not None
+        and num(row, "specified_cache_hit_rate_pct") is not None
+        and abs(num(row, "actual_cache_hit_rate_pct") - num(row, "specified_cache_hit_rate_pct")) <= baseline_tolerance
     ]
-    successful_baselines = [row for row in baseline_rows if row.get("exit_code", "") == "0"]
-    baseline_with_hit = [row for row in successful_baselines if num(row, "actual_cache_hit_rate_pct") is not None]
-    passing_baselines = [
-        row for row in baseline_with_hit
-        if target_hit is not None and abs(num(row, "actual_cache_hit_rate_pct") - target_hit) <= baseline_tolerance
+    if not baseline_rows:
+        continue
+    # The last passing inf row is the accepted layout after calibration and,
+    # when enabled, after the dynamic-duration resize.
+    baseline = baseline_rows[-1]
+    finite_rows = [
+        row for row in case_rows
+        if row.get("search_phase", "") == "descending"
+        and row.get("configured_request_rate", "") != "inf"
+        and same_parameters(row, baseline)
     ]
-    baseline = max(passing_baselines, key=group_num) if passing_baselines else None
-    if baseline is not None:
-        baseline_status = "PASS"
-    elif not baseline_rows or not successful_baselines:
-        baseline_status = "BASELINE_FAILED"
-    elif not baseline_with_hit:
-        baseline_status = "BASELINE_NO_CACHE_REPORT"
-    else:
-        baseline_status = "BASELINE_HIT_RATE_MISMATCH"
+    inf_rps = num(baseline, "request_throughput")
+    inf_hit = num(baseline, "actual_cache_hit_rate_pct")
+    final_rows = [(baseline, "inf")] + [(row, "finite") for row in finite_rows]
+    final_rows.sort(key=lambda item: (
+        0 if item[1] == "inf" else 1,
+        -(num(item[0], "configured_request_rate") or float("-inf"))
+    ))
+    for order, (row, result_type) in enumerate(final_rows, start=1):
+        output = dict(row)
+        target_hit = num(row, "specified_cache_hit_rate_pct")
+        actual_hit = num(row, "actual_cache_hit_rate_pct")
+        output.update({
+            "result_type": result_type,
+            "parameter_status": "confirmed",
+            "confirmed_inf_actual_rps": f"{inf_rps:.2f}" if inf_rps is not None else "",
+            "confirmed_inf_cache_hit_rate_pct": f"{inf_hit:.4f}" if inf_hit is not None else "",
+            "confirmed_inf_phase": baseline.get("search_phase", ""),
+            "request_rate_order": str(order),
+            "actual_cache_hit_rate_delta_pct": (
+                f"{actual_hit - target_hit:.4f}"
+                if actual_hit is not None and target_hit is not None else ""
+            ),
+        })
+        summary.append(output)
 
-    targets = [x for x in base.get("ttft_targets_s", "").split("|") if x]
-    for target_s in targets:
-        try:
-            target_ms = float(target_s) * 1000.0
-        except ValueError:
-            continue
-        if baseline is None:
-            summary.append(summary_row(base, target_s, None, baseline_status, baseline_status))
-            continue
-
-        selected_groups = str(group_num(baseline))
-        selected_prompts = baseline.get("gsp_prompts_per_group", "")
-        selected_system = baseline.get("system_prompt_len", "")
-        selected_question = baseline.get("question_len", "")
-        candidates = []
-        eligible_rows = [
-            row for row in case_rows
-            if row.get("exit_code", "") == "0"
-            and row.get("configured_request_rate", "") != "inf"
-            and str(group_num(row)) == selected_groups
-            and row.get("gsp_prompts_per_group", "") == selected_prompts
-            and row.get("system_prompt_len", "") == selected_system
-            and row.get("question_len", "") == selected_question
-            and num(row, "request_throughput") is not None
-        ]
-        for row in eligible_rows:
-            measured_hit = num(row, "actual_cache_hit_rate_pct")
-            selected_ttft = num(row, row.get("ttft_metric", ""))
-            tpot_metric = row.get("tpot_metric", "")
-            selected_tpot = num(row, tpot_metric) if tpot_metric else None
-            tpot_limit = num(row, "tpot_target_ms") if tpot_metric else None
-            if None in (measured_hit, target_hit, selected_ttft):
-                continue
-            delta = abs(measured_hit - target_hit)
-            tpot_ok = not tpot_metric or (
-                selected_tpot is not None and tpot_limit is not None and selected_tpot <= tpot_limit
-            )
-            if delta <= finite_tolerance and selected_ttft <= target_ms and tpot_ok:
-                candidates.append((num(row, "request_throughput"), row, selected_ttft, selected_tpot, delta))
-        if candidates:
-            actual_rps, row, ttft, tpot, delta = max(candidates, key=lambda item: item[0])
-            result = summary_row(base, target_s, baseline, baseline_status, "MEET")
-            result.update({
-                "measured_hit_rate_pct": f"{num(row, 'actual_cache_hit_rate_pct'):.4f}",
-                "hit_rate_delta_pct": f"{delta:.4f}",
-                "selected_actual_rps": f"{actual_rps:.2f}",
-                "selected_input_throughput": row.get("input_throughput", ""),
-                "selected_ttft_ms": f"{ttft:.4f}",
-                "selected_tpot_ms": f"{tpot:.4f}" if tpot is not None else "",
-                "selected_configured_request_rate": row.get("configured_request_rate", ""),
-                "log_file": row.get("log_file", ""),
-            })
-            summary.append(result)
-        else:
-            summary.append(summary_row(base, target_s, baseline, baseline_status, "NO_MEET"))
+summary.sort(key=lambda row: (
+    -(num(row, "confirmed_inf_actual_rps") or float("-inf")),
+    row.get("case_id", ""),
+    0 if row.get("result_type") == "inf" else 1,
+    -(num(row, "configured_request_rate") or float("-inf")),
+))
 
 with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
-    writer.writerows(summary)
+    writer.writerows({field: row.get(field, "") for field in fields} for row in summary)
+PY
+}
+
+prune_confirmed_trials() {
+  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" <<'PY'
+import csv
+import os
+import sys
+
+trials_path, summary_path = sys.argv[1:]
+if not os.path.exists(trials_path) or not os.path.exists(summary_path):
+    raise SystemExit(0)
+
+with open(summary_path, newline="", encoding="utf-8-sig") as f:
+    confirmed = list(csv.DictReader(f))
+if not confirmed:
+    raise SystemExit(0)
+
+def key(row):
+    return (
+        row.get("case_id", ""), row.get("configured_request_rate", ""),
+        row.get("search_phase", ""), row.get("gsp_num_groups", ""),
+        row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
+        row.get("question_len", ""),
+    )
+
+confirmed_keys = {key(row) for row in confirmed}
+with open(trials_path, newline="", encoding="utf-8-sig") as f:
+    rows = list(csv.DictReader(f))
+fields = list(rows[0].keys()) if rows else []
+remaining = [row for row in rows if key(row) not in confirmed_keys]
+with open(trials_path, "w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(remaining)
 PY
 }
 
 plot_summary() {
   [[ "${plot_requested}" == "1" ]] || return 0
-  "${PYTHON_PLOT_BIN}" - "${summary_csv}" "${out_dir}/gsp_prefix_matrix.png" "${plot_cell}" <<'PY'
+  "${PYTHON_PLOT_BIN}" - "${summary_csv}" "${trials_csv}" "${out_dir}/gsp_prefix_matrix.png" "${plot_cell}" "${FINITE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
 import math
 import sys
 from pathlib import Path
 
-summary_path, output_path, cell = sys.argv[1:]
+summary_path, trials_path, output_path, cell, finite_tolerance_s = sys.argv[1:]
+finite_tolerance = float(finite_tolerance_s)
 try:
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1276,9 +1272,31 @@ except ImportError as exc:
     raise SystemExit(f"matplotlib/numpy 不可用，无法作图: {exc}")
 
 with open(summary_path, newline="", encoding="utf-8-sig") as f:
-    rows = list(csv.DictReader(f))
-if not rows:
+    summary_rows = list(csv.DictReader(f))
+if not summary_rows:
     raise SystemExit("summary CSV 没有可作图数据")
+with open(trials_path, newline="", encoding="utf-8-sig") as f:
+    trial_rows = list(csv.DictReader(f))
+
+def row_key(row):
+    return (
+        row.get("case_id", ""), row.get("configured_request_rate", ""),
+        row.get("search_phase", ""), row.get("gsp_num_groups", ""),
+        row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
+        row.get("question_len", ""),
+    )
+
+confirmed_keys = {row_key(row) for row in summary_rows}
+rows = [row for row in trial_rows if row_key(row) in confirmed_keys]
+if not rows:
+    raise SystemExit("summary 对应的正式回测数据不存在")
+
+def num(row, key):
+    try:
+        value = float(row.get(key, ""))
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
 
 columns = []
 for row in rows:
@@ -1287,25 +1305,45 @@ for row in rows:
         columns.append(label)
 targets = []
 for row in rows:
-    label = f"{row.get('ttft_metric','')} < {row.get('ttft_target_s','')} s"
-    if label not in targets:
-        targets.append(label)
+    for target_s in row.get("ttft_targets_s", "").split("|"):
+        if not target_s:
+            continue
+        label = f"{row.get('ttft_metric','')} < {target_s} s"
+        if label not in targets:
+            targets.append(label)
 
 matrix = np.full((len(targets), len(columns)), np.nan, dtype=float)
 annotations = [["NO\nMEET" for _ in columns] for _ in targets]
-for row in rows:
-    col = f"{row.get('input','')} / {row.get('output','')}\nhit {row.get('specified_cache_hit_rate_pct','')}%"
-    target = f"{row.get('ttft_metric','')} < {row.get('ttft_target_s','')} s"
-    i, j = targets.index(target), columns.index(col)
-    value_key = "selected_actual_rps" if cell == "rps" else "selected_input_throughput"
-    try:
-        value = float(row.get(value_key, ""))
-        if not math.isfinite(value):
-            raise ValueError
-        matrix[i, j] = value
-        annotations[i][j] = f"{value:.2f}"
-    except (TypeError, ValueError):
-        annotations[i][j] = row.get("status", "NO_MEET")
+for i, target in enumerate(targets):
+    metric, _, target_s = target.partition(" < ")
+    target_ms = float(target_s.removesuffix(" s")) * 1000.0
+    for j, column in enumerate(columns):
+        candidates = []
+        for row in rows:
+            row_column = f"{row.get('input','')} / {row.get('output','')}\nhit {row.get('specified_cache_hit_rate_pct','')}%"
+            if row_column != column or row.get("configured_request_rate") == "inf":
+                continue
+            measured_hit = num(row, "actual_cache_hit_rate_pct")
+            target_hit = num(row, "specified_cache_hit_rate_pct")
+            ttft = num(row, metric)
+            actual_rps = num(row, "request_throughput")
+            if None in (measured_hit, target_hit, ttft, actual_rps):
+                continue
+            if abs(measured_hit - target_hit) > finite_tolerance or ttft > target_ms:
+                continue
+            tpot_metric = row.get("tpot_metric", "")
+            if tpot_metric:
+                tpot = num(row, tpot_metric)
+                tpot_limit = num(row, "tpot_target_ms")
+                if tpot is None or tpot_limit is None or tpot > tpot_limit:
+                    continue
+            value = actual_rps if cell == "rps" else num(row, "input_throughput")
+            if value is not None:
+                candidates.append((actual_rps, value))
+        if candidates:
+            _, value = max(candidates, key=lambda item: item[0])
+            matrix[i, j] = value
+            annotations[i][j] = f"{value:.2f}"
 
 fig_width = max(7.0, 2.6 * len(columns) + 2.0)
 fig_height = max(4.5, 1.2 * len(targets) + 2.5)
@@ -1406,6 +1444,7 @@ if ! plot_summary; then
     exit 1
   fi
 fi
+prune_confirmed_trials
 
 echo
 echo "============================================================"
