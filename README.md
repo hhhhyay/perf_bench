@@ -69,11 +69,17 @@ question_len = L - system_prompt_len
 `GSP_SYSTEM_LEN_EXTRA_TOKENS` 在基础 page 对齐长度上追加共享前缀 token，默认 `0`，不自动修改目标；
 校准值应使用 page 大小的整数倍。
 
-默认使用 `2` 个 group，并根据目标命中率在每组 `16/32/64` 个 prompt 中自动选择，
+默认使用 `2` 个 group，并根据目标命中率在每组 `16/32/64/96/128/256` 个 prompt 中自动选择，
 以减少请求数并覆盖高命中率场景；默认 `TOKEN_UNIT=1024`，
 需要十进制 k 时显式设置 `TOKEN_UNIT=1000`。输入和输出支持小数，例如 `0.5k`。
 默认使用官方 `--gsp-input-ids` 直接发送 token ID，避免随机 token 经文本解码和重新编码后产生输入长度漂移；
 如需兼容不支持该参数的旧版 SGLang，可设置 `GSP_INPUT_IDS=0`，但实际输入长度和命中率可能发生偏差。
+
+默认开启自动命中率校准：每个 `inf` 候选先执行一次短 probe；如果实测命中率不满足，
+脚本按 `目标命中率 / 实测命中率` 修正共享前缀长度，并按 page size 对齐，最多再修正两轮；
+仍不达标时自动切换 `prompts/group` 和 `groups` 候选布局。校准 trial 会保留在
+`gsp_prefix_trials.csv`，但不会混入最终有限请求率容量结果。布局切换只改变请求组织方式，
+不改变单请求输入总 token 数和输出长度。
 
 `--case` 的基本格式为 `INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S`；TPOT 条件可选，
 需要约束 TPOT 时再追加 `TPOT_METRIC,TPOT_TARGET_MS`，例如：
@@ -86,15 +92,15 @@ question_len = L - system_prompt_len
 #### 811 节点官方 GSP 验证记录
 
 `m09r3n06` 上使用 Qwen3-8B、TP4、官方 `generated-shared-prefix`，默认使用
-`2` 个 group，并按目标命中率自动尝试每组 `16 -> 32 -> 64` 个 prompt；不设置
-`max-concurrency`，使用 `--gsp-input-ids --gsp-ordered --flush-cache --cache-report`。
+`2` 个 group，并按目标命中率自动尝试每组 `16 -> 32 -> 64 -> 96 -> 128 -> 256` 个 prompt；不设置
+`max-concurrency`，使用 `--gsp-input-ids --gsp-ordered --flush-cache --warmup-requests 0 --cache-report`。
 每个 case 的 `inf` baseline 必须先满足目标命中率，之后才从该 baseline 的实际 RPS
 向下回测；命中率始终按官方 `cache-report` 实测 token 比例判定。
 
 旧版固定 `32x16` 的结果不能作为新版 `inf` 硬门槛结果：此前 `inf` 命中率约为
-`84%`。在无限请求率下，每组可能有约两个并发请求未命中，因此脚本按
-`GSP_CACHE_MISS_REQUESTS_PER_GROUP=2` 校准共享前缀长度；例如 8K/90% 使用
-`7872/320`、32K/90% 使用 `31424/1344`。新版脚本会重新验证每个 case；如果所有
+`84%`。在 H20 无限请求率下，每组实测约有四个并发请求未命中，因此脚本按
+`GSP_CACHE_MISS_REQUESTS_PER_GROUP=4` 校准共享前缀长度，并将 `warmup-requests` 设为 `0`，
+避免 warmup 提前写入 KV cache；例如 8K/90% 会优先尝试 `96` prompts/group。新版脚本会重新验证每个 case；如果所有
 prompt/group 候选的 `inf` 命中率都不达标，summary 必须标记为 `BASELINE_HIT_RATE_MISMATCH`，不再
 用低速结果标记 `MEET`。
 
@@ -116,14 +122,17 @@ prompt/group 候选的 `inf` 命中率都不达标，summary 必须标记为 `BA
 其中 `inf` 只作为命中率基线，不作为最终容量点。8K/1 的配置请求率为
 `34.18、34.08、33.98、33.88、33.68、33.48、33.18、32.68 req/s`，32K/1
 的配置请求率为 `6.27、6.17、6.07、5.97、5.77、5.57、5.27、4.77 req/s`。
-在 `m09r3n06` 的实测中，8K 所有回测点均为 `90.1%`，32K 所有回测点均为
-`89.9%`；两组共 `20` 个完整日志，全部 `exitcode=0`。这说明在固定 GSP 分组、
-共享前缀长度和 `--flush-cache` 口径下，请求率变化会影响 TTFT/RPS，但不会改变
-该 workload 的 token-level cache hit rate。对应结果目录为
+在固定 GSP 分组、共享前缀长度和 `--flush-cache` 口径下，请求率通常不会大幅改变
+token-level cache hit rate，但无 `max-concurrency` 时并发冷 miss 数可能随请求率变化。
+因此脚本对 `inf` baseline 使用严格的 `0.5` 个百分点容差，对有限请求率默认使用
+`1.5` 个百分点容差，并且 CSV 仍完整记录每个点的实测命中率和偏差；超过有限速率容差
+仍判定为 `NO_MEET`，不会用理论值替代实测值。对应结果目录为
 `/all_result/bench_gsp_prefix_20261019_dynamic_duration_60/`。
 
 `GSP_SYSTEM_LEN_EXTRA_TOKENS` 仍可用于已有服务的实测校准，但默认不追加额外 token；这不是
-放宽命中率容差，CSV 仍按实测命中率和默认 `0.5` 个百分点容差筛选。
+替代实测命中率。`inf` 使用严格的 `0.5` 个百分点容差，有限请求率默认使用 `1.5` 个百分点
+容差，并可分别用 `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` 和
+`GSP_FINITE_HIT_RATE_TOLERANCE_PCT` 调整。
 
 一个命令可以连续测试多个输入/输出、命中率和 SLA：
 
@@ -298,17 +307,22 @@ bash vllm/vllmc.sh
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
 | `MAX_NUM_SEQS` / `MAX_RUNNING_REQUESTS` | vLLM / SGLang 的请求数上限兜底值。 |
 | `TOKEN_UNIT` | K 的 token 定义，默认 `1024`；设为 `1000` 使用十进制 K。 |
-| `GSP_NUM_GROUPS_CANDIDATES` | `inf` 命中率校验的 groups 候选，默认 `2`；可逗号分隔多个值，设置 `GSP_NUM_GROUPS` 时只使用该固定值。 |
-| `GSP_PROMPTS_PER_GROUP_CANDIDATES` | 每组 prompt 候选，默认 `16,32,64`，从小到大尝试；用于按目标命中率减少请求数。 |
-| `GSP_PROMPTS_PER_GROUP` | 固定每组 prompt 数；设置后只使用该值，不再自动选择候选。 |
-| `GSP_CACHE_MISS_REQUESTS_PER_GROUP` | `inf` 校准时每组预估的并发未命中请求数，默认 `2`；最终仍以官方 `cache-report` 实测命中率为准。 |
+| `GSP_NUM_GROUPS_CANDIDATES` | `inf` 命中率校验的 groups 候选，默认 `2,4,8`；自动布局开启时，显式 `GSP_NUM_GROUPS` 也会作为首个候选。 |
+| `GSP_PROMPTS_PER_GROUP_CANDIDATES` | 每组 prompt 候选，默认 `16,32,64,96,128,256`；低命中率优先尝试较小组合，高命中率优先尝试较大组合。 |
+| `GSP_PROMPTS_PER_GROUP` | 首选每组 prompt 数；自动布局开启且校正失败时，会继续尝试候选组合。设置 `GSP_AUTO_LAYOUT=0` 才固定为该值。 |
+| `GSP_CACHE_MISS_REQUESTS_PER_GROUP` | 初始长度计算时每组预估的并发未命中请求数，默认 `4`（按 H20 实测）；最终仍以官方 `cache-report` 实测命中率为准。 |
+| `GSP_AUTO_CALIBRATE` | 是否在 `inf` 命中率偏差后自动修正 system/question 长度，默认 `1`。 |
+| `GSP_CALIBRATION_MAX_ITERS` | 每个 GSP 布局最多追加的校准 probe 次数，默认 `2`。 |
+| `GSP_AUTO_LAYOUT` | 命中率校正仍不达标时是否自动尝试其他 groups/prompts 布局，默认 `1`；设为 `0` 保持显式布局固定。 |
 | `GSP_AUTO_DURATION` | 是否按 pilot RPS 动态扩展每个 case 的请求数，默认 `1`；显式设置 `GSP_NUM_GROUPS` 时不扩展 groups。 |
 | `GSP_TARGET_DURATION_S` | 每个 case 的目标 benchmark 时长，默认 `60` 秒，允许 `60-120` 秒；按 prompts/group 向上取整请求数。 |
 | `GSP_INPUT_IDS` | 是否使用官方 `--gsp-input-ids` 直接发送 token ID，默认 `1`；设为 `0` 关闭。 |
 | `GSP_PAGE_SIZE` | GSP KV page 大小；真实执行默认从 `/server_info` 读取，失败回退 `64`。 |
 | `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
 | `GSP_SYSTEM_LEN_EXTRA_TOKENS` | 在基础 page 对齐长度上追加的共享前缀 token 数，默认 `0`；仅用于已由官方 `cache-report` 证实的稳定偏差校准，建议使用 page 大小的整数倍。 |
-| `GSP_HIT_RATE_TOLERANCE_PCT` | 实测 cache 命中率相对指定命中率的允许误差，默认 `0.5` 个百分点；只有落在该范围内才算命中率达标。 |
+| `GSP_HIT_RATE_TOLERANCE_PCT` | page 对齐和兼容逻辑使用的命中率容差，默认 `0.5` 个百分点。 |
+| `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` | `inf` baseline 的严格实测命中率容差，默认 `0.5` 个百分点。 |
+| `GSP_FINITE_HIT_RATE_TOLERANCE_PCT` | 有限请求率回测的命中率容差，默认 `1.5` 个百分点，用于覆盖无并发上限时的冷 miss 漂移。 |
 | `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
 | `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`。 |
 | `PREFILL_TTFT_INPUTS` | Prefill 输入长度，默认 `32 64 128`，单位为 K。 |

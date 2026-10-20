@@ -12,11 +12,14 @@ MODEL="${MODEL:-}"
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
 GSP_NUM_GROUPS_WAS_SET="${GSP_NUM_GROUPS+x}"
 GSP_NUM_GROUPS="${GSP_NUM_GROUPS:-2}"
-GSP_NUM_GROUPS_CANDIDATES="${GSP_NUM_GROUPS_CANDIDATES:-2}"
+GSP_NUM_GROUPS_CANDIDATES="${GSP_NUM_GROUPS_CANDIDATES:-2,4,8}"
 GSP_PROMPTS_PER_GROUP_WAS_SET="${GSP_PROMPTS_PER_GROUP+x}"
 GSP_PROMPTS_PER_GROUP="${GSP_PROMPTS_PER_GROUP:-16}"
-GSP_PROMPTS_PER_GROUP_CANDIDATES="${GSP_PROMPTS_PER_GROUP_CANDIDATES:-16,32,64}"
-GSP_CACHE_MISS_REQUESTS_PER_GROUP="${GSP_CACHE_MISS_REQUESTS_PER_GROUP:-2}"
+GSP_PROMPTS_PER_GROUP_CANDIDATES="${GSP_PROMPTS_PER_GROUP_CANDIDATES:-16,32,64,96,128,256}"
+GSP_CACHE_MISS_REQUESTS_PER_GROUP="${GSP_CACHE_MISS_REQUESTS_PER_GROUP:-4}"
+GSP_AUTO_CALIBRATE="${GSP_AUTO_CALIBRATE:-1}"
+GSP_CALIBRATION_MAX_ITERS="${GSP_CALIBRATION_MAX_ITERS:-2}"
+GSP_AUTO_LAYOUT="${GSP_AUTO_LAYOUT:-1}"
 GSP_AUTO_DURATION="${GSP_AUTO_DURATION:-1}"
 GSP_TARGET_DURATION_S="${GSP_TARGET_DURATION_S:-60}"
 GSP_MAX_CONCURRENCY="${GSP_MAX_CONCURRENCY:-}"
@@ -30,6 +33,8 @@ PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
 RATE_OFFSETS="${GSP_RATE_OFFSETS:-0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5}"
 RATE_STEP="${GSP_RATE_STEP:-0.1}"
 HIT_RATE_TOLERANCE="${GSP_HIT_RATE_TOLERANCE_PCT:-0.5}"
+BASELINE_HIT_RATE_TOLERANCE="${GSP_BASELINE_HIT_RATE_TOLERANCE_PCT:-${HIT_RATE_TOLERANCE}}"
+FINITE_HIT_RATE_TOLERANCE="${GSP_FINITE_HIT_RATE_TOLERANCE_PCT:-1.5}"
 EXPLICIT_RATES="${GSP_REQUEST_RATES:-}"
 
 out_dir="./all_result/bench_gsp_prefix_${RUN_ID}"
@@ -65,11 +70,14 @@ Example:
 
 Environment:
   TOKEN_UNIT=1024                 Default token unit; set 1000 explicitly for decimal k
-  GSP_NUM_GROUPS=2                Fixed group count when explicitly set
-  GSP_NUM_GROUPS_CANDIDATES=2     inf fallback candidates
-  GSP_PROMPTS_PER_GROUP=16        Fixed prompts/group when explicitly set
-  GSP_PROMPTS_PER_GROUP_CANDIDATES=16,32,64  inf candidates, smallest first
-  GSP_CACHE_MISS_REQUESTS_PER_GROUP=2  Concurrent cache misses per group used for calibration
+  GSP_NUM_GROUPS=2                Preferred group count when explicitly set
+  GSP_NUM_GROUPS_CANDIDATES=2,4,8 inf fallback candidates
+  GSP_PROMPTS_PER_GROUP=16        Preferred prompts/group when explicitly set
+  GSP_PROMPTS_PER_GROUP_CANDIDATES=16,32,64,96,128,256  inf candidates
+  GSP_CACHE_MISS_REQUESTS_PER_GROUP=4  Concurrent cache misses per group used for calibration
+  GSP_AUTO_CALIBRATE=1                Auto-correct shared prefix after measured hit-rate drift
+  GSP_CALIBRATION_MAX_ITERS=2         Maximum corrective probes per layout
+  GSP_AUTO_LAYOUT=1                   Try alternate groups/prompts layouts after hit-rate calibration fails
   GSP_AUTO_DURATION=1             Resize each case to the target benchmark duration
   GSP_TARGET_DURATION_S=60        Target main benchmark duration, allowed range 60-120s
   GSP_MAX_CONCURRENCY=            Optional global max concurrency
@@ -80,12 +88,15 @@ Environment:
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
   GSP_RATE_OFFSETS=0,-0.1,...     Cumulative high-to-low offsets after inf baseline
   GSP_RATE_STEP=0.1               Minimum finite-rate step
-  GSP_HIT_RATE_TOLERANCE_PCT=0.5  Allowed measured/target hit-rate difference
+  GSP_HIT_RATE_TOLERANCE_PCT=0.5  Workload/page-alignment tolerance fallback
+  GSP_BASELINE_HIT_RATE_TOLERANCE_PCT=0.5  Strict inf hit-rate tolerance
+  GSP_FINITE_HIT_RATE_TOLERANCE_PCT=1.5  Finite-rate hit-rate tolerance for concurrency drift
   RUN_ID=...                       Result directory suffix
 
 The hit rate is token-level: total_cached_tokens / total_prompt_tokens.
-The default calibration assumes two concurrent first requests per ordered prefix group can miss;
-the script adjusts system/question length and then accepts only the measured cache-report rate.
+  The default calibration assumes four concurrent first requests per ordered prefix group can miss;
+  the script adjusts system/question length, then tries alternate GSP layouts when the measured
+  cache-report rate still misses the target. Set GSP_AUTO_LAYOUT=0 to keep explicit layouts fixed.
 USAGE
 }
 
@@ -195,8 +206,10 @@ declare -a PROMPT_CANDIDATES=()
 resolve_group_candidates() {
   local raw="${GSP_NUM_GROUPS_CANDIDATES}"
   local group existing
-  if [[ "${GSP_NUM_GROUPS_WAS_SET}" == "x" ]]; then
+  if [[ "${GSP_NUM_GROUPS_WAS_SET}" == "x" && "${GSP_AUTO_LAYOUT}" == "0" ]]; then
     raw="${GSP_NUM_GROUPS}"
+  elif [[ "${GSP_NUM_GROUPS_WAS_SET}" == "x" ]]; then
+    raw="${GSP_NUM_GROUPS},${raw}"
   fi
   IFS=',' read -ra _group_values <<< "${raw}"
   GROUP_CANDIDATES=()
@@ -220,8 +233,10 @@ resolve_group_candidates() {
 resolve_prompt_candidates() {
   local raw="${GSP_PROMPTS_PER_GROUP_CANDIDATES}"
   local prompts existing_prompt existing_prompt_value
-  if [[ "${GSP_PROMPTS_PER_GROUP_WAS_SET}" == "x" ]]; then
+  if [[ "${GSP_PROMPTS_PER_GROUP_WAS_SET}" == "x" && "${GSP_AUTO_LAYOUT}" == "0" ]]; then
     raw="${GSP_PROMPTS_PER_GROUP}"
+  elif [[ "${GSP_PROMPTS_PER_GROUP_WAS_SET}" == "x" ]]; then
+    raw="${GSP_PROMPTS_PER_GROUP},${raw}"
   fi
   IFS=',' read -ra _prompt_values <<< "${raw}"
   PROMPT_CANDIDATES=()
@@ -244,6 +259,37 @@ resolve_prompt_candidates() {
     echo "[ERROR] GSP_PROMPTS_PER_GROUP_CANDIDATES 不能为空" >&2
     return 1
   }
+}
+
+order_layout_candidates_for_case() {
+  [[ "${GSP_AUTO_LAYOUT}" == "1" ]] || return 0
+
+  local target="${CASE_HIT_PCT}" value
+  local -a ordered=() rest=()
+  local prefer_large=0
+  awk -v target="${target}" 'BEGIN { exit !(target >= 90) }' && prefer_large=1
+
+  # Keep the familiar fixed layout first around the 90% workload. For lower
+  # and higher targets, choose smaller/larger prompt groups first so the
+  # discrete cache-hit steps are useful before spending more requests.
+  if [[ "${GSP_PROMPTS_PER_GROUP_WAS_SET}" == "x" ]] &&
+     awk -v target="${target}" 'BEGIN { exit !(target >= 85 && target < 92) }'; then
+    ordered+=("${GSP_PROMPTS_PER_GROUP}")
+    for value in "${PROMPT_CANDIDATES[@]}"; do
+      [[ "${value}" == "${GSP_PROMPTS_PER_GROUP}" ]] || rest+=("${value}")
+    done
+  else
+    rest=("${PROMPT_CANDIDATES[@]}")
+  fi
+
+  if (( ${#rest[@]} > 0 )); then
+    if (( prefer_large == 1 )); then
+      while IFS= read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -nr)
+    else
+      while IFS= read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -n)
+    fi
+  fi
+  PROMPT_CANDIDATES=("${ordered[@]}")
 }
 
 derive_gsp_lengths() {
@@ -431,6 +477,9 @@ validate_global_config() {
   [[ "${GSP_NUM_GROUPS}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_NUM_GROUPS 必须是正整数" >&2; return 1; }
   [[ "${GSP_PROMPTS_PER_GROUP}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须是正整数" >&2; return 1; }
   [[ "${GSP_CACHE_MISS_REQUESTS_PER_GROUP}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_CACHE_MISS_REQUESTS_PER_GROUP 必须是非负整数" >&2; return 1; }
+  [[ "${GSP_AUTO_CALIBRATE}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_AUTO_CALIBRATE 必须是 0 或 1" >&2; return 1; }
+  [[ "${GSP_CALIBRATION_MAX_ITERS}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_CALIBRATION_MAX_ITERS 必须是非负整数" >&2; return 1; }
+  [[ "${GSP_AUTO_LAYOUT}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_AUTO_LAYOUT 必须是 0 或 1" >&2; return 1; }
   [[ "${GSP_AUTO_DURATION}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_AUTO_DURATION 必须是 0 或 1" >&2; return 1; }
   [[ "${GSP_TARGET_DURATION_S}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] GSP_TARGET_DURATION_S 必须是数字" >&2; return 1; }
   awk -v v="${GSP_TARGET_DURATION_S}" 'BEGIN { exit !(v >= 60 && v <= 120) }' || {
@@ -445,6 +494,8 @@ validate_global_config() {
   is_positive_decimal "${RATE_STEP}" || { echo "[ERROR] GSP_RATE_STEP 必须是正数" >&2; return 1; }
   awk -v v="${RATE_STEP}" 'BEGIN { exit !(v >= 0.1) }' || { echo "[ERROR] GSP_RATE_STEP 不能小于 0.1" >&2; return 1; }
   is_positive_decimal "${HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
+  is_positive_decimal "${BASELINE_HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_BASELINE_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
+  is_positive_decimal "${FINITE_HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_FINITE_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
   if [[ -n "${GSP_MAX_CONCURRENCY}" ]]; then
     [[ "${GSP_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_MAX_CONCURRENCY 必须是正整数" >&2; return 1; }
   fi
@@ -487,7 +538,7 @@ print_dry_run_case() {
   printf ' %q' --gsp-question-len "${CASE_QUESTION_LEN}"
   printf ' %q' --gsp-output-len "${CASE_OUTPUT_LEN}"
   printf ' %q' --gsp-ordered --num-prompts "${CASE_NUM_PROMPTS}"
-  printf ' %q' --flush-cache --seed "${SEED}" --cache-report
+  printf ' %q' --flush-cache --warmup-requests 0 --seed "${SEED}" --cache-report
   if [[ "${GSP_INPUT_IDS}" == "1" ]]; then
     printf ' %q' --gsp-input-ids
   fi
@@ -502,6 +553,7 @@ if (( dry_run == 1 )); then
   echo "[DRY-RUN] BASE_URL=${BASE_URL} MODEL=${MODEL:-<model>} TOKEN_UNIT=${TOKEN_UNIT}"
   for raw_case in "${CASES[@]}"; do
     parse_case "${raw_case}" || exit 1
+    order_layout_candidates_for_case
     for candidate_prompts in "${PROMPT_CANDIDATES[@]}"; do
       if ! set_case_prompt_config "${candidate_prompts}"; then
         echo "[DRY-RUN] prompts/group=${candidate_prompts} 无法满足目标命中率，跳过"
@@ -647,6 +699,7 @@ build_bench_command() {
     --gsp-ordered
     --num-prompts "${CASE_NUM_PROMPTS}"
     --flush-cache
+    --warmup-requests 0
     --seed "${SEED}"
     --cache-report
     --request-rate "${request_rate}"
@@ -659,6 +712,18 @@ build_bench_command() {
   if [[ -n "${CASE_CONCURRENCY:-}" ]]; then
     cmd+=(--max-concurrency "${CASE_CONCURRENCY}")
   fi
+}
+
+trial_log_path() {
+  local request_rate="$1" phase="$2" rate_slug suffix=""
+  rate_slug="$(sanitize_slug "${request_rate}")"
+  [[ -n "${rate_slug}" ]] || rate_slug="zero"
+  case "${phase}" in
+    baseline|duration_baseline|descending) ;;
+    *) suffix="__${phase}" ;;
+  esac
+  printf '%s/%s__g%s__p%s__rate_%s%s.log\n' \
+    "${log_dir}" "${CASE_ID}" "${GSP_NUM_GROUPS}" "${GSP_PROMPTS_PER_GROUP}" "${rate_slug}" "${suffix}"
 }
 
 append_trial_row() {
@@ -729,9 +794,13 @@ if os.path.exists(path):
             rows = list(csv.DictReader(f))
     except (OSError, csv.Error):
         rows = []
-key = (case_id, request_rate, groups)
+# Keep every GSP layout: the same case/groups/rate can be tested with
+# different prompts-per-group candidates during inf calibration.
+key = (case_id, request_rate, phase, groups, prompts_per_group, system_len, question_len)
 rows = [r for r in rows if (
-    r.get("case_id", ""), r.get("configured_request_rate", ""), r.get("gsp_num_groups", "")
+    r.get("case_id", ""), r.get("configured_request_rate", ""), r.get("search_phase", ""),
+    r.get("gsp_num_groups", ""),
+    r.get("gsp_prompts_per_group", ""), r.get("system_prompt_len", ""), r.get("question_len", "")
 ) != key]
 rows.append(row)
 with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -743,10 +812,8 @@ PY
 
 run_trial() {
   local request_rate="$1" phase="$2"
-  local rate_slug log_file exit_file exit_code metrics_json
-  rate_slug="$(sanitize_slug "${request_rate}")"
-  [[ -n "${rate_slug}" ]] || rate_slug="zero"
-  log_file="${log_dir}/${CASE_ID}__g${GSP_NUM_GROUPS}__p${GSP_PROMPTS_PER_GROUP}__rate_${rate_slug}.log"
+  local log_file exit_file exit_code metrics_json
+  log_file="$(trial_log_path "${request_rate}" "${phase}")"
   exit_file="${log_file}.exitcode"
   mkdir -p "${log_dir}"
 
@@ -810,8 +877,72 @@ baseline_hit_rate_passes() {
   local measured
   measured="$(read_actual_hit_rate "${log_file}" 2>/dev/null || true)"
   [[ -n "${measured}" ]] || return 1
-  awk -v actual="${measured}" -v target="${CASE_HIT_PCT}" -v tolerance="${HIT_RATE_TOLERANCE}" \
+  awk -v actual="${measured}" -v target="${CASE_HIT_PCT}" -v tolerance="${BASELINE_HIT_RATE_TOLERANCE}" \
     'BEGIN { exit !(actual >= target - tolerance && actual <= target + tolerance) }'
+}
+
+adjust_case_prompt_config_from_hit() {
+  local measured="$1" lengths
+  lengths="$("${PYTHON_BIN}" - "${CASE_SYSTEM_LEN}" "${measured}" "${CASE_HIT_PCT}" \
+    "${CASE_INPUT_LEN}" "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}" \
+    "${GSP_PROMPTS_PER_GROUP}" "${GSP_CACHE_MISS_REQUESTS_PER_GROUP}" <<'PY' | tr -d '\r'
+import math
+import sys
+
+current, actual, target, total, page, align, prompts, misses = sys.argv[1:]
+current = int(current)
+actual = float(actual)
+target = float(target)
+total = int(total)
+page = int(page)
+align = align == "1"
+prompts = int(prompts)
+misses = int(misses)
+if actual <= 0 or current <= 0 or current >= total:
+    raise SystemExit("invalid measured hit-rate correction inputs")
+
+raw = current * target / actual
+if align and page > 1:
+    corrected = int(math.floor(raw / page + 0.5)) * page
+    if corrected == current:
+        corrected += page if target > actual else -page
+else:
+    corrected = int(math.floor(raw + 0.5))
+corrected = max(1, min(total - 1, corrected))
+if corrected == current:
+    raise SystemExit("page alignment cannot produce a different correction")
+question = total - corrected
+effective_misses = min(max(misses, 0), prompts - 1)
+theory = 100.0 * (prompts - effective_misses) * corrected / (prompts * total)
+print(corrected, question, f"{theory:.6f}", f"{theory:.6f}")
+PY
+  )" || return 1
+  read -r CASE_SYSTEM_LEN CASE_QUESTION_LEN CASE_THEORY_HIT_PCT CASE_REQUESTED_THEORY_HIT_PCT <<< "${lengths}"
+  echo "[CALIBRATE] 实测命中率=${measured}%，修正 system/question=${CASE_SYSTEM_LEN}/${CASE_QUESTION_LEN}，理论命中率=${CASE_THEORY_HIT_PCT}%" >&2
+}
+
+run_inf_with_auto_calibration() {
+  local base_phase="$1" attempt=0 trial_phase log_file measured
+  LAST_INF_LOG=""
+  while :; do
+    if (( attempt == 0 )); then
+      trial_phase="${base_phase}"
+    else
+      trial_phase="${base_phase}_calibration${attempt}"
+    fi
+    run_trial inf "${trial_phase}"
+    log_file="$(trial_log_path inf "${trial_phase}")"
+    LAST_INF_LOG="${log_file}"
+    if [[ -s "${log_file}" ]] && baseline_hit_rate_passes "${log_file}"; then
+      return 0
+    fi
+    (( GSP_AUTO_CALIBRATE == 1 && attempt < GSP_CALIBRATION_MAX_ITERS )) || return 1
+    measured="$(read_actual_hit_rate "${log_file}" 2>/dev/null || true)"
+    [[ -n "${measured}" ]] || return 1
+    adjust_case_prompt_config_from_hit "${measured}" || return 1
+    ((attempt++))
+    print_case
+  done
 }
 
 resize_case_for_duration() {
@@ -966,14 +1097,16 @@ PY
 }
 
 write_summary() {
-  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" "${HIT_RATE_TOLERANCE}" <<'PY'
+  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" \
+    "${BASELINE_HIT_RATE_TOLERANCE}" "${FINITE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
 import math
 import os
 import sys
 
-trials_path, summary_path, tolerance_s = sys.argv[1:]
-tolerance = float(tolerance_s)
+trials_path, summary_path, baseline_tolerance_s, finite_tolerance_s = sys.argv[1:]
+baseline_tolerance = float(baseline_tolerance_s)
+finite_tolerance = float(finite_tolerance_s)
 fields = [
     "case_id", "input", "output", "specified_cache_hit_rate_pct", "theoretical_cache_hit_rate_pct",
     "requested_theoretical_cache_hit_rate_pct", "gsp_page_size", "page_aligned",
@@ -1043,12 +1176,16 @@ for case_id, case_rows in case_groups.items():
     baseline_rows = [
         row for row in case_rows
         if row.get("configured_request_rate", "") == "inf"
+        and (
+            row.get("search_phase", "").startswith("baseline")
+            or row.get("search_phase", "").startswith("duration_baseline")
+        )
     ]
     successful_baselines = [row for row in baseline_rows if row.get("exit_code", "") == "0"]
     baseline_with_hit = [row for row in successful_baselines if num(row, "actual_cache_hit_rate_pct") is not None]
     passing_baselines = [
         row for row in baseline_with_hit
-        if target_hit is not None and abs(num(row, "actual_cache_hit_rate_pct") - target_hit) <= tolerance
+        if target_hit is not None and abs(num(row, "actual_cache_hit_rate_pct") - target_hit) <= baseline_tolerance
     ]
     baseline = max(passing_baselines, key=group_num) if passing_baselines else None
     if baseline is not None:
@@ -1071,11 +1208,18 @@ for case_id, case_rows in case_groups.items():
             continue
 
         selected_groups = str(group_num(baseline))
+        selected_prompts = baseline.get("gsp_prompts_per_group", "")
+        selected_system = baseline.get("system_prompt_len", "")
+        selected_question = baseline.get("question_len", "")
         candidates = []
         eligible_rows = [
             row for row in case_rows
             if row.get("exit_code", "") == "0"
+            and row.get("configured_request_rate", "") != "inf"
             and str(group_num(row)) == selected_groups
+            and row.get("gsp_prompts_per_group", "") == selected_prompts
+            and row.get("system_prompt_len", "") == selected_system
+            and row.get("question_len", "") == selected_question
             and num(row, "request_throughput") is not None
         ]
         for row in eligible_rows:
@@ -1090,7 +1234,7 @@ for case_id, case_rows in case_groups.items():
             tpot_ok = not tpot_metric or (
                 selected_tpot is not None and tpot_limit is not None and selected_tpot <= tpot_limit
             )
-            if delta <= tolerance and selected_ttft <= target_ms and tpot_ok:
+            if delta <= finite_tolerance and selected_ttft <= target_ms and tpot_ok:
                 candidates.append((num(row, "request_throughput"), row, selected_ttft, selected_tpot, delta))
         if candidates:
             actual_rps, row, ttft, tpot, delta = max(candidates, key=lambda item: item[0])
@@ -1193,6 +1337,7 @@ check_bench_flags || exit 1
 
 for raw_case in "${CASES[@]}"; do
   parse_case "${raw_case}" || exit 1
+  order_layout_candidates_for_case
   baseline_rps=""
   baseline_passed=0
   selected_groups=""
@@ -1205,18 +1350,12 @@ for raw_case in "${CASES[@]}"; do
       GSP_NUM_GROUPS="${candidate_groups}"
       CASE_NUM_PROMPTS=$((GSP_NUM_GROUPS * GSP_PROMPTS_PER_GROUP))
       print_case
-      inf_slug="$(sanitize_slug inf)"
-      inf_log="${log_dir}/${CASE_ID}__g${GSP_NUM_GROUPS}__p${GSP_PROMPTS_PER_GROUP}__rate_${inf_slug}.log"
-      run_trial inf baseline
-      if [[ ! -s "${inf_log}" ]]; then
-        echo "[WARN] inf baseline 没有生成日志，继续尝试下一组数: ${CASE_ID} groups=${GSP_NUM_GROUPS} prompts=${GSP_PROMPTS_PER_GROUP}" >&2
+      if ! run_inf_with_auto_calibration baseline; then
+        measured_hit="$(read_actual_hit_rate "${LAST_INF_LOG}" 2>/dev/null || printf 'unavailable')"
+        echo "[WARN] inf cache 命中率校准未通过: ${CASE_ID} groups=${GSP_NUM_GROUPS} prompts=${GSP_PROMPTS_PER_GROUP} actual=${measured_hit}% target=${CASE_HIT_PCT}%" >&2
         continue
       fi
-      if ! baseline_hit_rate_passes "${inf_log}"; then
-        measured_hit="$(read_actual_hit_rate "${inf_log}" 2>/dev/null || printf 'unavailable')"
-        echo "[WARN] inf cache 命中率不达标: ${CASE_ID} groups=${GSP_NUM_GROUPS} prompts=${GSP_PROMPTS_PER_GROUP} actual=${measured_hit}% target=${CASE_HIT_PCT}%" >&2
-        continue
-      fi
+      inf_log="${LAST_INF_LOG}"
       baseline_rps="$(read_actual_rps "${inf_log}" 2>/dev/null || true)"
       if [[ -z "${baseline_rps}" ]]; then
         echo "[WARN] 无法从 inf baseline 读取实际 RPS，继续尝试下一组数: ${CASE_ID} groups=${GSP_NUM_GROUPS} prompts=${GSP_PROMPTS_PER_GROUP}" >&2
@@ -1237,15 +1376,13 @@ for raw_case in "${CASES[@]}"; do
   pilot_groups="${GSP_NUM_GROUPS}"
   if resize_case_for_duration "${baseline_rps}" && [[ "${GSP_NUM_GROUPS}" != "${pilot_groups}" ]]; then
     print_case
-    inf_slug="$(sanitize_slug inf)"
-    inf_log="${log_dir}/${CASE_ID}__g${GSP_NUM_GROUPS}__p${GSP_PROMPTS_PER_GROUP}__rate_${inf_slug}.log"
-    run_trial inf duration_baseline
-    if [[ ! -s "${inf_log}" ]] || ! baseline_hit_rate_passes "${inf_log}"; then
-      measured_hit="$(read_actual_hit_rate "${inf_log}" 2>/dev/null || printf 'unavailable')"
+    if ! run_inf_with_auto_calibration duration_baseline; then
+      measured_hit="$(read_actual_hit_rate "${LAST_INF_LOG}" 2>/dev/null || printf 'unavailable')"
       echo "[ERROR] 动态请求数 baseline 命中率不达标: ${CASE_ID} groups=${GSP_NUM_GROUPS} actual=${measured_hit}% target=${CASE_HIT_PCT}%" >&2
       run_failure=1
       continue
     fi
+    inf_log="${LAST_INF_LOG}"
     baseline_rps="$(read_actual_rps "${inf_log}" 2>/dev/null || true)"
     [[ -n "${baseline_rps}" ]] || {
       echo "[ERROR] 动态请求数 baseline 无法读取实际 RPS: ${CASE_ID}" >&2
