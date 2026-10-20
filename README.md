@@ -82,6 +82,12 @@ question_len = L - system_prompt_len
 `gsp_prefix_summary.csv`。布局切换只改变请求组织方式，
 不改变单请求输入总 token 数和输出长度。
 
+每个自动 case 都会优先从较小的 `prompts/group` 开始；首轮 `inf` probe 还会受
+`GSP_PILOT_INPUT_TOKEN_BUDGET` 限制，默认总输入 token 不超过约 1M，避免任意输入长度直接
+使用过大的请求数开始。首轮得到该 case 的实际 RPS 后，脚本先做一个短时长 inf，再根据
+实测 duration/RPS 逐步调整到 `GSP_TARGET_DURATION_S` 的容差范围；显式固定
+`GSP_NUM_GROUPS` 或关闭 `GSP_AUTO_DURATION` 时不做这层自动缩放。
+
 `--case` 的基本格式为 `INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S`；TPOT 条件可选，
 需要约束 TPOT 时再追加 `TPOT_METRIC,TPOT_TARGET_MS`，例如：
 
@@ -314,8 +320,12 @@ bash vllm/vllmc.sh
 | `GSP_AUTO_CALIBRATE` | 是否在 `inf` 命中率偏差后自动修正 system/question 长度，默认 `1`。 |
 | `GSP_CALIBRATION_MAX_ITERS` | 每个 GSP 布局最多追加的校准 probe 次数，默认 `2`。 |
 | `GSP_AUTO_LAYOUT` | 命中率校正仍不达标时是否自动尝试其他 groups/prompts 布局，默认 `1`；设为 `0` 保持显式布局固定。 |
-| `GSP_AUTO_DURATION` | 是否按 pilot RPS 动态扩展每个 case 的请求数，默认 `1`；显式设置 `GSP_NUM_GROUPS` 时不扩展 groups。 |
+| `GSP_AUTO_DURATION` | 是否按 pilot RPS 和实测 duration 动态调整每个 case 的请求数，默认 `1`；显式设置 `GSP_NUM_GROUPS` 时不调整 groups。 |
 | `GSP_TARGET_DURATION_S` | 每个 case 的目标 benchmark 时长，默认 `60` 秒，允许 `60-120` 秒；按 prompts/group 向上取整请求数。 |
+| `GSP_PILOT_INPUT_TOKEN_BUDGET` | 每个自动 case 首轮 `inf` probe 的总输入 token 预算，默认 `1048576`（约 1M）；仅在未显式固定 groups 且开启自动时长时生效。 |
+| `GSP_DURATION_FIRST_PASS_S` | 自动时长调整的首轮短测试时长，默认 `30` 秒；之后根据实测 duration 调整到目标时长。 |
+| `GSP_DURATION_ADJUST_MAX_ITERS` | 每个 case 的最大动态时长调整次数，默认 `2`。 |
+| `GSP_DURATION_TOLERANCE_PCT` | 目标时长容差，默认 `25%`；落在目标上下限内后停止调整。 |
 | `GSP_INPUT_IDS` | 是否使用官方 `--gsp-input-ids` 直接发送 token ID，默认 `1`；设为 `0` 关闭。 |
 | `GSP_PAGE_SIZE` | GSP KV page 大小；真实执行默认从 `/server_info` 读取，失败回退 `64`。 |
 | `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
@@ -324,7 +334,9 @@ bash vllm/vllmc.sh
 | `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` | `inf` baseline 的严格实测命中率容差，默认 `0.5` 个百分点。 |
 | `GSP_FINITE_HIT_RATE_TOLERANCE_PCT` | 有限请求率回测的命中率容差，默认 `1.5` 个百分点，用于覆盖无并发上限时的冷 miss 漂移。 |
 | `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
-| `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`。 |
+| `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`；按高到低回测。 |
+| `GSP_RATE_STEP` | 请求率最小间隔，默认 `0.1 req/s`，不能设置小于 `0.1`；显式请求率或偏移序列也必须按高到低且满足该间隔。 |
+| `GSP_STOP_ON_SLA` | 默认 `1`：每个 case 按高到低请求率测试，所有 `TTFT_TARGETS_S` 都找到满足点且 cache/TPOT 也通过后停止；设为 `0` 才跑完整降速序列。 |
 | `PREFILL_TTFT_INPUTS` | Prefill 输入长度，默认 `32 64 128`，单位为 K。 |
 | `PREFILL_SLA_RULES` | Prefill SLA 规则，格式为 `input_k:metric:target_seconds:near_seconds`，例如 `8:p99_ttft_ms:5:0.5`；默认对每个输入使用 Mean TTFT 的 3s/5s/10s。 |
 | `PREFILL_TTFT_TARGETS_S` | 未显式设置 `PREFILL_SLA_RULES` 时使用的默认目标秒数，默认 `3 5 10`。 |

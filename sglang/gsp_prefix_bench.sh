@@ -22,6 +22,11 @@ GSP_CALIBRATION_MAX_ITERS="${GSP_CALIBRATION_MAX_ITERS:-2}"
 GSP_AUTO_LAYOUT="${GSP_AUTO_LAYOUT:-1}"
 GSP_AUTO_DURATION="${GSP_AUTO_DURATION:-1}"
 GSP_TARGET_DURATION_S="${GSP_TARGET_DURATION_S:-60}"
+GSP_PILOT_INPUT_TOKEN_BUDGET="${GSP_PILOT_INPUT_TOKEN_BUDGET:-1048576}"
+GSP_DURATION_FIRST_PASS_S="${GSP_DURATION_FIRST_PASS_S:-30}"
+GSP_DURATION_ADJUST_MAX_ITERS="${GSP_DURATION_ADJUST_MAX_ITERS:-2}"
+GSP_DURATION_TOLERANCE_PCT="${GSP_DURATION_TOLERANCE_PCT:-25}"
+GSP_STOP_ON_SLA="${GSP_STOP_ON_SLA:-1}"
 GSP_MAX_CONCURRENCY="${GSP_MAX_CONCURRENCY:-}"
 GSP_INPUT_IDS="${GSP_INPUT_IDS:-1}"
 GSP_PAGE_SIZE="${GSP_PAGE_SIZE:-}"
@@ -80,6 +85,11 @@ Environment:
   GSP_AUTO_LAYOUT=1                   Try alternate groups/prompts layouts after hit-rate calibration fails
   GSP_AUTO_DURATION=1             Resize each case to the target benchmark duration
   GSP_TARGET_DURATION_S=60        Target main benchmark duration, allowed range 60-120s
+  GSP_PILOT_INPUT_TOKEN_BUDGET=1048576  Max input tokens for an automatic pilot probe
+  GSP_DURATION_FIRST_PASS_S=30    Short first duration pass before target-duration adjustment
+  GSP_DURATION_ADJUST_MAX_ITERS=2 Maximum duration adjustment passes per case
+  GSP_DURATION_TOLERANCE_PCT=25  Acceptable duration error percentage around target
+  GSP_STOP_ON_SLA=1              Stop descending backtests after all TTFT targets meet
   GSP_MAX_CONCURRENCY=            Optional global max concurrency
   GSP_INPUT_IDS=1                 Pass raw token IDs with official --gsp-input-ids
   GSP_PAGE_SIZE=                  KV cache page size; auto-read from /server_info, fallback 64
@@ -163,6 +173,41 @@ is_positive_decimal() {
 
 is_nonnegative_decimal() {
   is_decimal "$1" && awk -v v="$1" 'BEGIN { exit !(v >= 0) }'
+}
+
+validate_rate_spacing() {
+  local previous="" current rate offset
+  if [[ -n "${EXPLICIT_RATES}" ]]; then
+    IFS=',' read -ra _explicit_rates <<< "${EXPLICIT_RATES}"
+    for rate in "${_explicit_rates[@]}"; do
+      is_positive_decimal "${rate}" || {
+        echo "[ERROR] GSP_REQUEST_RATES 含非法值: ${rate}" >&2
+        return 1
+      }
+      if [[ -n "${previous}" ]] && ! awk -v prev="${previous}" -v curr="${rate}" -v step="${RATE_STEP}" \
+        'BEGIN { exit !(prev > curr && prev - curr + 1e-9 >= step) }'; then
+        echo "[ERROR] GSP_REQUEST_RATES 必须按高到低排列，且相邻请求率间隔不小于 ${RATE_STEP}" >&2
+        return 1
+      fi
+      previous="${rate}"
+    done
+    return 0
+  fi
+
+  IFS=',' read -ra _rate_offsets <<< "${RATE_OFFSETS}"
+  for offset in "${_rate_offsets[@]}"; do
+    is_decimal "${offset#-}" || {
+      echo "[ERROR] GSP_RATE_OFFSETS 含非法值: ${offset}" >&2
+      return 1
+    }
+    current="${offset}"
+    if [[ -n "${previous}" ]] && ! awk -v prev="${previous}" -v curr="${current}" -v step="${RATE_STEP}" \
+      'BEGIN { exit !(prev > curr && prev - curr + 1e-9 >= step) }'; then
+      echo "[ERROR] GSP_RATE_OFFSETS 必须按高到低排列，且相邻偏移间隔不小于 ${RATE_STEP}" >&2
+      return 1
+    fi
+    previous="${current}"
+  done
 }
 
 tokens_from_k() {
@@ -264,16 +309,17 @@ resolve_prompt_candidates() {
 order_layout_candidates_for_case() {
   [[ "${GSP_AUTO_LAYOUT}" == "1" ]] || return 0
 
-  local target="${CASE_HIT_PCT}" value
+  local value
   local -a ordered=() rest=()
-  local prefer_large=0
-  awk -v target="${target}" 'BEGIN { exit !(target >= 90) }' && prefer_large=1
+  # Probe every automatic case from the smallest layout. The measured RPS
+  # then determines the request count for the target duration; this avoids
+  # making one input-length threshold special.
 
-  # Keep the familiar fixed layout first around the 90% workload. For lower
-  # and higher targets, choose smaller/larger prompt groups first so the
-  # discrete cache-hit steps are useful before spending more requests.
+  # Keep the familiar fixed layout first around the 90% workload. Otherwise,
+  # try smaller prompt groups first so the first probe stays bounded for every
+  # input length and the measured RPS can drive the later request-count resize.
   if [[ "${GSP_PROMPTS_PER_GROUP_WAS_SET}" == "x" ]] &&
-     awk -v target="${target}" 'BEGIN { exit !(target >= 85 && target < 92) }'; then
+     awk -v target="${CASE_HIT_PCT}" 'BEGIN { exit !(target >= 85 && target < 92) }'; then
     ordered+=("${GSP_PROMPTS_PER_GROUP}")
     for value in "${PROMPT_CANDIDATES[@]}"; do
       [[ "${value}" == "${GSP_PROMPTS_PER_GROUP}" ]] || rest+=("${value}")
@@ -283,13 +329,25 @@ order_layout_candidates_for_case() {
   fi
 
   if (( ${#rest[@]} > 0 )); then
-    if (( prefer_large == 1 )); then
-      while IFS= read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -nr)
-    else
-      while IFS= read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -n)
-    fi
+    while IFS= read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -n)
   fi
   PROMPT_CANDIDATES=("${ordered[@]}")
+}
+
+cap_initial_probe_groups() {
+  [[ "${GSP_AUTO_DURATION}" == "1" ]] || return 0
+  [[ "${GSP_NUM_GROUPS_WAS_SET}" != "x" ]] || return 0
+  [[ "${GSP_PILOT_INPUT_TOKEN_BUDGET}" =~ ^[1-9][0-9]*$ ]] || return 0
+  [[ "${CASE_INPUT_LEN}" =~ ^[1-9][0-9]*$ ]] || return 0
+  [[ "${GSP_PROMPTS_PER_GROUP}" =~ ^[1-9][0-9]*$ ]] || return 0
+
+  local max_groups
+  max_groups=$((GSP_PILOT_INPUT_TOKEN_BUDGET / CASE_INPUT_LEN / GSP_PROMPTS_PER_GROUP))
+  (( max_groups >= 1 )) || max_groups=1
+  if (( GSP_NUM_GROUPS > max_groups )); then
+    echo "[INFO] 自动首轮 probe 限制总输入 token: groups=${GSP_NUM_GROUPS}->${max_groups}, prompts/group=${GSP_PROMPTS_PER_GROUP}, budget=${GSP_PILOT_INPUT_TOKEN_BUDGET}" >&2
+    GSP_NUM_GROUPS="${max_groups}"
+  fi
 }
 
 derive_gsp_lengths() {
@@ -486,6 +544,19 @@ validate_global_config() {
     echo "[ERROR] GSP_TARGET_DURATION_S 必须在 60-120 秒之间" >&2
     return 1
   }
+  [[ "${GSP_PILOT_INPUT_TOKEN_BUDGET}" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] GSP_PILOT_INPUT_TOKEN_BUDGET 必须是正整数" >&2; return 1; }
+  [[ "${GSP_DURATION_FIRST_PASS_S}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] GSP_DURATION_FIRST_PASS_S 必须是数字" >&2; return 1; }
+  awk -v v="${GSP_DURATION_FIRST_PASS_S}" -v target="${GSP_TARGET_DURATION_S}" 'BEGIN { exit !(v > 0 && v <= target) }' || {
+    echo "[ERROR] GSP_DURATION_FIRST_PASS_S 必须大于 0 且不超过 GSP_TARGET_DURATION_S" >&2
+    return 1
+  }
+  [[ "${GSP_DURATION_ADJUST_MAX_ITERS}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_DURATION_ADJUST_MAX_ITERS 必须是非负整数" >&2; return 1; }
+  [[ "${GSP_DURATION_TOLERANCE_PCT}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] GSP_DURATION_TOLERANCE_PCT 必须是非负数字" >&2; return 1; }
+  awk -v v="${GSP_DURATION_TOLERANCE_PCT}" 'BEGIN { exit !(v < 100) }' || {
+    echo "[ERROR] GSP_DURATION_TOLERANCE_PCT 必须小于 100" >&2
+    return 1
+  }
+  [[ "${GSP_STOP_ON_SLA}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_STOP_ON_SLA 必须是 0 或 1" >&2; return 1; }
   [[ "${GSP_INPUT_IDS}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_INPUT_IDS 必须是 0 或 1" >&2; return 1; }
   (( GSP_PROMPTS_PER_GROUP >= 2 )) || { echo "[ERROR] GSP_PROMPTS_PER_GROUP 必须不小于 2" >&2; return 1; }
   [[ "${SEED}" =~ ^[0-9]+$ ]] || { echo "[ERROR] SEED 必须是非负整数" >&2; return 1; }
@@ -493,6 +564,7 @@ validate_global_config() {
   [[ "${GSP_SYSTEM_LEN_EXTRA_TOKENS}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_SYSTEM_LEN_EXTRA_TOKENS 必须是非负整数" >&2; return 1; }
   is_positive_decimal "${RATE_STEP}" || { echo "[ERROR] GSP_RATE_STEP 必须是正数" >&2; return 1; }
   awk -v v="${RATE_STEP}" 'BEGIN { exit !(v >= 0.1) }' || { echo "[ERROR] GSP_RATE_STEP 不能小于 0.1" >&2; return 1; }
+  validate_rate_spacing || return 1
   is_positive_decimal "${HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
   is_positive_decimal "${BASELINE_HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_BASELINE_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
   is_positive_decimal "${FINITE_HIT_RATE_TOLERANCE}" || { echo "[ERROR] GSP_FINITE_HIT_RATE_TOLERANCE_PCT 必须是正数" >&2; return 1; }
@@ -561,6 +633,7 @@ if (( dry_run == 1 )); then
       fi
       for candidate_groups in "${GROUP_CANDIDATES[@]}"; do
         GSP_NUM_GROUPS="${candidate_groups}"
+        cap_initial_probe_groups
         CASE_NUM_PROMPTS=$((GSP_NUM_GROUPS * GSP_PROMPTS_PER_GROUP))
         print_dry_run_case inf
       done
@@ -858,6 +931,48 @@ print(f"{value:.2f}")
 '
 }
 
+read_benchmark_duration() {
+  local log_file="$1"
+  parse_benchmark_log "${log_file}" | "${PYTHON_BIN}" -c '
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    value=data.get("benchmark_duration_s", data.get("duration_s"))
+    value=float(value)
+    if value <= 0: raise ValueError
+except Exception:
+    raise SystemExit(1)
+print(f"{value:.3f}")
+'
+}
+
+trial_meets_sla() {
+  local log_file="$1" target_s="$2"
+  [[ -s "${log_file}" ]] || return 1
+  [[ -f "${log_file}.exitcode" && "$(<"${log_file}.exitcode")" == "0" ]] || return 1
+  parse_benchmark_log "${log_file}" | "${PYTHON_BIN}" -c '
+import json,math,sys
+try:
+    data=json.load(sys.stdin)
+    ttft_metric, target_s, tpot_metric, tpot_target, hit_target, hit_tolerance = sys.argv[1:]
+    ttft=float(data[ttft_metric])
+    target_ms=float(target_s)*1000.0
+    if not math.isfinite(ttft) or ttft > target_ms:
+        raise SystemExit(1)
+    if tpot_metric:
+        tpot=float(data[tpot_metric])
+        if not math.isfinite(tpot) or tpot > float(tpot_target):
+            raise SystemExit(1)
+    actual_hit=float(data["cache_hit_rate_pct"])
+    if not math.isfinite(actual_hit) or abs(actual_hit - float(hit_target)) > float(hit_tolerance):
+        raise SystemExit(1)
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+print("1")
+' "${CASE_TTFT_METRIC}" "${target_s}" "${CASE_TPOT_METRIC:-}" "${CASE_TPOT_TARGET_MS:-}" \
+    "${CASE_HIT_PCT}" "${FINITE_HIT_RATE_TOLERANCE}" 2>/dev/null | grep -qx '1'
+}
+
 read_actual_hit_rate() {
   local log_file="$1"
   parse_benchmark_log "${log_file}" | "${PYTHON_BIN}" -c '
@@ -946,17 +1061,17 @@ run_inf_with_auto_calibration() {
 }
 
 resize_case_for_duration() {
-  local baseline_rps="$1" target_prompts target_groups
+  local baseline_rps="$1" requested_duration="${2:-${GSP_TARGET_DURATION_S}}" target_prompts target_groups
   [[ "${GSP_AUTO_DURATION}" == "1" ]] || return 1
   [[ "${GSP_NUM_GROUPS_WAS_SET}" == "x" ]] && return 1
-  target_prompts="$(awk -v rps="${baseline_rps}" -v duration="${GSP_TARGET_DURATION_S}" \
+  target_prompts="$(awk -v rps="${baseline_rps}" -v duration="${requested_duration}" \
     -v prompts="${GSP_PROMPTS_PER_GROUP}" \
     'BEGIN { n = int(rps * duration + 0.999999); n = int((n + prompts - 1) / prompts) * prompts; print n }')"
   target_groups=$((target_prompts / GSP_PROMPTS_PER_GROUP))
   (( target_groups >= 1 )) || target_groups=1
   GSP_NUM_GROUPS="${target_groups}"
   CASE_NUM_PROMPTS=$((GSP_NUM_GROUPS * GSP_PROMPTS_PER_GROUP))
-  echo "[INFO] 按 baseline 实际 RPS=${baseline_rps} 和目标时长=${GSP_TARGET_DURATION_S}s 调整 case: groups=${GSP_NUM_GROUPS} prompts/group=${GSP_PROMPTS_PER_GROUP} num_prompts=${CASE_NUM_PROMPTS}"
+  echo "[INFO] 按实际 RPS=${baseline_rps} 和目标时长=${requested_duration}s 调整 case: groups=${GSP_NUM_GROUPS} prompts/group=${GSP_PROMPTS_PER_GROUP} num_prompts=${CASE_NUM_PROMPTS}"
   return 0
 }
 
@@ -1386,6 +1501,7 @@ for raw_case in "${CASES[@]}"; do
     fi
     for candidate_groups in "${GROUP_CANDIDATES[@]}"; do
       GSP_NUM_GROUPS="${candidate_groups}"
+      cap_initial_probe_groups
       CASE_NUM_PROMPTS=$((GSP_NUM_GROUPS * GSP_PROMPTS_PER_GROUP))
       print_case
       if ! run_inf_with_auto_calibration baseline; then
@@ -1411,29 +1527,75 @@ for raw_case in "${CASES[@]}"; do
     continue
   fi
 
-  pilot_groups="${GSP_NUM_GROUPS}"
-  if resize_case_for_duration "${baseline_rps}" && [[ "${GSP_NUM_GROUPS}" != "${pilot_groups}" ]]; then
-    print_case
-    if ! run_inf_with_auto_calibration duration_baseline; then
-      measured_hit="$(read_actual_hit_rate "${LAST_INF_LOG}" 2>/dev/null || printf 'unavailable')"
-      echo "[ERROR] 动态请求数 baseline 命中率不达标: ${CASE_ID} groups=${GSP_NUM_GROUPS} actual=${measured_hit}% target=${CASE_HIT_PCT}%" >&2
-      run_failure=1
-      continue
+  if [[ "${GSP_AUTO_DURATION}" == "1" && "${GSP_NUM_GROUPS_WAS_SET}" != "x" ]]; then
+    duration_pass=0
+    if resize_case_for_duration "${baseline_rps}" "${GSP_DURATION_FIRST_PASS_S}"; then
+      cap_initial_probe_groups
+      CASE_NUM_PROMPTS=$((GSP_NUM_GROUPS * GSP_PROMPTS_PER_GROUP))
+      while :; do
+        duration_phase="duration_baseline"
+        (( duration_pass > 0 )) && duration_phase="duration_adjust${duration_pass}"
+        print_case
+        if ! run_inf_with_auto_calibration "${duration_phase}"; then
+          measured_hit="$(read_actual_hit_rate "${LAST_INF_LOG}" 2>/dev/null || printf 'unavailable')"
+          echo "[ERROR] 动态请求数 baseline 命中率不达标: ${CASE_ID} groups=${GSP_NUM_GROUPS} actual=${measured_hit}% target=${CASE_HIT_PCT}%" >&2
+          run_failure=1
+          continue 2
+        fi
+        inf_log="${LAST_INF_LOG}"
+        baseline_rps="$(read_actual_rps "${inf_log}" 2>/dev/null || true)"
+        actual_duration="$(read_benchmark_duration "${inf_log}" 2>/dev/null || true)"
+        [[ -n "${baseline_rps}" ]] || {
+          echo "[ERROR] 动态请求数 baseline 无法读取实际 RPS: ${CASE_ID}" >&2
+          run_failure=1
+          continue 2
+        }
+        selected_groups="${GSP_NUM_GROUPS}"
+        echo "[MEET] 动态请求数 baseline 通过: ${CASE_ID} groups=${selected_groups} num_prompts=${CASE_NUM_PROMPTS} actual_rps=${baseline_rps} duration=${actual_duration:-unknown}s"
+
+        [[ -n "${actual_duration}" ]] || break
+        within_target="$(awk -v actual="${actual_duration}" -v target="${GSP_TARGET_DURATION_S}" -v tolerance="${GSP_DURATION_TOLERANCE_PCT}" \
+          'BEGIN { low = target * (1 - tolerance / 100); high = target * (1 + tolerance / 100); print (actual >= low && actual <= high) ? 1 : 0 }')"
+        [[ "${within_target}" == "1" ]] && break
+        if (( duration_pass >= GSP_DURATION_ADJUST_MAX_ITERS )); then
+          echo "[WARN] ${CASE_ID} 动态时长在 ${GSP_DURATION_ADJUST_MAX_ITERS} 次调整后仍为 ${actual_duration}s，目标=${GSP_TARGET_DURATION_S}s" >&2
+          break
+        fi
+        previous_groups="${GSP_NUM_GROUPS}"
+        resize_case_for_duration "${baseline_rps}" "${GSP_TARGET_DURATION_S}" || break
+        (( duration_pass++ ))
+        [[ "${GSP_NUM_GROUPS}" != "${previous_groups}" ]] || {
+          echo "[INFO] ${CASE_ID} 按 prompts/group 取整后请求数不再变化，停止动态时长调整"
+          break
+        }
+      done
     fi
-    inf_log="${LAST_INF_LOG}"
-    baseline_rps="$(read_actual_rps "${inf_log}" 2>/dev/null || true)"
-    [[ -n "${baseline_rps}" ]] || {
-      echo "[ERROR] 动态请求数 baseline 无法读取实际 RPS: ${CASE_ID}" >&2
-      run_failure=1
-      continue
-    }
-    selected_groups="${GSP_NUM_GROUPS}"
-    echo "[MEET] 动态请求数 baseline 通过: ${CASE_ID} groups=${selected_groups} num_prompts=${CASE_NUM_PROMPTS} actual_rps=${baseline_rps}"
   fi
 
+  IFS='|' read -ra sla_targets <<< "${CASE_TTFT_TARGETS}"
+  sla_target_met=()
+  for sla_index in "${!sla_targets[@]}"; do
+    sla_target_met[${sla_index}]=0
+  done
+  sla_targets_remaining="${#sla_targets[@]}"
   while IFS= read -r finite_rate; do
     [[ -n "${finite_rate}" ]] || continue
     run_trial "${finite_rate}" descending
+    finite_log="$(trial_log_path "${finite_rate}" descending)"
+    if [[ "${GSP_STOP_ON_SLA}" == "1" && "${sla_targets_remaining}" -gt 0 ]]; then
+      for sla_index in "${!sla_targets[@]}"; do
+        [[ "${sla_target_met[$sla_index]}" == "1" ]] && continue
+        if trial_meets_sla "${finite_log}" "${sla_targets[$sla_index]}"; then
+          sla_target_met[${sla_index}]=1
+          (( sla_targets_remaining-- ))
+          echo "[MEET] ${CASE_ID} request_rate=${finite_rate} actual_rps=$(read_actual_rps "${finite_log}" 2>/dev/null || printf 'unknown') ${CASE_TTFT_METRIC}<${sla_targets[$sla_index]}s"
+        fi
+      done
+      if (( sla_targets_remaining == 0 )); then
+        echo "[STOP] ${CASE_ID} 所有 TTFT 目标均已找到满足点，停止继续降低请求率"
+        break
+      fi
+    fi
   done < <(finite_rate_candidates "${baseline_rps}")
 done
 
