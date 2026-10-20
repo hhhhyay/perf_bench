@@ -176,7 +176,7 @@ is_nonnegative_decimal() {
 }
 
 validate_rate_spacing() {
-  local previous="" current rate offset
+  local previous="" rate offset
   if [[ -n "${EXPLICIT_RATES}" ]]; then
     IFS=',' read -ra _explicit_rates <<< "${EXPLICIT_RATES}"
     for rate in "${_explicit_rates[@]}"; do
@@ -195,18 +195,18 @@ validate_rate_spacing() {
   fi
 
   IFS=',' read -ra _rate_offsets <<< "${RATE_OFFSETS}"
+  local offset_index=0
   for offset in "${_rate_offsets[@]}"; do
     is_decimal "${offset#-}" || {
       echo "[ERROR] GSP_RATE_OFFSETS 含非法值: ${offset}" >&2
       return 1
     }
-    current="${offset}"
-    if [[ -n "${previous}" ]] && ! awk -v prev="${previous}" -v curr="${current}" -v step="${RATE_STEP}" \
-      'BEGIN { exit !(prev > curr && prev - curr + 1e-9 >= step) }'; then
-      echo "[ERROR] GSP_RATE_OFFSETS 必须按高到低排列，且相邻偏移间隔不小于 ${RATE_STEP}" >&2
+    if ! awk -v offset="${offset}" -v position="${offset_index}" -v step="${RATE_STEP}" \
+      'BEGIN { exit !(offset <= 0 && (position == 0 || -offset + 1e-9 >= step)) }'; then
+      echo "[ERROR] GSP_RATE_OFFSETS 每个下降步长必须不小于 ${RATE_STEP}，首项只能为 0 或负数" >&2
       return 1
     fi
-    previous="${current}"
+    (( offset_index++ ))
   done
 }
 
