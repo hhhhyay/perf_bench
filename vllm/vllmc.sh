@@ -42,7 +42,12 @@ BASE_URL="${BASE_URL:-http://12.12.12.108:8332}"
 SERVER_INFO_URL="${SERVER_INFO_URL:-${BASE_URL%/}/server_info}"
 SERVER_LOG="${SERVER_LOG:-}"   # 可选：vLLM 服务端启动日志路径，用于提取 max_num_seqs 等未暴露配置
 MODEL="${MODEL:-/model/Qwen3-8B}"
+TOKENIZER="${TOKENIZER:-}"
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
+declare -a TOKENIZER_ARGS=()
+if [[ -n "${TOKENIZER}" ]]; then
+  TOKENIZER_ARGS=(--tokenizer "${TOKENIZER}")
+fi
 
 write_run_metadata() {
   local metadata_path="${out_dir}/run_metadata.json"
@@ -57,7 +62,7 @@ import tempfile
 
 (path, started_at, script, script_commit, run_id, base_url, model,
  node_hostname, output_dir, dp_size, parallel_config) = sys.argv[1:]
-prefixes = ("SLA_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE", "EP_SIZE",
+prefixes = ("SLA_", "TOKENIZER", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE", "EP_SIZE",
             "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC", "DP_ATTENTION",
             "NUM_PROMPTS_MULTIPLIER", "PERCENTILE_METRICS", "METRIC_PERCENTILES")
 metadata = {
@@ -87,6 +92,7 @@ write_log_header() {
   {
     printf '# perf_bench run metadata: %s\n' "${out_dir}/run_metadata.json"
     printf '# model: %s\n' "${MODEL}"
+    printf '# tokenizer: %s\n' "${TOKENIZER:-<client default>}"
     printf '# node_hostname: %s\n' "${NODE_HOSTNAME}"
     printf '# base_url: %s\n' "${BASE_URL}"
     printf '# run_id: %s\n' "${run_id}"
@@ -167,7 +173,7 @@ PERCENTILE_METRICS="${PERCENTILE_METRICS:-ttft,tpot,itl,e2el}"
 # Input / Output（单位 K，可使用小数）
 # ============================================================
 
-CASES=(
+DEFAULT_CASES=(
   "1 1"
   "8 1"
   "16 1"
@@ -176,6 +182,23 @@ CASES=(
   "128 1"
   "1024 1"
 )
+
+# 可选：用逗号指定本次要跑的输入/输出 case，例如：
+#   VLLM_CASES="8 1,32 1" bash vllm/vllmc.sh
+if [[ -n "${VLLM_CASES:-}" ]]; then
+  CASES=()
+  IFS=',' read -ra case_items <<< "${VLLM_CASES}"
+  for case_item in "${case_items[@]}"; do
+    read -r case_input case_output extra <<< "${case_item}"
+    if [[ -z "${case_input:-}" || -z "${case_output:-}" || -n "${extra:-}" ]]; then
+      echo "[ERROR] VLLM_CASES 格式应为 '输入 输出,输入 输出'，当前为: ${VLLM_CASES}" >&2
+      exit 1
+    fi
+    CASES+=("${case_input} ${case_output}")
+  done
+else
+  CASES=("${DEFAULT_CASES[@]}")
+fi
 
 
 # DP<=3 时使用较稀疏但更实用的基础点：
@@ -881,9 +904,10 @@ def parse_summary_from_log(log_path):
         "mean_e2el_ms": "mean_e2e_latency_ms",
     }
     known_prefixes = (
-        "successful_requests", "completed", "benchmark_duration", "duration_s",
+        "successful_requests", "failed_requests", "completed", "benchmark_duration", "duration_s",
         "total_input", "total_generated", "request_throughput", "input_token",
         "output_token", "total_token", "peak_output", "peak_concurrency",
+        "peak_concurrent",
         "concurrency", "max_", "mean_", "median_", "p50_", "p75_", "p90_",
         "p95_", "p99_", "p999_", "max_", "accept_length", "request_rate",
     )
@@ -952,6 +976,14 @@ def normalize_row(row, log_path=None):
         row, "total_throughput_tok_s",
         "total_token_throughput", "total_throughput"
     )
+    if row["input_throughput_tok_s"] in ("", None):
+        try:
+            input_tokens = float(first_present(row, "total_input_tokens", "prompt_tokens"))
+            duration_s = float(row["duration_s"])
+            if duration_s > 0:
+                row["input_throughput_tok_s"] = round(input_tokens / duration_s, 2)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
     row["mean_e2e_latency_ms"] = first_present(
         row, "mean_e2e_latency_ms", "mean_e2el_ms"
     )
@@ -1107,6 +1139,8 @@ preferred = [
     "token_theoretical_per_dp_bs",
     "effective_theoretical_per_dp_bs",
     "per_dp_bs",
+    "successful_requests",
+    "failed_requests",
     "num_prompts",
     "max_concurrency",
     "concurrency",
@@ -1142,7 +1176,6 @@ duplicate_aliases = {
     "random_output_len",
     "input_length",
     "output_length",
-    "successful_requests",
     "completed",
     "max_concurrent_requests",
     "max_request_concurrency",
@@ -1292,6 +1325,31 @@ case_result_exists() {
   [[ "$(tr -d '[:space:]' < "${exit_file}" 2>/dev/null)" == "0" ]]
 }
 
+benchmark_log_is_valid() {
+  local log_file="$1"
+  python3 - "${log_file}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+
+def metric(name):
+    matches = re.findall(rf"^{re.escape(name)}:\s*([0-9]+(?:\.[0-9]+)?)", text, re.MULTILINE)
+    return float(matches[-1]) if matches else None
+
+successful = metric("Successful requests")
+failed = metric("Failed requests")
+if successful is None or failed is None or successful <= 0 or failed > 0:
+    print(
+        f"[ERROR] benchmark 没有有效成功请求: successful={successful} failed={failed}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
 run_one_bs() {
   local per_dp_bs="$1"
   local global_concurrency=$((DP_SIZE * per_dp_bs))
@@ -1337,6 +1395,7 @@ run_one_bs() {
       --backend openai \
       --base-url "${BASE_URL}" \
       --model "${MODEL}" \
+      "${TOKENIZER_ARGS[@]}" \
       --dataset-name random \
       --random-input-len "${input_len}" \
       --random-output-len "${output_len}" \
@@ -1360,6 +1419,11 @@ run_one_bs() {
   if [[ -f "${exit_file}" ]]; then
     case_exit_code="$(tr -d '[:space:]' < "${exit_file}")"
   else
+    case_exit_code=1
+    printf "%s\n" "${case_exit_code}" > "${exit_file}"
+  fi
+
+  if (( case_exit_code == 0 )) && ! benchmark_log_is_valid "${log_file}"; then
     case_exit_code=1
     printf "%s\n" "${case_exit_code}" > "${exit_file}"
   fi

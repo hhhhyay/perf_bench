@@ -221,6 +221,9 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 - CSV 前置常用指标与 SGLang 脚本口径对齐。
 - 理论 BS = `min(token theory, max_num_seqs)`；如果无法获取 `max_num_seqs`，退回 token theory。
 - 支持与 SGLang 相同的 `SLA_RULES` inline 加密扫描。
+- 默认测试 `1/8/16/32/64/128/1024K` 输入 case；可用 `VLLM_CASES="8 1,32 1"` 选择指定输入/输出，避免验证时误跑大上下文。
+- `MODEL` 使用服务端的 served model name；如果客户端容器不能联网，另设 `TOKENIZER=/本地模型目录`，脚本会将本地 tokenizer 传给 `vllm bench serve`。
+- benchmark 只要成功请求数为 0 或存在失败请求，就标记为失败，不会把 vLLM 客户端的 0 退出码当成有效性能结果。
 - 直接从 vLLM benchmark 日志提取 RPS、Token 吞吐、请求数、耗时、平均时延和分位数，不保存结果 JSON。
 
 ## 长度口径
@@ -327,6 +330,8 @@ SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
 | --- | --- |
 | `BASE_URL` | OpenAI 兼容服务地址。 |
 | `MODEL` | benchmark 请求中使用的模型名或模型路径。 |
+| `TOKENIZER` | vLLM benchmark 客户端使用的本地 tokenizer 路径；服务名与本地目录不一致或网络受限时必须设置。 |
+| `VLLM_CASES` | vLLM 输入/输出 case 覆盖，格式为 `"8 1,32 1"`；不设置时使用脚本默认 case 列表。 |
 | `NODE_HOSTNAME` | 覆盖结果元数据中的节点 hostname，适合容器内 hostname 未映射到宿主机节点时使用。 |
 | `FIXED_PER_DP_BS` | 固定 per-DP BS 测试点，支持逗号或空格分隔多个值。 |
 | `FIXED_CONCURRENCY` | 固定全局并发测试点，必须能被 `DP_SIZE` 整除。 |
