@@ -21,11 +21,18 @@
 
 set -uo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 out_dir="./all_result/bench_vllm_prefix_salt_${run_id}"
 log_dir="${out_dir}/logs"
 mkdir -p "${log_dir}"
 STARTUP_READY=0
+
+NODE_NAME="${NODE_NAME:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown')}"
+CONTAINER_NAME="${CONTAINER_NAME:-${HOSTNAME:-unknown}}"
+RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
+SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null || true)"
 
 
 # ============================================================
@@ -37,6 +44,60 @@ SERVER_INFO_URL="${SERVER_INFO_URL:-${BASE_URL%/}/server_info}"
 SERVER_LOG="${SERVER_LOG:-}"   # 可选：vLLM 服务端启动日志路径，用于提取 max_num_seqs 等未暴露配置
 MODEL="${MODEL:-/model/Qwen3-8B}"
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
+
+write_run_metadata() {
+  local metadata_path="${out_dir}/run_metadata.json"
+  python3 - "${metadata_path}" "${RUN_STARTED_AT}" \
+    "${script_dir}/$(basename "${BASH_SOURCE[0]}")" "${SCRIPT_COMMIT}" \
+    "${run_id}" "${BASE_URL}" "${MODEL}" "${NODE_NAME}" "${CONTAINER_NAME}" \
+    "$(hostname 2>/dev/null || true)" "${out_dir}" "${DP_SIZE}" "${PARALLEL_CONFIG}" <<'PY_METADATA'
+import json
+import os
+import sys
+import tempfile
+
+(path, started_at, script, script_commit, run_id, base_url, model, node,
+ container, container_hostname, output_dir, dp_size, parallel_config) = sys.argv[1:]
+prefixes = ("SLA_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE", "EP_SIZE",
+            "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC", "DP_ATTENTION",
+            "NUM_PROMPTS_MULTIPLIER", "PERCENTILE_METRICS", "METRIC_PERCENTILES")
+metadata = {
+    "started_at": started_at,
+    "script": script,
+    "script_commit": script_commit,
+    "run_id": run_id,
+    "base_url": base_url,
+    "model": model,
+    "node": node,
+    "container": container,
+    "container_hostname": container_hostname,
+    "output_dir": output_dir,
+    "dp_size": dp_size,
+    "parallel_config": parallel_config,
+    "environment": {k: v for k, v in os.environ.items() if k.startswith(prefixes)},
+}
+parent = os.path.dirname(os.path.abspath(path))
+fd, tmp = tempfile.mkstemp(prefix=".run_metadata.", dir=parent, text=True)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+os.replace(tmp, path)
+PY_METADATA
+}
+
+write_log_header() {
+  local log_file="$1"
+  {
+    printf '# perf_bench run metadata: %s\n' "${out_dir}/run_metadata.json"
+    printf '# model: %s\n' "${MODEL}"
+    printf '# node: %s\n' "${NODE_NAME}"
+    printf '# container: %s\n' "${CONTAINER_NAME}"
+    printf '# base_url: %s\n' "${BASE_URL}"
+    printf '# run_id: %s\n' "${run_id}"
+    printf '# started_at: %s\n' "${RUN_STARTED_AT}"
+    printf '#\n'
+  } > "${log_file}"
+}
 if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] TOKEN_UNIT 必须是正整数，当前为: ${TOKEN_UNIT}" >&2
   exit 1
@@ -1275,6 +1336,7 @@ run_one_bs() {
 
   (
     set -o pipefail
+    write_log_header "${log_file}"
     vllm bench serve \
       --backend openai \
       --base-url "${BASE_URL}" \
@@ -1292,7 +1354,7 @@ run_one_bs() {
       --metric-percentiles "${METRIC_PERCENTILES}" \
       --disable-tqdm \
       --extra-body "{\"cache_salt\":\"${cache_salt}\"}" \
-      2>&1 | tee "${log_file}"
+      2>&1 | tee -a "${log_file}"
     echo $? > "${exit_file}"
   ) &
   bench_pid=$!
@@ -1335,6 +1397,8 @@ load_vllm_server_info
 load_vllm_server_log_config
 load_vllm_capacity
 validate_fixed_mode
+
+write_run_metadata
 
 if [[ ! "${NUM_PROMPTS_MULTIPLIER}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] NUM_PROMPTS_MULTIPLIER 必须是正整数"

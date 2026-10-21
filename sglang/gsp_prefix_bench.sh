@@ -36,6 +36,10 @@ GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
 GSP_SYSTEM_LEN_EXTRA_TOKENS="${GSP_SYSTEM_LEN_EXTRA_TOKENS:-0}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+NODE_NAME="${NODE_NAME:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown')}"
+CONTAINER_NAME="${CONTAINER_NAME:-${HOSTNAME:-unknown}}"
+RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
+SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null || true)"
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
 RATE_OFFSETS="${GSP_RATE_OFFSETS:-0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5}"
 RATE_STEP="${GSP_RATE_STEP:-0.1}"
@@ -54,6 +58,65 @@ dry_run=0
 run_failure=0
 
 declare -a CASES=()
+
+write_run_metadata() {
+  local metadata_path="${out_dir}/run_metadata.json"
+  "${PYTHON_BIN}" - "${metadata_path}" \
+    "${RUN_STARTED_AT}" "${script_dir}/$(basename "${BASH_SOURCE[0]}")" \
+    "${SCRIPT_COMMIT}" "${RUN_ID}" "${BASE_URL}" "${MODEL}" \
+    "${NODE_NAME}" "${CONTAINER_NAME}" "$(hostname 2>/dev/null || true)" \
+    "${out_dir}" "${GSP_PAGE_SIZE}" <<'PY_METADATA'
+import json
+import os
+import sys
+import tempfile
+
+(path, started_at, script, script_commit, run_id, base_url, model, node,
+ container, container_hostname, output_dir, page_size) = sys.argv[1:]
+prefixes = ("GSP_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE",
+            "EP_SIZE", "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC",
+            "DP_ATTENTION", "SEED")
+environment = {
+    key: value for key, value in os.environ.items()
+    if key.startswith(prefixes)
+}
+metadata = {
+    "started_at": started_at,
+    "script": script,
+    "script_commit": script_commit,
+    "run_id": run_id,
+    "base_url": base_url,
+    "model": model,
+    "node": node,
+    "container": container,
+    "container_hostname": container_hostname,
+    "output_dir": output_dir,
+    "gsp_page_size": page_size,
+    "environment": environment,
+}
+parent = os.path.dirname(os.path.abspath(path))
+os.makedirs(parent, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".run_metadata.", dir=parent, text=True)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+os.replace(tmp, path)
+PY_METADATA
+}
+
+write_log_header() {
+  local log_file="$1"
+  {
+    printf '# perf_bench run metadata: %s\n' "${out_dir}/run_metadata.json"
+    printf '# model: %s\n' "${MODEL}"
+    printf '# node: %s\n' "${NODE_NAME}"
+    printf '# container: %s\n' "${CONTAINER_NAME}"
+    printf '# base_url: %s\n' "${BASE_URL}"
+    printf '# run_id: %s\n' "${RUN_ID}"
+    printf '# started_at: %s\n' "${RUN_STARTED_AT}"
+    printf '#\n'
+  } > "${log_file}"
+}
 
 usage() {
   cat <<'USAGE'
@@ -918,7 +981,8 @@ run_trial() {
   echo "============================================================"
   printf '[CMD]'; printf ' %q' "${cmd[@]}"; printf '\n'
 
-  "${cmd[@]}" 2>&1 | tee "${log_file}"
+  write_log_header "${log_file}"
+  "${cmd[@]}" 2>&1 | tee -a "${log_file}"
   exit_code="${PIPESTATUS[0]}"
   if [[ "${exit_code}" != "0" ]]; then
     run_failure=1
@@ -1584,6 +1648,7 @@ PY
 
 mkdir -p "${out_dir}" "${log_dir}"
 check_bench_flags || exit 1
+write_run_metadata
 
 for raw_case in "${CASES[@]}"; do
   parse_case "${raw_case}" || exit 1

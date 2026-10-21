@@ -202,7 +202,9 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 
 结果位于 `all_result/bench_gsp_prefix_<RUN_ID>/`：
 
+- `run_metadata.json`：本次运行的模型、服务地址、节点、容器、启动时间、脚本 commit 和关键环境参数。容器内无法自动识别宿主机时，可通过 `NODE_NAME` 和 `CONTAINER_NAME` 显式补充。
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
+- 每个新生成的 `.log` 开头也会写入上述模型、节点、容器和服务地址，便于单独复制日志后追溯来源。
 - `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准 probe；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
 - `gsp_prefix_summary.csv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `configured_request_rate=inf` 或 `search_phase` 区分基线/回测，并保留确认后的长度/分组/请求数、`confirmed_inf_actual_rps`、`configured_request_rate`、`request_throughput`、实际 cache 命中率和完整客户端指标。重复的状态、排序序号、RPS、请求率和 TPOT 规则字段不再放入 summary。先按 `confirmed_inf_actual_rps` 降序排列，同一参数块内再按配置请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
 - `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
@@ -299,6 +301,10 @@ bash sglang/prefill_ttft.sh --plot mean --plot p99 --plot line
 
 脚本内部会把秒换算成毫秒参与判断，例如 `5.5` 秒变成 `5500ms`，`0.25` 秒变成 `250ms`。CSV 仍保留 `target_value_ms` 和 `target_near_ms` 字段，以兼容现有数据平台。
 
+Prefill 结果目录同样会生成 `run_metadata.json`，并在每个新 benchmark 日志开头记录
+`model`、`node`、`container`、`base_url`、`run_id` 和启动时间。节点/容器信息默认取当前运行环境，
+在 Docker 容器中建议显式设置，例如 `NODE_NAME=h20-1 CONTAINER_NAME=gbj_811_q3.8_27b_fp8`。
+
 ### vLLM
 
 ```bash
@@ -308,12 +314,18 @@ MODEL=/path/to/model \
 bash vllm/vllmc.sh
 ```
 
+SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
+`run_metadata.json`，并给每个新 benchmark 日志追加同样的元数据头。这样拿到单个日志时，
+仍可以直接确认具体模型、服务地址、节点、容器、运行时间和脚本版本；Docker 内运行时可用
+`NODE_NAME`、`CONTAINER_NAME` 显式填写宿主机节点和容器名。
+
 ## 常用环境变量
 
 | 变量 | 说明 |
 | --- | --- |
 | `BASE_URL` | OpenAI 兼容服务地址。 |
 | `MODEL` | benchmark 请求中使用的模型名或模型路径。 |
+| `NODE_NAME` / `CONTAINER_NAME` | 覆盖结果元数据中的节点和容器名称，适合 Docker 内运行时补充宿主机信息。 |
 | `FIXED_PER_DP_BS` | 固定 per-DP BS 测试点，支持逗号或空格分隔多个值。 |
 | `FIXED_CONCURRENCY` | 固定全局并发测试点，必须能被 `DP_SIZE` 整除。 |
 | `NUM_PROMPTS_MULTIPLIER` | 请求数量倍率，`num_prompts = max_concurrency * NUM_PROMPTS_MULTIPLIER`。 |

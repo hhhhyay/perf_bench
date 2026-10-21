@@ -16,6 +16,11 @@ log_dir="${out_dir}/logs"
 trials_csv="${out_dir}/prefill_ttft_trials.csv"
 matrix_csv="${out_dir}/prefill_ttft_matrix.csv"
 
+NODE_NAME="${NODE_NAME:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown')}"
+CONTAINER_NAME="${CONTAINER_NAME:-${HOSTNAME:-unknown}}"
+RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
+SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null || true)"
+
 BASE_URL="${BASE_URL:-http://12.12.12.37:10015}"
 MODEL="${MODEL:-/public4/opendas/DL_DATA/llm-models/DeepSeek-V4-Flash-0731-FP8-Channel}"
 DP_SIZE="${DP_SIZE:-}"
@@ -49,6 +54,66 @@ PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}
 PREFILL_TTFT_TEST_MODE="${PREFILL_TTFT_TEST_MODE:-}"
 PLOT_REQUESTS=()
 PLOT_CELL="${PLOT_CELL:-rps}"
+
+write_run_metadata() {
+  local metadata_path="${out_dir}/run_metadata.json"
+  "${PYTHON_BIN}" - "${metadata_path}" \
+    "${RUN_STARTED_AT}" "${script_dir}/$(basename "${BASH_SOURCE[0]}")" \
+    "${SCRIPT_COMMIT}" "${run_id}" "${BASE_URL}" "${MODEL}" \
+    "${NODE_NAME}" "${CONTAINER_NAME}" "$(hostname 2>/dev/null || true)" \
+    "${out_dir}" "${DP_SIZE}" "${PARALLEL_CONFIG}" <<'PY_METADATA'
+import json
+import os
+import sys
+import tempfile
+
+(path, started_at, script, script_commit, run_id, base_url, model, node,
+ container, container_hostname, output_dir, dp_size, parallel_config) = sys.argv[1:]
+prefixes = ("PREFILL_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE",
+            "EP_SIZE", "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC",
+            "DP_ATTENTION", "USE_FAKE_PREFILL", "NUM_PROMPTS_MULTIPLIER")
+environment = {
+    key: value for key, value in os.environ.items()
+    if key.startswith(prefixes)
+}
+metadata = {
+    "started_at": started_at,
+    "script": script,
+    "script_commit": script_commit,
+    "run_id": run_id,
+    "base_url": base_url,
+    "model": model,
+    "node": node,
+    "container": container,
+    "container_hostname": container_hostname,
+    "output_dir": output_dir,
+    "dp_size": dp_size,
+    "parallel_config": parallel_config,
+    "environment": environment,
+}
+parent = os.path.dirname(os.path.abspath(path))
+os.makedirs(parent, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".run_metadata.", dir=parent, text=True)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+os.replace(tmp, path)
+PY_METADATA
+}
+
+write_log_header() {
+  local log_file="$1"
+  {
+    printf '# perf_bench run metadata: %s\n' "${out_dir}/run_metadata.json"
+    printf '# model: %s\n' "${MODEL}"
+    printf '# node: %s\n' "${NODE_NAME}"
+    printf '# container: %s\n' "${CONTAINER_NAME}"
+    printf '# base_url: %s\n' "${BASE_URL}"
+    printf '# run_id: %s\n' "${run_id}"
+    printf '# started_at: %s\n' "${RUN_STARTED_AT}"
+    printf '#\n'
+  } > "${log_file}"
+}
 
 usage() {
   cat <<'USAGE'
@@ -667,7 +732,8 @@ run_probe() {
       return 0
     fi
     mkdir -p "${log_dir}"
-    "${cmd[@]}" 2>&1 | tee "${log_file}"
+    write_log_header "${log_file}"
+    "${cmd[@]}" 2>&1 | tee -a "${log_file}"
     exit_code="${PIPESTATUS[0]}"
     printf "%s\n" "${exit_code}" > "${exit_file}"
   fi
@@ -1022,6 +1088,7 @@ main() {
     echo "[ERROR] MODEL 为空且无法从 metrics 识别" >&2
     return 1
   }
+  write_run_metadata
 
   echo "[INFO] Prefill TTFT matrix"
   echo "[INFO] BASE_URL=${BASE_URL}"
