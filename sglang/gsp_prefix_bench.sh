@@ -41,7 +41,6 @@ NODE_HOSTNAME="${NODE_HOSTNAME:-$(hostname 2>/dev/null || printf 'unknown')}"
 RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
 SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null || true)"
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
-RATE_OFFSETS="${GSP_RATE_OFFSETS:-0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5}"
 RATE_STEP="${GSP_RATE_STEP:-0.1}"
 HIT_RATE_TOLERANCE="${GSP_HIT_RATE_TOLERANCE_PCT:-0.5}"
 BASELINE_HIT_RATE_TOLERANCE="${GSP_BASELINE_HIT_RATE_TOLERANCE_PCT:-${HIT_RATE_TOLERANCE}}"
@@ -163,8 +162,7 @@ Environment:
   GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
   GSP_SYSTEM_LEN_EXTRA_TOKENS=0   Optional page-aligned cache-report calibration tokens
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
-  GSP_RATE_OFFSETS=0,-0.1,...     Cumulative high-to-low offsets after inf baseline
-  GSP_RATE_STEP=0.1               Minimum finite-rate step
+  GSP_RATE_STEP=0.1               Uniform descending finite-rate step; minimum 0.1
   GSP_HIT_RATE_TOLERANCE_PCT=0.5  Workload/page-alignment tolerance fallback
   GSP_BASELINE_HIT_RATE_TOLERANCE_PCT=0.5  Strict inf hit-rate tolerance
   GSP_FINITE_HIT_RATE_TOLERANCE_PCT=1.5  Finite-rate hit-rate tolerance for concurrency drift
@@ -269,20 +267,6 @@ validate_rate_spacing() {
     return 0
   fi
 
-  IFS=',' read -ra _rate_offsets <<< "${RATE_OFFSETS}"
-  local offset_index=0
-  for offset in "${_rate_offsets[@]}"; do
-    is_decimal "${offset#-}" || {
-      echo "[ERROR] GSP_RATE_OFFSETS 含非法值: ${offset}" >&2
-      return 1
-    }
-    if ! awk -v offset="${offset}" -v position="${offset_index}" -v step="${RATE_STEP}" \
-      'BEGIN { exit !(offset <= 0 && (position == 0 || -offset + 1e-9 >= step)) }'; then
-      echo "[ERROR] GSP_RATE_OFFSETS 每个下降步长必须不小于 ${RATE_STEP}，首项只能为 0 或负数" >&2
-      return 1
-    fi
-    (( offset_index++ ))
-  done
 }
 
 tokens_from_k() {
@@ -1260,17 +1244,21 @@ finite_rate_candidates() {
     done
     return 0
   fi
-  local current="${baseline}" offset candidate previous=""
-  IFS=',' read -ra offsets <<< "${RATE_OFFSETS}"
-  for offset in "${offsets[@]}"; do
-    is_decimal "${offset#-}" || { echo "[ERROR] GSP_RATE_OFFSETS 含非法值: ${offset}" >&2; return 1; }
-    current="$(awk -v c="${current}" -v o="${offset}" 'BEGIN { printf "%.6f", c + o }')"
-    candidate="$(format_decimal "${current}")"
-    if awk -v c="${candidate}" 'BEGIN { exit !(c > 0) }' && [[ "${candidate}" != "${previous}" ]]; then
-      printf '%s\n' "${candidate}"
-      previous="${candidate}"
-    fi
-  done
+  # Use a uniform descending grid.  The previous cumulative offset list
+  # skipped valid points such as 0.95 when the baseline was 1.55.
+  awk -v start="${baseline}" -v step="${RATE_STEP}" '
+    BEGIN {
+      rate = start
+      while (rate >= 0.1 - 1e-9) {
+        printf "%.2f\n", rate
+        next_rate = rate - step
+        if (next_rate < 0.1 - 1e-9) {
+          break
+        }
+        rate = next_rate
+      }
+    }
+  '
 }
 
 write_summary_legacy() {

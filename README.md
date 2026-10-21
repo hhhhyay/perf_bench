@@ -126,11 +126,11 @@ prompt/group 候选的 `inf` 命中率都不达标，summary 必须标记为 `BA
 同请求数回测耗时分别为 `63.78s` 和 `60.66s`，说明请求数会随 case 的 pilot RPS
 自动变化，而不会固定为 64。
 
-多请求率回测也已在同一轮验证：默认 `GSP_RATE_OFFSETS` 会从动态 `inf` 实际 RPS
-依次生成 `0、-0.1、-0.1、-0.1、-0.2、-0.2、-0.3、-0.5` 八个有限请求率，
-其中 `inf` 只作为命中率基线，不作为最终容量点。8K/1 的配置请求率为
-`34.18、34.08、33.98、33.88、33.68、33.48、33.18、32.68 req/s`，32K/1
-的配置请求率为 `6.27、6.17、6.07、5.97、5.77、5.57、5.27、4.77 req/s`。
+多请求率回测也已在同一轮验证：默认从动态 `inf` 实际 RPS 开始，按
+`GSP_RATE_STEP` 均匀从高到低逐档测试，默认步长为 `0.1 req/s`。例如基线为
+`1.55 req/s` 时，配置请求率依次为 `1.55、1.45、1.35、1.25、1.15、1.05、
+0.95、0.85...`，不会再因累计偏移跳过中间档位。其中 `inf` 只作为命中率和性能
+基线，不作为最终容量点。
 在固定 GSP 分组、共享前缀长度和 `--flush-cache` 口径下，请求率通常不会大幅改变
 token-level cache hit rate，但无 `max-concurrency` 时并发冷 miss 数可能随请求率变化。
 因此脚本对 `inf` baseline 使用严格的 `0.5` 个百分点容差，对有限请求率默认使用
@@ -163,8 +163,8 @@ INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S,TPOT_METRIC,TPOT_TARGET_MS[,MAX
 限制为 30ms。每个 case 先按 `GSP_PROMPTS_PER_GROUP_CANDIDATES` 从小到大计算可行的共享前缀，
 使用 `GSP_NUM_GROUPS_CANDIDATES` 组合测试 `inf`，选择首个实际命中率达标的组合；显式设置
 `GSP_PROMPTS_PER_GROUP` 或 `GSP_NUM_GROUPS` 时只使用固定值。然后以该次 `inf` 的实际
-`request_throughput` 为起点从高到低回测，记录实际请求率，保留两位小数，最小步长不低于
-`0.1 req/s`。只有 baseline 和候选点都满足实测命中率、TTFT、TPOT，才会进入容量结果。
+`request_throughput` 为起点从高到低按 `0.1 req/s`（可由 `GSP_RATE_STEP` 调整）逐档回测，
+记录实际请求率，保留两位小数。只有 baseline 和候选点都满足实测命中率、TTFT、TPOT，才会进入容量结果。
 默认先用小请求数得到 pilot RPS，再按 `GSP_TARGET_DURATION_S` 动态扩展当前 case 的
 `gsp_num_groups/num_prompts`；默认目标为 60 秒，最终每个 case 的 benchmark duration
 通常落在 1～2 分钟。扩展时保持 prompts/group、system/question 长度和命中率口径不变。
@@ -362,8 +362,7 @@ SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
 | `GSP_INF_MAX_TRIALS` | 命中率确认后重复 `inf` 的最大次数，默认 `5`。 |
 | `GSP_INF_NO_IMPROVEMENT_LIMIT` | `input_throughput` 连续不提升的停止次数，默认 `2`。 |
 | `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
-| `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`；按高到低回测。 |
-| `GSP_RATE_STEP` | 请求率最小间隔，默认 `0.1 req/s`，不能设置小于 `0.1`；显式请求率或偏移序列也必须按高到低且满足该间隔。 |
+| `GSP_RATE_STEP` | 默认有限请求率逐档下降的步长，默认 `0.1 req/s`，不能设置小于 `0.1`；显式请求率仍必须按高到低且满足该间隔。 |
 | `GSP_STOP_ON_SLA` | 默认 `1`：每个 case 按高到低请求率测试，所有 `TTFT_TARGETS_S` 都找到满足点且 cache/TPOT 也通过后停止；设为 `0` 才跑完整降速序列。 |
 | `PREFILL_TTFT_INPUTS` | Prefill 输入长度，默认 `32 64 128`，单位为 K。 |
 | `PREFILL_SLA_RULES` | Prefill SLA 规则，格式为 `input_k:metric:target_seconds:near_seconds`，例如 `8:p99_ttft_ms:5:0.5`；默认对每个输入使用 Mean TTFT 的 3s/5s/10s。 |
