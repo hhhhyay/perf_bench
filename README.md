@@ -207,6 +207,7 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 - 每个新生成的 `.log` 开头也会写入上述模型、节点 hostname 和服务地址，便于单独复制日志后追溯来源。
 - `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准 probe；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
 - `gsp_prefix_summary.csv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `configured_request_rate=inf` 或 `search_phase` 区分基线/回测，并保留确认后的长度/分组/请求数、`confirmed_inf_actual_rps`、`configured_request_rate`、`request_throughput`、实际 cache 命中率和完整客户端指标。重复的状态、排序序号、RPS、请求率和 TPOT 规则字段不再放入 summary。先按 `confirmed_inf_actual_rps` 降序排列，同一参数块内再按配置请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
+- GSP CSV/TSV 会记录 `parallel_config`，优先从服务 `/server_info` 生成；接口不可用时可通过 `PARALLEL_CONFIG` 手动指定。
 - `gsp_prefix_summary.tsv`：与 summary CSV 内容相同，但列之间使用制表符，空值用 `-` 占位以避免终端复制时连续 Tab 导致列错位。执行 `cat gsp_prefix_summary.tsv` 后复制到 Excel/WPS，可直接按列粘贴；CSV 仍作为数据平台导入文件保留。
 - `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
 

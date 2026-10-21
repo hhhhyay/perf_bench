@@ -32,6 +32,7 @@ GSP_INPUT_IDS="${GSP_INPUT_IDS:-1}"
 GSP_INF_MAX_TRIALS="${GSP_INF_MAX_TRIALS:-5}"
 GSP_INF_NO_IMPROVEMENT_LIMIT="${GSP_INF_NO_IMPROVEMENT_LIMIT:-2}"
 GSP_PAGE_SIZE="${GSP_PAGE_SIZE:-}"
+PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"
 GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
 GSP_SYSTEM_LEN_EXTRA_TOKENS="${GSP_SYSTEM_LEN_EXTRA_TOKENS:-0}"
 SEED="${SEED:-42}"
@@ -65,14 +66,14 @@ write_run_metadata() {
     "${RUN_STARTED_AT}" "${script_dir}/$(basename "${BASH_SOURCE[0]}")" \
     "${SCRIPT_COMMIT}" "${RUN_ID}" "${BASE_URL}" "${MODEL}" \
     "${NODE_HOSTNAME}" \
-    "${out_dir}" "${GSP_PAGE_SIZE}" <<'PY_METADATA'
+    "${out_dir}" "${GSP_PAGE_SIZE}" "${PARALLEL_CONFIG}" <<'PY_METADATA'
 import json
 import os
 import sys
 import tempfile
 
 (path, started_at, script, script_commit, run_id, base_url, model,
- node_hostname, output_dir, page_size) = sys.argv[1:]
+ node_hostname, output_dir, page_size, parallel_config) = sys.argv[1:]
 prefixes = ("GSP_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE",
             "EP_SIZE", "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC",
             "DP_ATTENTION", "SEED")
@@ -90,6 +91,7 @@ metadata = {
     "node_hostname": node_hostname,
     "output_dir": output_dir,
     "gsp_page_size": page_size,
+    "parallel_config": parallel_config,
     "environment": environment,
 }
 parent = os.path.dirname(os.path.abspath(path))
@@ -157,6 +159,7 @@ Environment:
   GSP_INF_MAX_TRIALS=5            Maximum repeated inf probes before finite-rate backtests
   GSP_INF_NO_IMPROVEMENT_LIMIT=2 Stop inf probes after this many non-improving input-throughput trials
   GSP_PAGE_SIZE=                  KV cache page size; auto-read from /server_info, fallback 64
+  PARALLEL_CONFIG=                Parallel layout; auto-read from /server_info
   GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
   GSP_SYSTEM_LEN_EXTRA_TOKENS=0   Optional page-aligned cache-report calibration tokens
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
@@ -517,6 +520,52 @@ PY
   [[ "${GSP_PAGE_SIZE}" =~ ^[1-9][0-9]*$ ]] || GSP_PAGE_SIZE=64
 }
 
+resolve_parallel_config() {
+  [[ -n "${PARALLEL_CONFIG}" ]] && return 0
+  if (( dry_run == 1 )); then
+    PARALLEL_CONFIG="UNKNOWN"
+    return 0
+  fi
+  PARALLEL_CONFIG="$(${PYTHON_BIN} - "${BASE_URL%/}/server_info" <<'PY'
+import json
+import sys
+import urllib.request
+
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=2) as response:
+        obj = json.load(response)
+except Exception:
+    obj = {}
+
+def value(name, *fallbacks):
+    current = obj.get(name)
+    if current is not None:
+        return current
+    for parent in fallbacks:
+        if isinstance(obj.get(parent), dict) and obj[parent].get(name) is not None:
+            return obj[parent][name]
+    return "NA"
+
+def text(item):
+    if isinstance(item, bool):
+        return "true" if item else "false"
+    return str(item) if item not in (None, "") else "NA"
+
+tp = text(value("tp_size", "server_args"))
+dp = text(value("dp_size", "server_args"))
+pp = text(value("pp_size", "server_args"))
+ep = text(value("ep_size", "server_args"))
+acp = text(value("attn_cp_size", "server_args"))
+dpa = value("enable_dp_attention", "server_args")
+attn = "DPA" if dpa is True or str(dpa).lower() == "true" else "TPA"
+kv = text(value("kv_cache_dtype", "server_args"))
+mem = text(value("mem_fraction_static", "server_args"))
+print(f"TP{tp}-DP{dp}({attn})-PP{pp}-EP{ep}-ACP{acp}-KV{kv}-MEM{mem}")
+PY
+  )"
+  [[ -n "${PARALLEL_CONFIG}" ]] || PARALLEL_CONFIG="UNKNOWN"
+}
+
 parse_case() {
   local raw="$1"
   local old_ifs="$IFS"
@@ -649,6 +698,7 @@ validate_global_config() {
 
 validate_global_config || exit 1
 resolve_page_size || exit 1
+resolve_parallel_config || exit 1
 
 print_case() {
   echo "CASE                 : ${CASE_ID}"
@@ -878,7 +928,7 @@ append_trial_row() {
   "${PYTHON_BIN}" - "${trials_csv}" "${CASE_ID}" "${CASE_INPUT_RAW}" "${CASE_OUTPUT_RAW}" \
     "${CASE_HIT_PCT}" "${CASE_SYSTEM_LEN}" "${CASE_QUESTION_LEN}" "${CASE_THEORY_HIT_PCT}" \
     "${CASE_REQUESTED_THEORY_HIT_PCT}" \
-    "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}" \
+    "${GSP_PAGE_SIZE}" "${PARALLEL_CONFIG}" "${GSP_PAGE_ALIGN}" \
     "${GSP_NUM_GROUPS}" "${GSP_PROMPTS_PER_GROUP}" "${CASE_NUM_PROMPTS}" "${CASE_TTFT_METRIC}" \
     "${CASE_TTFT_TARGETS}" "${CASE_TPOT_METRIC}" "${CASE_TPOT_TARGET_MS}" "${request_rate}" \
     "${phase}" "${CASE_CONCURRENCY:-}" "${log_file}" "${exit_code}" "${metrics_json}" <<'PY'
@@ -888,7 +938,7 @@ import os
 import sys
 
 (path, case_id, input_raw, output_raw, target_hit, system_len, question_len,
- theory_hit, requested_theory_hit, page_size, page_aligned, groups, prompts_per_group, num_prompts, ttft_metric, ttft_targets,
+ theory_hit, requested_theory_hit, page_size, parallel_config, page_aligned, groups, prompts_per_group, num_prompts, ttft_metric, ttft_targets,
  tpot_metric, tpot_target, request_rate, phase, max_concurrency, log_file,
  exit_code, metrics_raw) = sys.argv[1:]
 try:
@@ -898,7 +948,7 @@ except json.JSONDecodeError:
 fields = [
     "case_id", "input", "output", "specified_cache_hit_rate_pct", "system_prompt_len",
     "question_len", "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
-    "gsp_page_size", "page_aligned",
+    "gsp_page_size", "parallel_config", "page_aligned",
     "gsp_num_groups",
     "gsp_prompts_per_group", "num_prompts", "ttft_metric", "ttft_targets_s",
     "tpot_metric", "tpot_target_ms", "configured_request_rate", "search_phase",
@@ -920,7 +970,7 @@ row.update({
     "specified_cache_hit_rate_pct": target_hit, "system_prompt_len": system_len,
     "question_len": question_len, "theoretical_cache_hit_rate_pct": theory_hit,
     "requested_theoretical_cache_hit_rate_pct": requested_theory_hit,
-    "gsp_page_size": page_size, "page_aligned": page_aligned,
+    "gsp_page_size": page_size, "parallel_config": parallel_config, "page_aligned": page_aligned,
     "gsp_num_groups": groups, "gsp_prompts_per_group": prompts_per_group,
     "num_prompts": num_prompts, "ttft_metric": ttft_metric,
     "ttft_targets_s": ttft_targets, "tpot_metric": tpot_metric,
@@ -1372,7 +1422,7 @@ metadata_fields = [
 preferred_fields = [
     "case_id", "input", "output",
     "specified_cache_hit_rate_pct", "SLO_ms", "actual_cache_hit_rate_pct",
-    "system_prompt_len", "question_len",
+    "parallel_config", "system_prompt_len", "question_len",
     "gsp_page_size", "gsp_num_groups", "gsp_prompts_per_group",
     "successful_requests", "num_prompts",
     "max_concurrency", "concurrency", "peak_output_throughput", "peak_concurrency",
