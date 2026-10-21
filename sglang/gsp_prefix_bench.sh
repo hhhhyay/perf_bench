@@ -1487,6 +1487,10 @@ summary.sort(key=lambda row: (
 ))
 
 output_rows = [{field: row.get(field, "") for field in fields} for row in summary]
+clipboard_rows = [
+    {field: (row.get(field, "") or "-") for field in fields}
+    for row in output_rows
+]
 with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
@@ -1494,7 +1498,7 @@ with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
 with open(summary_tsv_path, "w", newline="", encoding="utf-8-sig") as f:
     writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", lineterminator="\n")
     writer.writeheader()
-    writer.writerows(output_rows)
+    writer.writerows(clipboard_rows)
 PY
 }
 
