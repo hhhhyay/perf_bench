@@ -533,6 +533,7 @@ prefix = {
     "Output token throughput (tok/s)": "output_throughput",
     "Peak output token throughput (tok/s)": "peak_output_throughput",
     "Peak concurrency": "peak_concurrency",
+    "Peak concurrent requests": "peak_concurrency",
     "Total token throughput (tok/s)": "total_throughput",
     "Concurrency": "concurrency",
     "Accept length": "accept_length",

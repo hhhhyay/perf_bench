@@ -760,6 +760,7 @@ aliases = {
     "Peak output token throughput (tok/s)": "peak_output_throughput",
     "Total token throughput (tok/s)": "total_throughput",
     "Peak concurrency": "peak_concurrency",
+    "Peak concurrent requests": "peak_concurrency",
     "Concurrency": "concurrency",
     "Accept length": "accept_length",
     "Mean E2E Latency (ms)": "mean_e2e_latency_ms",
