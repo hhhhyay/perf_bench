@@ -51,6 +51,7 @@ out_dir="./all_result/bench_gsp_prefix_${RUN_ID}"
 log_dir="${out_dir}/logs"
 trials_csv="${out_dir}/gsp_prefix_trials.csv"
 summary_csv="${out_dir}/gsp_prefix_summary.csv"
+summary_tsv="${out_dir}/gsp_prefix_summary.tsv"
 plot_requested=0
 plot_cell="rps"
 dry_run=0
@@ -1335,7 +1336,7 @@ PY
 }
 
 write_summary() {
-  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" \
+  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" "${summary_tsv}" \
     "${BASELINE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
 import json
@@ -1343,7 +1344,7 @@ import math
 import os
 import sys
 
-trials_path, summary_path, baseline_tolerance_s = sys.argv[1:]
+trials_path, summary_path, summary_tsv_path, baseline_tolerance_s = sys.argv[1:]
 baseline_tolerance = float(baseline_tolerance_s)
 rows = []
 if os.path.exists(trials_path):
@@ -1485,10 +1486,15 @@ summary.sort(key=lambda row: (
     -(num(row, "configured_request_rate") or float("-inf")),
 ))
 
+output_rows = [{field: row.get(field, "") for field in fields} for row in summary]
 with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
     writer = csv.DictWriter(f, fieldnames=fields)
     writer.writeheader()
-    writer.writerows({field: row.get(field, "") for field in fields} for row in summary)
+    writer.writerows(output_rows)
+with open(summary_tsv_path, "w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(output_rows)
 PY
 }
 
@@ -1772,6 +1778,7 @@ echo "GSP prefix benchmark finished"
 echo "Result directory : ${out_dir}"
 echo "Trials CSV       : ${trials_csv}"
 echo "Summary CSV      : ${summary_csv}"
+echo "Summary TSV      : ${summary_tsv}  (cat 后可直接复制到表格)"
 if (( plot_requested == 1 )); then
   echo "Plot             : ${out_dir}/gsp_prefix_matrix.png"
 fi
