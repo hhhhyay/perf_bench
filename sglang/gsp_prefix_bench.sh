@@ -36,8 +36,7 @@ GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
 GSP_SYSTEM_LEN_EXTRA_TOKENS="${GSP_SYSTEM_LEN_EXTRA_TOKENS:-0}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-NODE_NAME="${NODE_NAME:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'unknown')}"
-CONTAINER_NAME="${CONTAINER_NAME:-${HOSTNAME:-unknown}}"
+NODE_HOSTNAME="${NODE_HOSTNAME:-$(hostname 2>/dev/null || printf 'unknown')}"
 RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
 SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null || true)"
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
@@ -64,15 +63,15 @@ write_run_metadata() {
   "${PYTHON_BIN}" - "${metadata_path}" \
     "${RUN_STARTED_AT}" "${script_dir}/$(basename "${BASH_SOURCE[0]}")" \
     "${SCRIPT_COMMIT}" "${RUN_ID}" "${BASE_URL}" "${MODEL}" \
-    "${NODE_NAME}" "${CONTAINER_NAME}" "$(hostname 2>/dev/null || true)" \
+    "${NODE_HOSTNAME}" \
     "${out_dir}" "${GSP_PAGE_SIZE}" <<'PY_METADATA'
 import json
 import os
 import sys
 import tempfile
 
-(path, started_at, script, script_commit, run_id, base_url, model, node,
- container, container_hostname, output_dir, page_size) = sys.argv[1:]
+(path, started_at, script, script_commit, run_id, base_url, model,
+ node_hostname, output_dir, page_size) = sys.argv[1:]
 prefixes = ("GSP_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE",
             "EP_SIZE", "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC",
             "DP_ATTENTION", "SEED")
@@ -87,9 +86,7 @@ metadata = {
     "run_id": run_id,
     "base_url": base_url,
     "model": model,
-    "node": node,
-    "container": container,
-    "container_hostname": container_hostname,
+    "node_hostname": node_hostname,
     "output_dir": output_dir,
     "gsp_page_size": page_size,
     "environment": environment,
@@ -109,8 +106,7 @@ write_log_header() {
   {
     printf '# perf_bench run metadata: %s\n' "${out_dir}/run_metadata.json"
     printf '# model: %s\n' "${MODEL}"
-    printf '# node: %s\n' "${NODE_NAME}"
-    printf '# container: %s\n' "${CONTAINER_NAME}"
+    printf '# node_hostname: %s\n' "${NODE_HOSTNAME}"
     printf '# base_url: %s\n' "${BASE_URL}"
     printf '# run_id: %s\n' "${RUN_ID}"
     printf '# started_at: %s\n' "${RUN_STARTED_AT}"
