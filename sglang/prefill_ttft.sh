@@ -39,9 +39,12 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 PREFILL_TTFT_INPUTS="${PREFILL_TTFT_INPUTS:-32 64 128}"
 PREFILL_SLA_RULES="${PREFILL_SLA_RULES:-}"
+PREFILL_TTFT_METRIC="${PREFILL_TTFT_METRIC:-mean}"
 PREFILL_TTFT_TARGETS_S="${PREFILL_TTFT_TARGETS_S:-3 5 10}"
 PREFILL_TTFT_SEARCH_ITERS="${PREFILL_TTFT_SEARCH_ITERS:-7}"
 PREFILL_TTFT_RATE_STEP="${PREFILL_TTFT_RATE_STEP:-0.1}"
+PREFILL_TTFT_INF_MAX_TRIALS="${PREFILL_TTFT_INF_MAX_TRIALS:-5}"
+PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT="${PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT:-2}"
 PREFILL_TTFT_BS_RULES="${PREFILL_TTFT_BS_RULES:-8:256,16:128,32:64,64:32,128:16}"
 PREFILL_TTFT_TEST_MODE="${PREFILL_TTFT_TEST_MODE:-}"
 PLOT_REQUESTS=()
@@ -121,6 +124,25 @@ if ! awk -v value="${PREFILL_TTFT_RATE_STEP}" 'BEGIN {
   exit 1
 fi
 
+for value_name in PREFILL_TTFT_INF_MAX_TRIALS PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT; do
+  value="${!value_name}"
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] ${value_name} 必须是正整数，当前为: ${value}" >&2
+    exit 1
+  fi
+done
+
+case "${PREFILL_TTFT_METRIC}" in
+  mean|mean_ttft_ms) PREFILL_TTFT_METRIC="mean_ttft_ms" ;;
+  p90|p90_ttft_ms) PREFILL_TTFT_METRIC="p90_ttft_ms" ;;
+  p95|p95_ttft_ms) PREFILL_TTFT_METRIC="p95_ttft_ms" ;;
+  p99|p99_ttft_ms) PREFILL_TTFT_METRIC="p99_ttft_ms" ;;
+  *)
+    echo "[ERROR] PREFILL_TTFT_METRIC 仅支持 mean/p90/p95/p99，当前为: ${PREFILL_TTFT_METRIC}" >&2
+    exit 1
+    ;;
+esac
+
 prefill_sla_rules_text() {
   if [[ -n "${PREFILL_SLA_RULES}" ]]; then
     printf "%s\n" "${PREFILL_SLA_RULES}"
@@ -132,7 +154,7 @@ prefill_sla_rules_text() {
   local input_k target
   for input_k in ${input_list}; do
     for target in ${target_list//,/ }; do
-      printf "%s:mean_ttft_ms:%s:0," "${input_k}" "${target}"
+      printf "%s:%s:%s:0," "${input_k}" "${PREFILL_TTFT_METRIC}" "${target}"
     done
   done
   printf "\n"
@@ -670,6 +692,48 @@ print(v if v is not None else "")' "${target_metric}")"
   LAST_LOG_FILE="${log_file}"
 }
 
+run_inf_until_input_throughput_stable() {
+  local input_k="$1" input_len="$2" per_dp_bs="$3"
+  local trial=0 no_improvement=0 phase log_file input_throughput
+  local best_input_throughput="" best_log="" best_rps=""
+
+  while (( trial < PREFILL_TTFT_INF_MAX_TRIALS )); do
+    if (( trial == 0 )); then
+      phase="baseline"
+    else
+      phase="inf_throughput${trial}"
+    fi
+    run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "" "" "" "${trial}" "${phase}" "inf"
+    [[ "${LAST_CASE_STATUS}" == "PASS" ]] || return 1
+    log_file="${LAST_LOG_FILE}"
+    input_throughput="$(extract_metric "${log_file}" input_throughput 2>/dev/null || true)"
+    [[ -n "${input_throughput}" ]] || {
+      echo "[ERROR] input=${input_k}K 的 inf 缺少 input throughput，无法判断是否稳定" >&2
+      return 1
+    }
+    if [[ -z "${best_input_throughput}" ]] || awk -v current="${input_throughput}" -v best="${best_input_throughput}" 'BEGIN { exit !(current > best + 1e-9) }'; then
+      best_input_throughput="${input_throughput}"
+      best_log="${log_file}"
+      best_rps="${LAST_ACTUAL_RPS}"
+      no_improvement=0
+      echo "[INF] input=${input_k}K trial=$((trial + 1)) input_throughput=${input_throughput} (new best)"
+    else
+      ((no_improvement++))
+      echo "[INF] input=${input_k}K trial=$((trial + 1)) input_throughput=${input_throughput} best=${best_input_throughput} no_improvement=${no_improvement}/${PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT}"
+    fi
+    ((trial++))
+    if (( no_improvement >= PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT )); then
+      break
+    fi
+  done
+
+  [[ -n "${best_log}" ]] || return 1
+  LAST_INF_LOG="${best_log}"
+  LAST_LOG_FILE="${best_log}"
+  LAST_ACTUAL_RPS="${best_rps}"
+  echo "[INF] input=${input_k}K selected input_throughput=${best_input_throughput} log=${best_log}"
+}
+
 search_target() {
   local input_k="$1"
   local input_len="$2"
@@ -688,13 +752,6 @@ search_target() {
   local trial=0
   local probe_rate
   local target_met
-
-  if awk -v value="${baseline_value}" -v target="${target_value_ms}" 'BEGIN { exit !(value <= target) }' 2>/dev/null; then
-    csv_upsert_trial "${input_k}" "${input_len}" "${per_dp_bs}" "$((DP_SIZE * per_dp_bs))" \
-      "${target_metric}" "${target_value_ms}" "${target_near_ms}" "0" "baseline-target" "inf" "PASS" "${baseline_log}"
-    echo "[TARGET-PASS] input=${input_k}K ${target_metric}<=${target_value_ms}ms uses inf baseline actual_rps=${baseline_rps}"
-    return 0
-  fi
 
   while (( trial < PREFILL_TTFT_SEARCH_ITERS )); do
     trial=$((trial + 1))
@@ -723,14 +780,14 @@ search_target() {
       low_rps="${LAST_ACTUAL_RPS}"
       low_value="${LAST_TARGET_VALUE}"
       if [[ "${phase}" == "descending" ]]; then
-        echo "[BRACKET] input=${input_k}K ${target_metric}<=${target_value_ms}ms fail_rate=${high_rate} pass_rate=${low_rate}"
+        echo "[BRACKET] input=${input_k}K ${target_metric}<=${target_value_ms}ms upper_rate=${high_rate} pass_rate=${low_rate}"
       fi
     else
       high_rate="${probe_rate}"
       if [[ -n "${low_rate}" ]] && awk -v low="${low_rate}" -v high="${high_rate}" 'BEGIN { exit !(high > low) }' 2>/dev/null; then :; fi
     fi
 
-    if [[ -n "${low_rate}" ]] && awk -v low="${low_rate}" -v high="${high_rate}" -v step="${PREFILL_TTFT_RATE_STEP}" 'BEGIN { exit !((high - low) > step) }' 2>/dev/null; then
+    if [[ -n "${low_rate}" ]] && awk -v low="${low_rate}" -v high="${high_rate}" -v step="${PREFILL_TTFT_RATE_STEP}" 'BEGIN { exit !((high - low) <= step) }' 2>/dev/null; then
       break
     fi
 
@@ -790,12 +847,17 @@ targets = sorted({
 }, key=lambda x: (x[0], float(x[1]), float(x[2] or 0)))
 out = []
 for input_k in inputs:
-    baseline = next(
-        (row for row in rows
-         if row.get("input_k") == input_k
-         and row.get("target_metric", "") == ""
-         and row.get("case_status") == "PASS"),
-        None,
+    baseline_candidates = [
+        row for row in rows
+        if row.get("input_k") == input_k
+        and row.get("target_metric", "") == ""
+        and row.get("input_request_rate", "") == "inf"
+        and row.get("case_status") == "PASS"
+    ]
+    baseline = max(
+        baseline_candidates,
+        key=lambda row: num(row, "input_throughput") or float("-inf"),
+        default=None,
     )
     target_values = [t for t in targets if any(
         row.get("input_k") == input_k
@@ -864,7 +926,10 @@ run_input_matrix() {
   echo "PREFILL GLOBAL CONC : $((DP_SIZE * per_dp_bs))"
   echo "============================================================"
 
-  run_probe "${input_k}" "${input_len}" "${per_dp_bs}" "" "" "" "0" "baseline" "inf"
+  run_inf_until_input_throughput_stable "${input_k}" "${input_len}" "${per_dp_bs}" || {
+    echo "[ERROR] input=${input_k}K 的 inf 基准未能稳定测得 input throughput，跳过矩阵" >&2
+    return 1
+  }
   baseline_rps="${LAST_ACTUAL_RPS}"
   baseline_log="${LAST_LOG_FILE}"
   if [[ "${LAST_CASE_STATUS}" != "PASS" || -z "${baseline_rps}" ]]; then

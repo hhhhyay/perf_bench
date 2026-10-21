@@ -29,6 +29,8 @@ GSP_DURATION_TOLERANCE_PCT="${GSP_DURATION_TOLERANCE_PCT:-25}"
 GSP_STOP_ON_SLA="${GSP_STOP_ON_SLA:-1}"
 GSP_MAX_CONCURRENCY="${GSP_MAX_CONCURRENCY:-}"
 GSP_INPUT_IDS="${GSP_INPUT_IDS:-1}"
+GSP_INF_MAX_TRIALS="${GSP_INF_MAX_TRIALS:-5}"
+GSP_INF_NO_IMPROVEMENT_LIMIT="${GSP_INF_NO_IMPROVEMENT_LIMIT:-2}"
 GSP_PAGE_SIZE="${GSP_PAGE_SIZE:-}"
 GSP_PAGE_ALIGN="${GSP_PAGE_ALIGN:-1}"
 GSP_SYSTEM_LEN_EXTRA_TOKENS="${GSP_SYSTEM_LEN_EXTRA_TOKENS:-0}"
@@ -92,6 +94,8 @@ Environment:
   GSP_STOP_ON_SLA=1              Stop descending backtests after all TTFT targets meet
   GSP_MAX_CONCURRENCY=            Optional global max concurrency
   GSP_INPUT_IDS=1                 Pass raw token IDs with official --gsp-input-ids
+  GSP_INF_MAX_TRIALS=5            Maximum repeated inf probes before finite-rate backtests
+  GSP_INF_NO_IMPROVEMENT_LIMIT=2 Stop inf probes after this many non-improving input-throughput trials
   GSP_PAGE_SIZE=                  KV cache page size; auto-read from /server_info, fallback 64
   GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
   GSP_SYSTEM_LEN_EXTRA_TOKENS=0   Optional page-aligned cache-report calibration tokens
@@ -155,6 +159,14 @@ case "${plot_cell}" in
   input_throughput|input_tp) plot_cell="input_throughput" ;;
   *) echo "[ERROR] --cell 仅支持 rps|input_throughput" >&2; exit 1 ;;
 esac
+
+for value_name in GSP_INF_MAX_TRIALS GSP_INF_NO_IMPROVEMENT_LIMIT; do
+  value="${!value_name}"
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] ${value_name} 必须是正整数，当前为: ${value}" >&2
+    exit 1
+  fi
+done
 
 if (( ${#CASES[@]} == 0 )); then
   CASES+=(
@@ -931,6 +943,20 @@ print(f"{value:.2f}")
 '
 }
 
+read_input_throughput() {
+  local log_file="$1"
+  parse_benchmark_log "${log_file}" | "${PYTHON_BIN}" -c '
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    value=float(data["input_throughput"])
+    if value <= 0: raise ValueError
+except Exception:
+    raise SystemExit(1)
+print(f"{value:.6f}")
+'
+}
+
 read_benchmark_duration() {
   local log_file="$1"
   parse_benchmark_log "${log_file}" | "${PYTHON_BIN}" -c '
@@ -1037,27 +1063,63 @@ PY
 }
 
 run_inf_with_auto_calibration() {
-  local base_phase="$1" attempt=0 trial_phase log_file measured
+  local base_phase="$1" attempt trial_phase log_file measured
+  local inf_trial=0 no_improvement=0 input_throughput best_input_throughput=""
+  local best_log=""
   LAST_INF_LOG=""
-  while :; do
-    if (( attempt == 0 )); then
+  while (( inf_trial < GSP_INF_MAX_TRIALS )); do
+    attempt=0
+    if (( inf_trial == 0 )); then
       trial_phase="${base_phase}"
     else
-      trial_phase="${base_phase}_calibration${attempt}"
+      trial_phase="${base_phase}_throughput${inf_trial}"
     fi
-    run_trial inf "${trial_phase}"
-    log_file="$(trial_log_path inf "${trial_phase}")"
-    LAST_INF_LOG="${log_file}"
-    if [[ -s "${log_file}" ]] && baseline_hit_rate_passes "${log_file}"; then
-      return 0
+    while :; do
+      if (( attempt == 0 )); then
+        run_trial inf "${trial_phase}"
+      else
+        run_trial inf "${trial_phase}_calibration${attempt}"
+      fi
+      if (( attempt == 0 )); then
+        log_file="$(trial_log_path inf "${trial_phase}")"
+      else
+        log_file="$(trial_log_path inf "${trial_phase}_calibration${attempt}")"
+      fi
+      LAST_INF_LOG="${log_file}"
+      if [[ -s "${log_file}" ]] && baseline_hit_rate_passes "${log_file}"; then
+        break
+      fi
+      (( GSP_AUTO_CALIBRATE == 1 && attempt < GSP_CALIBRATION_MAX_ITERS )) || return 1
+      measured="$(read_actual_hit_rate "${log_file}" 2>/dev/null || true)"
+      [[ -n "${measured}" ]] || return 1
+      adjust_case_prompt_config_from_hit "${measured}" || return 1
+      ((attempt++))
+      print_case
+    done
+
+    input_throughput="$(read_input_throughput "${log_file}" 2>/dev/null || true)"
+    [[ -n "${input_throughput}" ]] || {
+      echo "[ERROR] inf 缺少 input throughput，无法判断是否稳定: ${log_file}" >&2
+      return 1
+    }
+    if [[ -z "${best_input_throughput}" ]] || awk -v current="${input_throughput}" -v best="${best_input_throughput}" 'BEGIN { exit !(current > best + 1e-9) }'; then
+      best_input_throughput="${input_throughput}"
+      best_log="${log_file}"
+      no_improvement=0
+      echo "[INF] ${base_phase} trial=$((inf_trial + 1)) input_throughput=${input_throughput} (new best)"
+    else
+      ((no_improvement++))
+      echo "[INF] ${base_phase} trial=$((inf_trial + 1)) input_throughput=${input_throughput} best=${best_input_throughput} no_improvement=${no_improvement}/${GSP_INF_NO_IMPROVEMENT_LIMIT}"
     fi
-    (( GSP_AUTO_CALIBRATE == 1 && attempt < GSP_CALIBRATION_MAX_ITERS )) || return 1
-    measured="$(read_actual_hit_rate "${log_file}" 2>/dev/null || true)"
-    [[ -n "${measured}" ]] || return 1
-    adjust_case_prompt_config_from_hit "${measured}" || return 1
-    ((attempt++))
-    print_case
+    ((inf_trial++))
+    if (( no_improvement >= GSP_INF_NO_IMPROVEMENT_LIMIT )); then
+      break
+    fi
   done
+  [[ -n "${best_log}" ]] || return 1
+  LAST_INF_LOG="${best_log}"
+  echo "[INF] ${base_phase} selected input_throughput=${best_input_throughput} log=${best_log}"
+  return 0
 }
 
 resize_case_for_duration() {
@@ -1293,9 +1355,11 @@ for case_id, case_rows in case_groups.items():
     ]
     if not baseline_rows:
         continue
-    # The last passing inf row is the accepted layout after calibration and,
-    # when enabled, after the dynamic-duration resize.
-    baseline = baseline_rows[-1]
+    # Keep the latest layout after calibration/duration adjustment, then choose
+    # the highest-throughput inf trial within that layout.
+    latest_layout = baseline_rows[-1]
+    layout_rows = [row for row in baseline_rows if same_parameters(row, latest_layout)]
+    baseline = max(layout_rows, key=lambda row: (num(row, "input_throughput") or float("-inf")))
     finite_rows = [
         row for row in case_rows
         if row.get("search_phase", "") == "descending"

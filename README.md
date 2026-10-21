@@ -33,6 +33,7 @@ perf_bench/
 - 输出长度固定为 1 token，不再配置输出长度。
 - 不设置 `--max-concurrency`，让 Prefill 测试按请求率自然形成并发；`DP_SIZE × per-DP BS` 只用于计算请求数量和记录 BS。
 - 默认测试输入 `32K/64K/128K`，按 `PREFILL_TTFT_BS_RULES` 自动选择一个 per-DP BS，不扫描全部 BS。
+- 每个输入先重复执行 `inf`，直到输入吞吐连续不提升，再选择最高输入吞吐作为基线并开始有限请求率回测；默认最多 5 次 inf、连续 2 次不提升即停止，可用 `PREFILL_TTFT_INF_MAX_TRIALS` 和 `PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT` 调整。
 - 对每个输入先跑 `request_rate=inf`，再从高请求率向下寻找满足每条 SLA 规则的临界值。
 - 试探请求率统一保留两位小数；二分搜索区间默认缩小到 `0.1 req/s` 后停止，避免用过小步长制造没有实际意义的伪精度。
 - SLA 规则按输入长度绑定，格式为 `input_k:metric:target_seconds:near_seconds`；target 和 near 使用秒，可填写小数。
@@ -77,6 +78,7 @@ question_len = L - system_prompt_len
 
 默认开启自动命中率校准：每个 `inf` 候选先执行一次短 probe；如果实测命中率不满足，
 脚本按 `目标命中率 / 实测命中率` 修正共享前缀长度，并按 page size 对齐，最多再修正两轮；
+命中率确认后，GSP 会重复执行 `inf`，以客户端 `input_throughput` 最高值作为基线；默认最多 5 次，连续 2 次不再提升就进入有限请求率回测。
 仍不达标时自动切换 `prompts/group` 和 `groups` 候选布局。校准 trial 会保留在
 `gsp_prefix_trials.csv`，用于保留命中率修正前后的完整试探过程；确认参数后，最终的 `inf` 和有限请求率结果会单独整理到
 `gsp_prefix_summary.csv`。布局切换只改变请求组织方式，
@@ -248,6 +250,16 @@ PREFILL_TTFT_BS_RULES="8:256,16:128,32:64,64:32,128:16" \
 bash sglang/prefill_ttft.sh
 ```
 
+如果所有输入使用同一个 TTFT 指标和目标秒数，可以使用更简洁的写法；`PREFILL_TTFT_METRIC` 支持 `mean`、`p90`、`p95`、`p99`：
+
+```bash
+BASE_URL=http://127.0.0.1:30000 \
+PREFILL_TTFT_INPUTS="4 64 128" \
+PREFILL_TTFT_METRIC="p90" \
+PREFILL_TTFT_TARGETS_S="3 4 5 6" \
+bash sglang/prefill_ttft.sh
+```
+
 例如 8K/BS64 要求 P99 TTFT 小于 5 秒和 6 秒，32K/BS16 要求 Mean TTFT 小于 4 秒和 5 秒：
 
 ```bash
@@ -333,6 +345,8 @@ bash vllm/vllmc.sh
 | `GSP_HIT_RATE_TOLERANCE_PCT` | page 对齐和兼容逻辑使用的命中率容差，默认 `0.5` 个百分点。 |
 | `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` | `inf` baseline 的严格实测命中率容差，默认 `0.5` 个百分点。 |
 | `GSP_FINITE_HIT_RATE_TOLERANCE_PCT` | 有限请求率回测的命中率容差，默认 `1.5` 个百分点，用于覆盖无并发上限时的冷 miss 漂移。 |
+| `GSP_INF_MAX_TRIALS` | 命中率确认后重复 `inf` 的最大次数，默认 `5`。 |
+| `GSP_INF_NO_IMPROVEMENT_LIMIT` | `input_throughput` 连续不提升的停止次数，默认 `2`。 |
 | `GSP_REQUEST_RATES` | 可选的逗号分隔请求率列表；不设置时按 `inf` 实测 RPS 从高到低回测。 |
 | `GSP_RATE_OFFSETS` | 从 `inf` 实测 RPS 累减的偏移序列，默认 `0,-0.1,-0.1,-0.1,-0.2,-0.2,-0.3,-0.5`；按高到低回测。 |
 | `GSP_RATE_STEP` | 请求率最小间隔，默认 `0.1 req/s`，不能设置小于 `0.1`；显式请求率或偏移序列也必须按高到低且满足该间隔。 |
@@ -342,6 +356,8 @@ bash vllm/vllmc.sh
 | `PREFILL_TTFT_TARGETS_S` | 未显式设置 `PREFILL_SLA_RULES` 时使用的默认目标秒数，默认 `3 5 10`。 |
 | `PREFILL_TTFT_SEARCH_ITERS` | 每个 TTFT 目标最多搜索次数，默认 `7`。 |
 | `PREFILL_TTFT_RATE_STEP` | 请求率搜索的最小区间，默认 `0.1 req/s`；不允许设置小于 `0.1`。有限请求率传给 benchmark 并写入 CSV 时保留两位小数。 |
+| `PREFILL_TTFT_INF_MAX_TRIALS` | 每个输入重复 `inf` 的最大次数，默认 `5`；选择输入吞吐最高的一次作为回测基线。 |
+| `PREFILL_TTFT_INF_NO_IMPROVEMENT_LIMIT` | `input_throughput` 连续不提升的停止次数，默认 `2`。 |
 | `PREFILL_TTFT_BS_RULES` | 输入上限 K 到 per-DP BS 的规则，默认 `8:256,16:128,32:64,64:32,128:16`。 |
 | `--plot mean` / `--plot p99` / `--plot sla` | 可选作图入口，生成统一指标或按 case SLA 的容量矩阵；也支持 `--plot line` 和 `--plot heatmap`。可重复指定多个模式。 |
 | `--cell` | 容量矩阵格子中央的数值，支持 `rps`、`input_throughput`（简写 `input_tp`）；默认 `rps`。列固定为输入 token/BS。 |
