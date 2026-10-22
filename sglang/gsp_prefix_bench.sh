@@ -1036,6 +1036,7 @@ run_trial() {
     echo "[SKIP] ${CASE_ID} request_rate=${request_rate}"
     metrics_json="$(parse_benchmark_log "${log_file}")"
     append_trial_row "${request_rate}" "${phase}" "${log_file}" 0 "${metrics_json}"
+    refresh_summary_checkpoint
     return 0
   fi
 
@@ -1057,6 +1058,7 @@ run_trial() {
   printf '%s\n' "${exit_code}" > "${exit_file}"
   metrics_json="$(parse_benchmark_log "${log_file}")"
   append_trial_row "${request_rate}" "${phase}" "${log_file}" "${exit_code}" "${metrics_json}"
+  refresh_summary_checkpoint
   return 0
 }
 
@@ -1462,6 +1464,21 @@ with open(summary_tsv_path, "w", newline="", encoding="utf-8-sig") as f:
     writer.writerows(clipboard_rows)
 PY
 }
+
+refresh_summary_checkpoint() {
+  [[ -s "${trials_csv}" ]] || return 0
+  write_summary || echo "[WARN] 无法刷新 summary checkpoint: ${summary_csv}" >&2
+}
+
+handle_benchmark_signal() {
+  local exit_code="$1"
+  refresh_summary_checkpoint
+  trap - INT TERM
+  exit "${exit_code}"
+}
+
+trap 'handle_benchmark_signal 130' INT
+trap 'handle_benchmark_signal 143' TERM
 
 prune_confirmed_trials() {
   "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" <<'PY'
