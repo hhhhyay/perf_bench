@@ -51,7 +51,7 @@ out_dir="./all_result/bench_gsp_prefix_${RUN_ID}"
 log_dir="${out_dir}/logs"
 trials_csv="${out_dir}/gsp_prefix_trials.csv"
 summary_tsv="${out_dir}/gsp_prefix_summary.tsv"
-plot_requested=0
+plot_requested="${GSP_PLOT:-1}"
 plot_cell="rps"
 dry_run=0
 run_failure=0
@@ -124,7 +124,8 @@ Usage:
 Options:
   --case CASE       Repeatable case:
                     INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S[,TPOT_METRIC,TPOT_TARGET_MS[,MAX_CONCURRENCY]]
-  --plot            Generate a heatmap after CSV summary is written
+  --plot            Generate a heatmap after CSV summary is written (default)
+  --no-plot         Disable the default heatmap generation
   --cell CELL       Heatmap cell: rps|input_throughput (alias: input_tp)
   --dry-run         Validate and print official commands without calling the server
   -h, --help        Show this help
@@ -162,6 +163,7 @@ Environment:
   GSP_PAGE_ALIGN=1                Align shared prefix to a whole KV page; set 0 to disable
   GSP_SYSTEM_LEN_EXTRA_TOKENS=0   Optional page-aligned cache-report calibration tokens
   GSP_REQUEST_RATES=              Optional comma-separated finite rate list
+  GSP_PLOT=1                      Generate the Prefill/GSP heatmap by default; set 0 to disable
   GSP_RATE_STEP=0.1               Uniform descending finite-rate step; minimum 0.1
   GSP_HIT_RATE_TOLERANCE_PCT=0.5  Workload/page-alignment tolerance fallback
   GSP_BASELINE_HIT_RATE_TOLERANCE_PCT=0.5  Strict inf hit-rate tolerance
@@ -191,6 +193,10 @@ while (( $# > 0 )); do
       ;;
     --plot)
       plot_requested=1
+      shift
+      ;;
+    --no-plot)
+      plot_requested=0
       shift
       ;;
     --cell)
@@ -223,6 +229,11 @@ case "${plot_cell}" in
   input_throughput|input_tp) plot_cell="input_throughput" ;;
   *) echo "[ERROR] --cell 仅支持 rps|input_throughput" >&2; exit 1 ;;
 esac
+
+if [[ "${plot_requested}" != "0" && "${plot_requested}" != "1" ]]; then
+  echo "[ERROR] GSP_PLOT/plot_requested 必须是 0 或 1，当前为: ${plot_requested}" >&2
+  exit 1
+fi
 
 for value_name in GSP_INF_MAX_TRIALS GSP_INF_NO_IMPROVEMENT_LIMIT; do
   value="${!value_name}"
@@ -813,109 +824,8 @@ check_bench_flags() {
 }
 
 parse_benchmark_log() {
-  local log_file="$1"
-  "${PYTHON_BIN}" - "${log_file}" <<'PY'
-import json
-import math
-import re
-import sys
-
-path = sys.argv[1]
-aliases = {
-    "Backend": "backend",
-    "Traffic request rate": "traffic_request_rate",
-    "Max request concurrency": "max_request_concurrency",
-    "Max concurrent requests": "max_request_concurrency",
-    "Request throughput (req/s)": "request_throughput",
-    "Input token throughput (tok/s)": "input_throughput",
-    "Output token throughput (tok/s)": "output_throughput",
-    "Peak output token throughput (tok/s)": "peak_output_throughput",
-    "Total token throughput (tok/s)": "total_throughput",
-    "Peak concurrency": "peak_concurrency",
-    "Peak concurrent requests": "peak_concurrency",
-    "Concurrency": "concurrency",
-    "Accept length": "accept_length",
-    "Mean E2E Latency (ms)": "mean_e2e_latency_ms",
-    "Median E2E Latency (ms)": "p50_e2e_latency_ms",
-    "P50 E2E Latency (ms)": "p50_e2e_latency_ms",
-    "P75 E2E Latency (ms)": "p75_e2e_latency_ms",
-    "P90 E2E Latency (ms)": "p90_e2e_latency_ms",
-    "P95 E2E Latency (ms)": "p95_e2e_latency_ms",
-    "P99 E2E Latency (ms)": "p99_e2e_latency_ms",
-    "P999 E2E Latency (ms)": "p999_e2e_latency_ms",
-    "Max E2E Latency (ms)": "max_e2e_latency_ms",
-    "Mean TTFT (ms)": "mean_ttft_ms",
-    "Median TTFT (ms)": "p50_ttft_ms",
-    "P50 TTFT (ms)": "p50_ttft_ms",
-    "P75 TTFT (ms)": "p75_ttft_ms",
-    "P90 TTFT (ms)": "p90_ttft_ms",
-    "P95 TTFT (ms)": "p95_ttft_ms",
-    "P99 TTFT (ms)": "p99_ttft_ms",
-    "P999 TTFT (ms)": "p999_ttft_ms",
-    "Max TTFT (ms)": "max_ttft_ms",
-    "Mean TPOT (ms)": "mean_tpot_ms",
-    "Median TPOT (ms)": "p50_tpot_ms",
-    "P50 TPOT (ms)": "p50_tpot_ms",
-    "P75 TPOT (ms)": "p75_tpot_ms",
-    "P90 TPOT (ms)": "p90_tpot_ms",
-    "P95 TPOT (ms)": "p95_tpot_ms",
-    "P99 TPOT (ms)": "p99_tpot_ms",
-    "P999 TPOT (ms)": "p999_tpot_ms",
-    "Max TPOT (ms)": "max_tpot_ms",
-    "Mean ITL (ms)": "mean_itl_ms",
-    "Median ITL (ms)": "p50_itl_ms",
-    "P50 ITL (ms)": "p50_itl_ms",
-    "P75 ITL (ms)": "p75_itl_ms",
-    "P90 ITL (ms)": "p90_itl_ms",
-    "P95 ITL (ms)": "p95_itl_ms",
-    "P99 ITL (ms)": "p99_itl_ms",
-    "P999 ITL (ms)": "p999_itl_ms",
-    "Max ITL (ms)": "max_itl_ms",
-    "Total prompt tokens": "total_prompt_tokens",
-    "Total cached tokens": "total_cached_tokens",
-    "Total input tokens": "total_input_tokens",
-    "Total input text tokens": "total_input_text_tokens",
-    "Total generated tokens": "total_generated_tokens",
-    "Total generated tokens (retokenized)": "total_generated_tokens_retokenized",
-    "Cache hit rate": "cache_hit_rate_pct",
-    "Successful requests": "successful_requests",
-    "Benchmark duration (s)": "benchmark_duration_s",
+  "${PYTHON_BIN}" "${script_dir}/gsp_prefix_metrics.py" parse-log "$1"
 }
-
-number = re.compile(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?%?$")
-
-def convert(value):
-    value = value.strip()
-    if value.endswith("%"):
-        value = value[:-1].strip()
-    if number.fullmatch(value):
-        parsed = float(value)
-        if math.isfinite(parsed):
-            return int(parsed) if parsed.is_integer() else parsed
-    return value
-
-values = {}
-try:
-    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
-except OSError:
-    print("{}")
-    raise SystemExit(0)
-for line in lines:
-    if ":" not in line:
-        continue
-    label, raw = line.split(":", 1)
-    label = label.strip()
-    if label in aliases:
-        values[aliases[label]] = convert(raw)
-if "cache_hit_rate_pct" not in values:
-    prompt = values.get("total_prompt_tokens")
-    cached = values.get("total_cached_tokens")
-    if isinstance(prompt, (int, float)) and isinstance(cached, (int, float)) and prompt > 0:
-        values["cache_hit_rate_pct"] = 100.0 * cached / prompt
-print(json.dumps(values, ensure_ascii=False, separators=(",", ":")))
-PY
-}
-
 build_bench_command() {
   local request_rate="$1"
   cmd=(
@@ -974,91 +884,15 @@ trial_log_path() {
 append_trial_row() {
   local request_rate="$1" phase="$2" log_file="$3" exit_code="$4" metrics_json="$5"
   mkdir -p "${out_dir}"
-  "${PYTHON_BIN}" - "${trials_csv}" "${CASE_ID}" "${CASE_INPUT_RAW}" "${CASE_OUTPUT_RAW}" \
+  "${PYTHON_BIN}" "${script_dir}/gsp_prefix_metrics.py" append-trial \
+    "${trials_csv}" "${CASE_ID}" "${CASE_INPUT_RAW}" "${CASE_OUTPUT_RAW}" \
     "${CASE_HIT_PCT}" "${CASE_SYSTEM_LEN}" "${CASE_QUESTION_LEN}" "${CASE_THEORY_HIT_PCT}" \
     "${CASE_REQUESTED_THEORY_HIT_PCT}" \
     "${GSP_PAGE_SIZE}" "${PARALLEL_CONFIG}" "${GSP_PAGE_ALIGN}" \
     "${GSP_NUM_GROUPS}" "${GSP_PROMPTS_PER_GROUP}" "${CASE_NUM_PROMPTS}" "${CASE_TTFT_METRIC}" \
     "${CASE_TTFT_TARGETS}" "${CASE_TPOT_METRIC}" "${CASE_TPOT_TARGET_MS}" "${request_rate}" \
-    "${phase}" "${CASE_CONCURRENCY:-}" "${log_file}" "${exit_code}" "${metrics_json}" <<'PY'
-import csv
-import json
-import os
-import sys
-
-(path, case_id, input_raw, output_raw, target_hit, system_len, question_len,
- theory_hit, requested_theory_hit, page_size, parallel_config, page_aligned, groups, prompts_per_group, num_prompts, ttft_metric, ttft_targets,
- tpot_metric, tpot_target, request_rate, phase, max_concurrency, log_file,
- exit_code, metrics_raw) = sys.argv[1:]
-try:
-    metrics = json.loads(metrics_raw)
-except json.JSONDecodeError:
-    metrics = {}
-fields = [
-    "case_id", "input", "output", "specified_cache_hit_rate_pct", "system_prompt_len",
-    "question_len", "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
-    "gsp_page_size", "parallel_config", "page_aligned",
-    "gsp_num_groups",
-    "gsp_prompts_per_group", "num_prompts", "ttft_metric", "ttft_targets_s",
-    "tpot_metric", "tpot_target_ms", "configured_request_rate", "search_phase",
-    "exit_code", "actual_rps", "backend", "traffic_request_rate", "max_request_concurrency",
-    "successful_requests", "benchmark_duration_s", "total_input_tokens",
-    "total_input_text_tokens", "total_generated_tokens", "total_generated_tokens_retokenized",
-    "request_throughput", "input_throughput", "output_throughput", "total_throughput",
-    "peak_output_throughput", "peak_concurrency", "max_concurrency", "concurrency",
-    "mean_ttft_ms", "p50_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p95_ttft_ms",
-    "p99_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "mean_tpot_ms", "p50_tpot_ms",
-    "p75_tpot_ms", "p90_tpot_ms", "p95_tpot_ms", "p99_tpot_ms", "p999_tpot_ms",
-    "max_tpot_ms", "mean_itl_ms", "p50_itl_ms", "p75_itl_ms", "p90_itl_ms",
-    "p95_itl_ms", "p99_itl_ms", "p999_itl_ms", "max_itl_ms", "accept_length",
-    "mean_e2e_latency_ms", "p50_e2e_latency_ms", "p75_e2e_latency_ms", "p90_e2e_latency_ms",
-    "p95_e2e_latency_ms", "p99_e2e_latency_ms", "p999_e2e_latency_ms", "max_e2e_latency_ms",
-    "actual_cache_hit_rate_pct", "total_prompt_tokens",
-    "total_cached_tokens",
-    "duration_s", "log_file",
-]
-row = {key: "" for key in fields}
-row.update({
-    "case_id": case_id, "input": input_raw, "output": output_raw,
-    "specified_cache_hit_rate_pct": target_hit, "system_prompt_len": system_len,
-    "question_len": question_len, "theoretical_cache_hit_rate_pct": theory_hit,
-    "requested_theoretical_cache_hit_rate_pct": requested_theory_hit,
-    "gsp_page_size": page_size, "parallel_config": parallel_config, "page_aligned": page_aligned,
-    "gsp_num_groups": groups, "gsp_prompts_per_group": prompts_per_group,
-    "num_prompts": num_prompts, "ttft_metric": ttft_metric,
-    "ttft_targets_s": ttft_targets, "tpot_metric": tpot_metric,
-    "tpot_target_ms": tpot_target, "configured_request_rate": request_rate,
-    "search_phase": phase, "max_concurrency": max_concurrency,
-    "exit_code": exit_code, "log_file": log_file,
-})
-row.update({k: v for k, v in metrics.items() if k in fields})
-row["actual_rps"] = metrics.get("request_throughput", "")
-row["request_throughput"] = metrics.get("request_throughput", "")
-row["actual_cache_hit_rate_pct"] = metrics.get("cache_hit_rate_pct", "")
-
-rows = []
-if os.path.exists(path):
-    try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.DictReader(f))
-    except (OSError, csv.Error):
-        rows = []
-# Keep every GSP layout: the same case/groups/rate can be tested with
-# different prompts-per-group candidates during inf calibration.
-key = (case_id, request_rate, phase, groups, prompts_per_group, system_len, question_len)
-rows = [r for r in rows if (
-    r.get("case_id", ""), r.get("configured_request_rate", ""), r.get("search_phase", ""),
-    r.get("gsp_num_groups", ""),
-    r.get("gsp_prompts_per_group", ""), r.get("system_prompt_len", ""), r.get("question_len", "")
-) != key]
-rows.append(row)
-with open(path, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.DictWriter(f, fieldnames=fields)
-    writer.writeheader()
-    writer.writerows(rows)
-PY
+    "${phase}" "${CASE_CONCURRENCY:-}" "${log_file}" "${exit_code}" "${metrics_json}"
 }
-
 run_trial() {
   local request_rate="$1" phase="$2"
   local log_file exit_file exit_code metrics_json
@@ -1333,233 +1167,10 @@ finite_rate_candidates() {
 }
 
 write_summary() {
-  "${PYTHON_BIN}" - "${trials_csv}" "${summary_tsv}" \
-    "${BASELINE_HIT_RATE_TOLERANCE}" "${TOKEN_UNIT}" <<'PY'
-import csv
-import json
-import math
-import os
-import sys
-
-trials_path, summary_tsv_path, baseline_tolerance_s, token_unit_s = sys.argv[1:]
-baseline_tolerance = float(baseline_tolerance_s)
-token_unit = int(token_unit_s)
-rows = []
-if os.path.exists(trials_path):
-    with open(trials_path, newline="", encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
-
-def num(row, key):
-    try:
-        value = float(row.get(key, ""))
-        return value if math.isfinite(value) else None
-    except (TypeError, ValueError):
-        return None
-
-def token_value(raw):
-    """Convert the case's token notation using the shared TOKEN_UNIT."""
-    text = str(raw or "").strip().lower()
-    if not text:
-        return None
-    multiplier = token_unit if text.endswith("k") else 1
-    if multiplier != 1:
-        text = text[:-1]
-    try:
-        value = float(text) * multiplier
-        return int(value) if value.is_integer() else value
-    except ValueError:
-        return None
-
-def csv_number(value):
-    if value is None:
-        return ""
-    return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
-
-def same_parameters(row, baseline):
-    keys = ("gsp_num_groups", "gsp_prompts_per_group", "system_prompt_len", "question_len")
-    return all(row.get(key, "") == baseline.get(key, "") for key in keys)
-
-source_fields = list(rows[0].keys()) if rows else []
-metadata_fields = [
-    "result_type", "parameter_status", "confirmed_inf_actual_rps",
-    "confirmed_inf_cache_hit_rate_pct", "confirmed_inf_phase", "request_rate_order",
-    "actual_cache_hit_rate_delta_pct",
-]
-preferred_fields = [
-    # Keep the common prefix identical to sglc.sh so the two summaries can be
-    # pasted into the same table without moving the standard metrics.
-    "case_name", "input_len", "output_len",
-    "parallel_config",
-    # These fields define the GSP workload and must stay visible before the
-    # performance columns; without them the cache metrics are not interpretable.
-    "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
-    "system_prompt_len", "question_len", "gsp_page_size", "gsp_num_groups",
-    "gsp_prompts_per_group", "total_prompt_tokens", "total_cached_tokens",
-    "max_running_requests", "max_total_tokens",
-    "tokens_per_request", "token_theoretical_per_dp_bs",
-    "effective_theoretical_per_dp_bs", "per_dp_bs", "num_prompts",
-    "max_concurrency", "concurrency", "peak_output_throughput", "peak_concurrency",
-    "request_rate", "duration_s", "rps", "input_throughput_tok_s",
-    "generate_throughput_tok_s", "total_throughput_tok_s",
-    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
-    "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
-    "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
-    "accept_length", "mean_e2e_latency_ms",
-    "total_input_tokens", "total_input_text_tokens", "total_generated_tokens",
-    "total_generated_tokens_retokenized",
-    "std_e2e_latency_ms", "p75_e2e_latency_ms", "p90_e2e_latency_ms",
-    "p999_e2e_latency_ms", "max_e2e_latency_ms", "std_ttft_ms", "p75_ttft_ms",
-    "p90_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "std_tpot_ms", "p75_tpot_ms",
-    "p90_tpot_ms", "p999_tpot_ms", "max_tpot_ms", "std_itl_ms", "p75_itl_ms",
-    "p90_itl_ms", "p999_itl_ms", "max_itl_ms",
-    # P50 is retained as a GSP-specific extra after the shared columns.
-    "p50_ttft_ms", "p50_tpot_ms", "p50_itl_ms",
-]
-excluded_fields = {
-    "result_type", "parameter_status", "confirmed_inf_phase", "request_rate_order",
-    "actual_cache_hit_rate_delta_pct", "exit_code", "actual_rps", "traffic_request_rate",
-    "page_aligned", "confirmed_inf_actual_rps", "search_phase", "log_file", "backend",
-    "max_request_concurrency", "ttft_metric", "ttft_targets_s", "tpot_metric", "tpot_target_ms",
-    "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
-    "confirmed_inf_cache_hit_rate_pct", "configured_request_rate", "benchmark_duration_s",
-    "case_id", "input", "output", "successful_requests", "request_throughput",
-    "input_throughput", "output_throughput", "total_throughput", "max_tpot_ms",
-    "p50_e2e_latency_ms", "p95_e2e_latency_ms", "p99_e2e_latency_ms",
-    "case_status", "case_exit_code", "benchmark_result_found",
+  "${PYTHON_BIN}" "${script_dir}/gsp_prefix_summary.py" summary \
+    "${trials_csv}" "${summary_tsv}" \
+    "${BASELINE_HIT_RATE_TOLERANCE}" "${TOKEN_UNIT}"
 }
-fields = preferred_fields + [
-    field for field in source_fields
-    if field not in preferred_fields and field not in metadata_fields and field not in excluded_fields
-]
-
-summary = []
-case_groups = {}
-for row in rows:
-    case_groups.setdefault(row.get("case_id", ""), []).append(row)
-
-for case_id, case_rows in case_groups.items():
-    baseline_rows = [
-        row for row in case_rows
-        if row.get("configured_request_rate", "") == "inf"
-        and row.get("exit_code", "") == "0"
-        and num(row, "actual_cache_hit_rate_pct") is not None
-        and num(row, "specified_cache_hit_rate_pct") is not None
-        and abs(num(row, "actual_cache_hit_rate_pct") - num(row, "specified_cache_hit_rate_pct")) <= baseline_tolerance
-    ]
-    if not baseline_rows:
-        continue
-    # Keep the latest layout after calibration/duration adjustment, then choose
-    # the highest-throughput inf trial within that layout.
-    latest_layout = baseline_rows[-1]
-    layout_rows = [row for row in baseline_rows if same_parameters(row, latest_layout)]
-    baseline = max(layout_rows, key=lambda row: (num(row, "input_throughput") or float("-inf")))
-    finite_rows = [
-        row for row in case_rows
-        if row.get("search_phase", "") == "descending"
-        and row.get("configured_request_rate", "") != "inf"
-        and same_parameters(row, baseline)
-    ]
-    inf_rps = num(baseline, "request_throughput")
-    inf_hit = num(baseline, "actual_cache_hit_rate_pct")
-    metric = baseline.get("ttft_metric", "")
-    if metric == "mean_ttft_ms":
-        ttft_key = "mean"
-    elif metric.startswith("p") and metric.endswith("_ttft_ms"):
-        ttft_key = "P" + metric[1:-len("_ttft_ms")]
-    else:
-        ttft_key = metric
-    slo_values = []
-    for target_s in baseline.get("ttft_targets_s", "").split("|"):
-        if not target_s:
-            continue
-        try:
-            target_seconds = float(target_s)
-        except ValueError:
-            continue
-        slo_values.append(int(target_seconds) if target_seconds.is_integer() else target_seconds)
-    slo_payload = {"ttft": {ttft_key: slo_values}} if ttft_key and slo_values else {}
-    if baseline.get("tpot_metric") and baseline.get("tpot_target_ms"):
-        try:
-            tpot_target = float(baseline["tpot_target_ms"])
-            tpot_metric = baseline["tpot_metric"]
-            if tpot_metric == "mean_tpot_ms":
-                tpot_key = "mean"
-            elif tpot_metric.startswith("p") and tpot_metric.endswith("_tpot_ms"):
-                tpot_key = "P" + tpot_metric[1:-len("_tpot_ms")]
-            else:
-                tpot_key = tpot_metric
-            slo_payload.setdefault("tpot", {})[tpot_key] = [
-                int(tpot_target) if tpot_target.is_integer() else tpot_target
-            ]
-        except ValueError:
-            pass
-    slo_json = json.dumps(slo_payload, ensure_ascii=False, separators=(",", ":"))
-    final_rows = [(baseline, "inf")] + [(row, "finite") for row in finite_rows]
-    final_rows.sort(key=lambda item: (
-        0 if item[1] == "inf" else 1,
-        -(num(item[0], "configured_request_rate") or float("-inf"))
-    ))
-    for order, (row, result_type) in enumerate(final_rows, start=1):
-        output = dict(row)
-        target_hit = num(row, "specified_cache_hit_rate_pct")
-        actual_hit = num(row, "actual_cache_hit_rate_pct")
-        input_len = num(row, "system_prompt_len")
-        question_len = num(row, "question_len")
-        if input_len is not None and question_len is not None:
-            input_len += question_len
-        else:
-            input_len = token_value(row.get("input", ""))
-        output_len = token_value(row.get("output", ""))
-        request_rps = row.get("request_throughput", "")
-        input_tp = row.get("input_throughput", "")
-        output_tp = row.get("output_throughput", "")
-        total_tp = row.get("total_throughput", "")
-        output.update({
-            "case_name": row.get("case_id", ""),
-            "input_len": csv_number(input_len),
-            "output_len": csv_number(output_len),
-            "tokens_per_request": csv_number(
-                input_len + output_len if input_len is not None and output_len is not None else None
-            ),
-            "rps": request_rps,
-            "input_throughput_tok_s": input_tp,
-            "generate_throughput_tok_s": output_tp,
-            "total_throughput_tok_s": total_tp,
-            "result_type": result_type,
-            "parameter_status": "confirmed",
-            "SLO": slo_json,
-            "request_rate": row.get("configured_request_rate", ""),
-            "duration_s": row.get("benchmark_duration_s", row.get("duration_s", "")),
-            "confirmed_inf_actual_rps": f"{inf_rps:.2f}" if inf_rps is not None else "",
-            "confirmed_inf_cache_hit_rate_pct": f"{inf_hit:.4f}" if inf_hit is not None else "",
-            "confirmed_inf_phase": baseline.get("search_phase", ""),
-            "request_rate_order": str(order),
-            "actual_cache_hit_rate_delta_pct": (
-                f"{actual_hit - target_hit:.4f}"
-                if actual_hit is not None and target_hit is not None else ""
-            ),
-        })
-        summary.append(output)
-
-summary.sort(key=lambda row: (
-    -(num(row, "confirmed_inf_actual_rps") or float("-inf")),
-    row.get("case_id", ""),
-    0 if row.get("result_type") == "inf" else 1,
-    -(num(row, "configured_request_rate") or float("-inf")),
-))
-
-output_rows = [{field: row.get(field, "") for field in fields} for row in summary]
-clipboard_rows = [
-    {field: (row.get(field, "") or "-") for field in fields}
-    for row in output_rows
-]
-with open(summary_tsv_path, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(clipboard_rows)
-PY
-}
-
 refresh_summary_checkpoint() {
   [[ -s "${trials_csv}" ]] || return 0
   write_summary || echo "[WARN] 无法刷新 summary checkpoint: ${summary_tsv}" >&2
@@ -1576,155 +1187,14 @@ trap 'handle_benchmark_signal 130' INT
 trap 'handle_benchmark_signal 143' TERM
 
 prune_confirmed_trials() {
-  "${PYTHON_BIN}" - "${trials_csv}" "${summary_tsv}" <<'PY'
-import csv
-import os
-import sys
-
-trials_path, summary_tsv_path = sys.argv[1:]
-if not os.path.exists(trials_path) or not os.path.exists(summary_tsv_path):
-    raise SystemExit(0)
-
-with open(summary_tsv_path, newline="", encoding="utf-8-sig") as f:
-    confirmed = list(csv.DictReader(f, delimiter="\t"))
-if not confirmed:
-    raise SystemExit(0)
-
-def key(row):
-    return (
-        row.get("case_id") or row.get("case_name", ""),
-        row.get("configured_request_rate") or row.get("request_rate", ""),
-        row.get("gsp_num_groups", ""),
-        row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
-        row.get("question_len", ""),
-    )
-
-confirmed_keys = {key(row) for row in confirmed}
-with open(trials_path, newline="", encoding="utf-8-sig") as f:
-    rows = list(csv.DictReader(f))
-fields = list(rows[0].keys()) if rows else []
-remaining = [row for row in rows if key(row) not in confirmed_keys]
-with open(trials_path, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.DictWriter(f, fieldnames=fields)
-    writer.writeheader()
-    writer.writerows(remaining)
-PY
+  "${PYTHON_BIN}" "${script_dir}/gsp_prefix_summary.py" prune \
+    "${trials_csv}" "${summary_tsv}"
 }
-
 plot_summary() {
   [[ "${plot_requested}" == "1" ]] || return 0
-  "${PYTHON_PLOT_BIN}" - "${summary_tsv}" "${trials_csv}" "${out_dir}/gsp_prefix_matrix.png" "${plot_cell}" "${FINITE_HIT_RATE_TOLERANCE}" <<'PY'
-import csv
-import math
-import sys
-from pathlib import Path
-
-summary_path, trials_path, output_path, cell, finite_tolerance_s = sys.argv[1:]
-finite_tolerance = float(finite_tolerance_s)
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-except ImportError as exc:
-    raise SystemExit(f"matplotlib/numpy 不可用，无法作图: {exc}")
-
-with open(summary_path, newline="", encoding="utf-8-sig") as f:
-    summary_rows = list(csv.DictReader(f, delimiter="\t"))
-if not summary_rows:
-    raise SystemExit("summary TSV 没有可作图数据")
-with open(trials_path, newline="", encoding="utf-8-sig") as f:
-    trial_rows = list(csv.DictReader(f))
-
-def row_key(row):
-    return (
-        row.get("case_id") or row.get("case_name", ""),
-        row.get("configured_request_rate") or row.get("request_rate", ""),
-        row.get("gsp_num_groups", ""),
-        row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
-        row.get("question_len", ""),
-    )
-
-confirmed_keys = {row_key(row) for row in summary_rows}
-rows = [row for row in trial_rows if row_key(row) in confirmed_keys]
-if not rows:
-    raise SystemExit("summary 对应的正式回测数据不存在")
-
-def num(row, key):
-    try:
-        value = float(row.get(key, ""))
-        return value if math.isfinite(value) else None
-    except (TypeError, ValueError):
-        return None
-
-columns = []
-for row in rows:
-    label = f"{row.get('input','')} / {row.get('output','')}\nhit {row.get('specified_cache_hit_rate_pct','')}%"
-    if label not in columns:
-        columns.append(label)
-targets = []
-for row in rows:
-    for target_s in row.get("ttft_targets_s", "").split("|"):
-        if not target_s:
-            continue
-        label = f"{row.get('ttft_metric','')} < {target_s} s"
-        if label not in targets:
-            targets.append(label)
-
-matrix = np.full((len(targets), len(columns)), np.nan, dtype=float)
-annotations = [["NO\nMEET" for _ in columns] for _ in targets]
-for i, target in enumerate(targets):
-    metric, _, target_s = target.partition(" < ")
-    target_ms = float(target_s.removesuffix(" s")) * 1000.0
-    for j, column in enumerate(columns):
-        candidates = []
-        for row in rows:
-            row_column = f"{row.get('input','')} / {row.get('output','')}\nhit {row.get('specified_cache_hit_rate_pct','')}%"
-            if row_column != column or row.get("configured_request_rate") == "inf":
-                continue
-            measured_hit = num(row, "actual_cache_hit_rate_pct")
-            target_hit = num(row, "specified_cache_hit_rate_pct")
-            ttft = num(row, metric)
-            actual_rps = num(row, "request_throughput")
-            if None in (measured_hit, target_hit, ttft, actual_rps):
-                continue
-            if abs(measured_hit - target_hit) > finite_tolerance or ttft > target_ms:
-                continue
-            tpot_metric = row.get("tpot_metric", "")
-            if tpot_metric:
-                tpot = num(row, tpot_metric)
-                tpot_limit = num(row, "tpot_target_ms")
-                if tpot is None or tpot_limit is None or tpot > tpot_limit:
-                    continue
-            value = actual_rps if cell == "rps" else num(row, "input_throughput")
-            if value is not None:
-                candidates.append((actual_rps, value))
-        if candidates:
-            _, value = max(candidates, key=lambda item: item[0])
-            matrix[i, j] = value
-            annotations[i][j] = f"{value:.2f}"
-
-fig_width = max(7.0, 2.6 * len(columns) + 2.0)
-fig_height = max(4.5, 1.2 * len(targets) + 2.5)
-fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=160)
-masked = np.ma.masked_invalid(matrix)
-image = ax.imshow(masked, cmap="GnBu", aspect="auto")
-ax.set_xticks(range(len(columns)), columns, fontsize=11, fontweight="bold")
-ax.set_yticks(range(len(targets)), targets, fontsize=11)
-ax.set_xlabel("GSP workload case", fontsize=12, fontweight="bold")
-ax.set_ylabel("TTFT SLA", fontsize=12, fontweight="bold")
-ax.set_title("GSP Prefix Capacity Matrix", fontsize=18, fontweight="bold", pad=18)
-ax.text(0.5, 1.02, f"Maximum actual client {'RPS' if cell == 'rps' else 'input throughput'} under TTFT + TPOT + cache-hit constraints", transform=ax.transAxes, ha="center", va="bottom", fontsize=10, color="#5d6775")
-for i in range(len(targets)):
-    for j in range(len(columns)):
-        text = annotations[i][j]
-        value = matrix[i, j]
-        color = "white" if not math.isnan(value) and value > np.nanmedian(matrix) else "#132238"
-        ax.text(j, i, text, ha="center", va="center", fontsize=14, fontweight="bold", color=color)
-fig.colorbar(image, ax=ax, shrink=0.82, pad=0.03)
-fig.tight_layout()
-Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-fig.savefig(output_path, bbox_inches="tight")
-print(output_path)
-PY
+  "${PYTHON_PLOT_BIN}" "${script_dir}/gsp_prefix_plot.py" \
+    "${summary_tsv}" "${trials_csv}" "${out_dir}/gsp_prefix_matrix.png" \
+    "${plot_cell}" "${FINITE_HIT_RATE_TOLERANCE}"
 }
 
 mkdir -p "${out_dir}" "${log_dir}"
@@ -1844,10 +1314,7 @@ done
 
 write_summary
 if ! plot_summary; then
-  if (( plot_requested == 1 )); then
-    echo "[ERROR] --plot requested but the matrix image was not generated" >&2
-    exit 1
-  fi
+  echo "[WARN] Prefill/GSP 容量矩阵未生成；不影响 CSV/TSV 和 benchmark 结果" >&2
 fi
 prune_confirmed_trials
 
@@ -1857,7 +1324,7 @@ echo "GSP prefix benchmark finished"
 echo "Result directory : ${out_dir}"
 echo "Trials CSV       : ${trials_csv}"
 echo "Summary TSV      : ${summary_tsv}  (cat 后可直接复制到表格)"
-if (( plot_requested == 1 )); then
+if (( plot_requested == 1 && -f "${out_dir}/gsp_prefix_matrix.png" )); then
   echo "Plot             : ${out_dir}/gsp_prefix_matrix.png"
 fi
 echo "============================================================"

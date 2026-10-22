@@ -29,6 +29,9 @@ run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 NODE_HOSTNAME="${NODE_HOSTNAME:-$(hostname 2>/dev/null || printf 'unknown')}"
 RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
 SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null || true)"
+SGLC_PLOT_BIN="${SGLC_PLOT_BIN:-python3}"
+SGLC_PLOT="${SGLC_PLOT:-1}"
+SGLC_PLOT_CELL="${SGLC_PLOT_CELL:-rps}"
 
 out_dir="./all_result/bench_theory_bs_${run_id}"
 log_dir="${out_dir}/logs"
@@ -50,7 +53,7 @@ import tempfile
  node_hostname, output_dir, dp_size, parallel_config) = sys.argv[1:]
 prefixes = ("SLA_", "HARD_STOP_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE",
             "EP_SIZE", "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC",
-            "DP_ATTENTION", "USE_FAKE_PREFILL", "NUM_PROMPTS_MULTIPLIER")
+            "DP_ATTENTION", "USE_FAKE_PREFILL", "NUM_PROMPTS_MULTIPLIER", "SGLC_PLOT")
 metadata = {
     "started_at": started_at,
     "script": script,
@@ -195,6 +198,18 @@ if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] TOKEN_UNIT 必须是正整数，当前为: ${TOKEN_UNIT}" >&2
   exit 1
 fi
+if [[ "${SGLC_PLOT}" != "0" && "${SGLC_PLOT}" != "1" ]]; then
+  echo "[ERROR] SGLC_PLOT 必须是 0 或 1，当前为: ${SGLC_PLOT}" >&2
+  exit 1
+fi
+case "${SGLC_PLOT_CELL}" in
+  rps|output_throughput) ;;
+  output_tp) SGLC_PLOT_CELL="output_throughput" ;;
+  *)
+    echo "[ERROR] SGLC_PLOT_CELL 仅支持 rps|output_throughput" >&2
+    exit 1
+    ;;
+esac
 
 
 
@@ -1299,6 +1314,17 @@ PY
 # 10. Ctrl+C / TERM / 正常退出
 # ============================================================
 
+plot_decode_matrix() {
+  [[ "${SGLC_PLOT}" == "1" ]] || return 0
+  local csv_file="${out_dir}/sum_all.csv"
+  local image_file="${out_dir}/decode_matrix.png"
+  [[ -s "${csv_file}" ]] || return 0
+  if ! "${SGLC_PLOT_BIN}" "${script_dir}/sglc_plot.py" \
+      "${csv_file}" "${image_file}" "${SLA_RULES}" "${SGLC_PLOT_CELL}" "${TOKEN_UNIT}"; then
+    echo "[WARN] decode 容量矩阵未生成；不影响 CSV/benchmark 结果" >&2
+  fi
+}
+
 on_exit() {
   local exit_code=$?
   trap - EXIT
@@ -1307,10 +1333,14 @@ on_exit() {
   echo "脚本退出，正在汇总已有结果..."
   echo "============================================================"
   merge_results || true
+  plot_decode_matrix
   echo
   echo "结果目录：${out_dir}"
   echo "LOG     ：${log_dir}"
   echo "CSV     ：${out_dir}/sum_all.csv"
+  if [[ "${SGLC_PLOT}" == "1" && -f "${out_dir}/decode_matrix.png" ]]; then
+    echo "PLOT    ：${out_dir}/decode_matrix.png"
+  fi
   exit "${exit_code}"
 }
 

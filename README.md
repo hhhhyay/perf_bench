@@ -8,7 +8,11 @@ SGLang / vLLM 推理服务容量压测脚本集合，重点用于按照 per-DP b
 perf_bench/
 ├── sglang/
 │   ├── sglc.sh      # SGLang 客户端容量压测
-│   └── gsp_prefix_bench.sh # 统一的 Prefill/GSP TTFT/TPOT 容量压测入口
+│   ├── sglc_plot.py # Decode 容量矩阵作图
+│   ├── gsp_prefix_bench.sh # 统一的 Prefill/GSP TTFT/TPOT 容量压测入口
+│   ├── gsp_prefix_metrics.py # benchmark 日志解析与 trials CSV
+│   ├── gsp_prefix_summary.py # summary TSV 生成与正式 trial 清理
+│   └── gsp_prefix_plot.py # Prefill/GSP 容量矩阵作图
 └── vllm/
     └── vllmc.sh     # vLLM Prefix-Salt 标准容量压测
 ```
@@ -25,6 +29,8 @@ perf_bench/
 - 支持 `SLA_RULES` inline 加密扫描：当当前 BS 命中任一 SLA 规则后，连续补测到下一个基础 BS 前。
 - 支持 `HARD_STOP_RULES` 硬停止：指标命中阈值后停止当前 case 的后续 BS 测试。
 - 直接从 benchmark 日志提取 RPS、Token 吞吐、请求数、耗时和时延分位数，不保存逐请求 JSONL。
+- 默认根据 `sum_all.csv` 和 `SLA_RULES` 生成 `decode_matrix.png`；行是 TPOT/TTFT SLA，列是输入/输出与 per-DP BS，格子显示满足 SLA 的最大实际客户端 RPS。
+- `SGLC_PLOT_CELL=output_throughput` 可将格子改为输出 token throughput，`SGLC_PLOT=0` 可关闭默认作图。
 
 ### SGLang GSP Prefix: `sglang/gsp_prefix_bench.sh`
 
@@ -184,7 +190,7 @@ bash sglang/gsp_prefix_bench.sh \
 `configured_request_rate` 是客户端配置值，`request_throughput` 是实际客户端输出 RPS；
 容量筛选和 summary 排序使用后者。
 
-默认只生成 CSV 和日志；需要矩阵图时指定格子中央显示的指标：
+默认生成 CSV、日志和容量矩阵图；格子中央默认显示实际客户端 RPS。可以指定格子中央显示的指标：
 
 ```bash
 # 格子显示最大实际客户端 RPS
@@ -194,6 +200,13 @@ bash sglang/gsp_prefix_bench.sh --plot --cell rps \
 
 # 格子显示客户端输入 token throughput
 bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
+  --case '16k,1k,80,mean_ttft_ms,3|5,mean_tpot_ms,30'
+```
+
+如只需要 TSV/CSV 和日志，可关闭默认作图：
+
+```bash
+GSP_PLOT=0 bash sglang/gsp_prefix_bench.sh --no-plot \
   --case '16k,1k,80,mean_ttft_ms,3|5,mean_tpot_ms,30'
 ```
 
@@ -207,7 +220,20 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 - 只有 `gsp_prefix_summary.tsv` 作为可复制汇总文件；它会在每个 trial 完成后刷新一次，收到中断信号时也会保存当前已完成结果。中断时不会执行 trial 清理，因此可以结合 `gsp_prefix_trials.csv` 和日志继续排查。
 - GSP CSV/TSV 会记录 `parallel_config`，优先从服务 `/server_info` 生成；接口不可用时可通过 `PARALLEL_CONFIG` 手动指定。
 - `gsp_prefix_summary.tsv`：唯一的 summary 汇总文件，列之间使用制表符，空值用 `-` 占位以避免终端复制时连续 Tab 导致列错位。执行 `cat gsp_prefix_summary.tsv` 后复制到 Excel/WPS，可直接按列粘贴。
-- `gsp_prefix_matrix.png`：指定 `--plot` 后生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐。
+- `gsp_prefix_matrix.png`：默认生成的容量矩阵，列为输入/输出/命中率，行为 TTFT SLA，格子中央为 RPS 或输入吞吐；使用 `GSP_PLOT=0` 或 `--no-plot` 关闭。
+- 作图只调用现有 Python 环境中的 `matplotlib/numpy`，脚本不会自动下载依赖；绘图库缺失时只打印 warning，CSV/TSV、日志和 benchmark 退出状态不受影响。
+
+Prefill/GSP 作图规则：每一列代表一个输入/输出/指定命中率 workload，每一行代表一个 TTFT SLA
+目标。只使用命中率满足容差、TTFT/TPOT 满足 SLO 的有限请求率 trial；`inf` 只作为确认后的
+基线，不直接作为容量格子。每个格子选择实际客户端 RPS 最大的 trial，格子中央默认显示 RPS，
+也可以用 `--cell input_throughput` 显示客户端输入 token throughput。没有满足条件的格子显示
+`NO MEET`。因此它是“约束下最大容量矩阵”，不是把所有原始 trial 直接画成热力图。
+
+Decode 也可以采用同一套矩阵方式：把行从 TTFT SLA 换成 TPOT/ITL SLA，把列换成输入/输出、
+BS 或并发 workload，格子选择满足 SLA 的最大实际 RPS 或输出 token throughput。当前
+`sglc.sh` 仍以 `sum_all.csv` 为主，尚未默认接入 decode 矩阵图；GSP 拆分后的
+`gsp_prefix_plot.py` 已将作图逻辑独立出来，后续可复用同样的筛选规则接入 SGLC，而不必再把
+绘图代码塞回压测主流程。
 
 脚本支持 `--dry-run` 核对官方命令而不连接服务；同一 `RUN_ID` 重新执行时会跳过已有成功
 日志。缺少 `--cache-report` 或 benchmark 失败时保留日志并标记为失败，不用理论值伪造实测命中率。
@@ -272,6 +298,9 @@ SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
 | `SLA_DENSE_ENABLE` | 是否开启 SLA inline 加密扫描，默认 `1`。 |
 | `SLA_RULES` | SLA 规则，格式为 `metric:target:near`，多个规则用逗号分隔。 |
 | `HARD_STOP_RULES` | SGLang 硬停止规则，格式为 `metric:op:threshold`，多个规则用逗号分隔；默认关闭。 |
+| `SGLC_PLOT` | Decode 容量矩阵开关，默认 `1`；设为 `0` 只生成 CSV 和日志。 |
+| `SGLC_PLOT_CELL` | Decode 矩阵格子指标，默认 `rps`；可设为 `output_throughput`。 |
+| `SGLC_PLOT_BIN` | Decode 作图使用的 Python 命令，默认 `python3`。 |
 | `RUN_ID` | 固定结果目录后缀，用于中断后续测；不设置时自动使用当前时间戳。 |
 | `DP_SIZE` | 手动指定 DP 数；通常由脚本自动识别。 |
 | `KV_TOKENS` / `MAX_TOTAL_TOKENS` | 容量识别失败时的手动兜底值。 |
@@ -377,6 +406,10 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 
 - `logs/`：每个 case / BS 的执行日志。
 - `sum_all.csv`：汇总后的核心指标表。
+`sglc.sh` 默认额外生成 `decode_matrix.png`：每一列是输入/输出/per-DP BS workload，每一行是
+`SLA_RULES` 中的一条延迟规则，只保留对应指标小于等于 target 的 BS，格子显示其中实际 RPS
+最大的结果；没有满足点显示 `NO MEET`。默认格子显示 RPS，设置
+`SGLC_PLOT_CELL=output_throughput` 后显示生成 token throughput。
 GSP 的 `gsp_prefix_summary.tsv` 面向复制到表格使用，保留输入/输出、指定和实际 cache 命中率、确认后的 workload 参数、请求率、吞吐和性能指标；执行过程字段如 `page_aligned`、`search_phase`、`log_file`、`backend`、`ttft_metric`、`ttft_targets_s` 等不放入 summary，原始排查信息仍保留在 `gsp_prefix_trials.csv`。`SLO` 将 TTFT/TPOT 要求合并为 JSON，TTFT 使用秒、TPOT 使用毫秒，例如 `{"ttft":{"mean":[5,6],"P90":[8,10]},"tpot":{"mean":[20,30],"P90":[50,60]}}`。
 summary 的公共客户端指标仍按 `sglc.sh` 的顺序排列；GSP 的指定/实际 cache 命中率、SLO、前缀长度和 groups/prompts 紧跟在 case/输入输出/并行配置之后，先明确 workload，再查看并发、吞吐和 TTFT/TPOT/ITL 指标。这样既保留与 SGLC 的公共字段顺序，也不会把 GSP 的核心条件埋到表格末尾。
 
