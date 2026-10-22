@@ -391,7 +391,9 @@ order_layout_candidates_for_case() {
   fi
 
   if (( ${#rest[@]} > 0 )); then
-    while IFS= read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -n)
+    # Values are numeric and contain no whitespace; avoid a persistent IFS
+    # assignment leaking into the next repeated --case parse.
+    while read -r value; do [[ -n "${value}" ]] && ordered+=("${value}"); done < <(printf '%s\n' "${rest[@]}" | sort -n)
   fi
   PROMPT_CANDIDATES=("${ordered[@]}")
 }
@@ -557,11 +559,25 @@ PY
 }
 
 parse_case() {
-  local raw="$1"
-  local old_ifs="$IFS"
-  IFS=',' read -r CASE_INPUT_RAW CASE_OUTPUT_RAW CASE_HIT_PCT CASE_TTFT_METRIC \
-    CASE_TTFT_TARGETS CASE_TPOT_METRIC CASE_TPOT_TARGET_MS CASE_CONCURRENCY extra <<< "$raw"
-  IFS="$old_ifs"
+  local raw="${1//$'\r'/}"
+  local input_raw="" output_raw="" hit_pct="" ttft_metric="" ttft_targets=""
+  local tpot_metric="" tpot_target_ms="" concurrency="" extra=""
+  local IFS=','
+  read -r input_raw output_raw hit_pct ttft_metric ttft_targets \
+    tpot_metric tpot_target_ms concurrency extra <<< "$raw"
+
+  # Keep parsing isolated between repeated --case values.  The benchmark mutates
+  # global case fields while calibrating layouts and duration, so stale fields
+  # here can make a later case's SLA appear invalid.
+  CASE_INPUT_RAW="${input_raw}"
+  CASE_OUTPUT_RAW="${output_raw}"
+  CASE_HIT_PCT="${hit_pct}"
+  CASE_TTFT_METRIC="${ttft_metric}"
+  CASE_TTFT_TARGETS="${ttft_targets}"
+  CASE_TPOT_METRIC="${tpot_metric}"
+  CASE_TPOT_TARGET_MS="${tpot_target_ms}"
+  CASE_CONCURRENCY="${concurrency}"
+  extra="${extra}"
 
   [[ -z "${extra:-}" ]] || {
     echo "[ERROR] case 字段过多: ${raw}" >&2
@@ -820,25 +836,40 @@ aliases = {
     "Concurrency": "concurrency",
     "Accept length": "accept_length",
     "Mean E2E Latency (ms)": "mean_e2e_latency_ms",
+    "Median E2E Latency (ms)": "p50_e2e_latency_ms",
+    "P50 E2E Latency (ms)": "p50_e2e_latency_ms",
+    "P75 E2E Latency (ms)": "p75_e2e_latency_ms",
+    "P90 E2E Latency (ms)": "p90_e2e_latency_ms",
+    "P95 E2E Latency (ms)": "p95_e2e_latency_ms",
+    "P99 E2E Latency (ms)": "p99_e2e_latency_ms",
+    "P999 E2E Latency (ms)": "p999_e2e_latency_ms",
+    "Max E2E Latency (ms)": "max_e2e_latency_ms",
     "Mean TTFT (ms)": "mean_ttft_ms",
     "Median TTFT (ms)": "p50_ttft_ms",
     "P50 TTFT (ms)": "p50_ttft_ms",
+    "P75 TTFT (ms)": "p75_ttft_ms",
     "P90 TTFT (ms)": "p90_ttft_ms",
     "P95 TTFT (ms)": "p95_ttft_ms",
     "P99 TTFT (ms)": "p99_ttft_ms",
+    "P999 TTFT (ms)": "p999_ttft_ms",
     "Max TTFT (ms)": "max_ttft_ms",
     "Mean TPOT (ms)": "mean_tpot_ms",
     "Median TPOT (ms)": "p50_tpot_ms",
     "P50 TPOT (ms)": "p50_tpot_ms",
+    "P75 TPOT (ms)": "p75_tpot_ms",
     "P90 TPOT (ms)": "p90_tpot_ms",
     "P95 TPOT (ms)": "p95_tpot_ms",
     "P99 TPOT (ms)": "p99_tpot_ms",
+    "P999 TPOT (ms)": "p999_tpot_ms",
+    "Max TPOT (ms)": "max_tpot_ms",
     "Mean ITL (ms)": "mean_itl_ms",
     "Median ITL (ms)": "p50_itl_ms",
     "P50 ITL (ms)": "p50_itl_ms",
+    "P75 ITL (ms)": "p75_itl_ms",
     "P90 ITL (ms)": "p90_itl_ms",
     "P95 ITL (ms)": "p95_itl_ms",
     "P99 ITL (ms)": "p99_itl_ms",
+    "P999 ITL (ms)": "p999_itl_ms",
     "Max ITL (ms)": "max_itl_ms",
     "Total prompt tokens": "total_prompt_tokens",
     "Total cached tokens": "total_cached_tokens",
@@ -975,11 +1006,15 @@ fields = [
     "total_input_text_tokens", "total_generated_tokens", "total_generated_tokens_retokenized",
     "request_throughput", "input_throughput", "output_throughput", "total_throughput",
     "peak_output_throughput", "peak_concurrency", "max_concurrency", "concurrency",
-    "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms", "mean_tpot_ms", "p95_tpot_ms",
-    "p99_tpot_ms", "mean_itl_ms", "p95_itl_ms", "p99_itl_ms", "accept_length",
-    "mean_e2e_latency_ms", "actual_cache_hit_rate_pct", "total_prompt_tokens",
-    "total_cached_tokens", "p50_ttft_ms", "p90_ttft_ms", "max_ttft_ms",
-    "p50_tpot_ms", "p90_tpot_ms", "p50_itl_ms", "p90_itl_ms", "max_itl_ms",
+    "mean_ttft_ms", "p50_ttft_ms", "p75_ttft_ms", "p90_ttft_ms", "p95_ttft_ms",
+    "p99_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "mean_tpot_ms", "p50_tpot_ms",
+    "p75_tpot_ms", "p90_tpot_ms", "p95_tpot_ms", "p99_tpot_ms", "p999_tpot_ms",
+    "max_tpot_ms", "mean_itl_ms", "p50_itl_ms", "p75_itl_ms", "p90_itl_ms",
+    "p95_itl_ms", "p99_itl_ms", "p999_itl_ms", "max_itl_ms", "accept_length",
+    "mean_e2e_latency_ms", "p50_e2e_latency_ms", "p75_e2e_latency_ms", "p90_e2e_latency_ms",
+    "p95_e2e_latency_ms", "p99_e2e_latency_ms", "p999_e2e_latency_ms", "max_e2e_latency_ms",
+    "actual_cache_hit_rate_pct", "total_prompt_tokens",
+    "total_cached_tokens",
     "duration_s", "log_file",
 ]
 row = {key: "" for key in fields}
@@ -1299,15 +1334,16 @@ finite_rate_candidates() {
 
 write_summary() {
   "${PYTHON_BIN}" - "${trials_csv}" "${summary_tsv}" \
-    "${BASELINE_HIT_RATE_TOLERANCE}" <<'PY'
+    "${BASELINE_HIT_RATE_TOLERANCE}" "${TOKEN_UNIT}" <<'PY'
 import csv
 import json
 import math
 import os
 import sys
 
-trials_path, summary_tsv_path, baseline_tolerance_s = sys.argv[1:]
+trials_path, summary_tsv_path, baseline_tolerance_s, token_unit_s = sys.argv[1:]
 baseline_tolerance = float(baseline_tolerance_s)
+token_unit = int(token_unit_s)
 rows = []
 if os.path.exists(trials_path):
     with open(trials_path, newline="", encoding="utf-8-sig") as f:
@@ -1320,6 +1356,25 @@ def num(row, key):
     except (TypeError, ValueError):
         return None
 
+def token_value(raw):
+    """Convert the case's token notation using the shared TOKEN_UNIT."""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    multiplier = token_unit if text.endswith("k") else 1
+    if multiplier != 1:
+        text = text[:-1]
+    try:
+        value = float(text) * multiplier
+        return int(value) if value.is_integer() else value
+    except ValueError:
+        return None
+
+def csv_number(value):
+    if value is None:
+        return ""
+    return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+
 def same_parameters(row, baseline):
     keys = ("gsp_num_groups", "gsp_prompts_per_group", "system_prompt_len", "question_len")
     return all(row.get(key, "") == baseline.get(key, "") for key in keys)
@@ -1331,23 +1386,34 @@ metadata_fields = [
     "actual_cache_hit_rate_delta_pct",
 ]
 preferred_fields = [
-    "case_id", "input", "output",
-    "specified_cache_hit_rate_pct", "SLO", "actual_cache_hit_rate_pct",
-    "parallel_config", "system_prompt_len", "question_len",
-    "gsp_page_size", "gsp_num_groups", "gsp_prompts_per_group",
-    "successful_requests", "num_prompts",
+    # Keep the common prefix identical to sglc.sh so the two summaries can be
+    # pasted into the same table without moving the standard metrics.
+    "case_name", "input_len", "output_len",
+    "parallel_config",
+    # These fields define the GSP workload and must stay visible before the
+    # performance columns; without them the cache metrics are not interpretable.
+    "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
+    "system_prompt_len", "question_len", "gsp_page_size", "gsp_num_groups",
+    "gsp_prompts_per_group", "total_prompt_tokens", "total_cached_tokens",
+    "max_running_requests", "max_total_tokens",
+    "tokens_per_request", "token_theoretical_per_dp_bs",
+    "effective_theoretical_per_dp_bs", "per_dp_bs", "num_prompts",
     "max_concurrency", "concurrency", "peak_output_throughput", "peak_concurrency",
-    "request_rate", "duration_s", "request_throughput", "input_throughput",
-    "output_throughput", "total_throughput",
+    "request_rate", "duration_s", "rps", "input_throughput_tok_s",
+    "generate_throughput_tok_s", "total_throughput_tok_s",
     "mean_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
     "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
     "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
-    "accept_length", "mean_e2e_latency_ms", "total_prompt_tokens", "total_cached_tokens",
-    "p50_ttft_ms", "p90_ttft_ms", "max_ttft_ms",
-    "p50_tpot_ms", "p90_tpot_ms", "max_tpot_ms",
-    "p50_itl_ms", "p90_itl_ms", "max_itl_ms",
+    "accept_length", "mean_e2e_latency_ms",
     "total_input_tokens", "total_input_text_tokens", "total_generated_tokens",
     "total_generated_tokens_retokenized",
+    "std_e2e_latency_ms", "p75_e2e_latency_ms", "p90_e2e_latency_ms",
+    "p999_e2e_latency_ms", "max_e2e_latency_ms", "std_ttft_ms", "p75_ttft_ms",
+    "p90_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "std_tpot_ms", "p75_tpot_ms",
+    "p90_tpot_ms", "p999_tpot_ms", "max_tpot_ms", "std_itl_ms", "p75_itl_ms",
+    "p90_itl_ms", "p999_itl_ms", "max_itl_ms",
+    # P50 is retained as a GSP-specific extra after the shared columns.
+    "p50_ttft_ms", "p50_tpot_ms", "p50_itl_ms",
 ]
 excluded_fields = {
     "result_type", "parameter_status", "confirmed_inf_phase", "request_rate_order",
@@ -1356,6 +1422,10 @@ excluded_fields = {
     "max_request_concurrency", "ttft_metric", "ttft_targets_s", "tpot_metric", "tpot_target_ms",
     "theoretical_cache_hit_rate_pct", "requested_theoretical_cache_hit_rate_pct",
     "confirmed_inf_cache_hit_rate_pct", "configured_request_rate", "benchmark_duration_s",
+    "case_id", "input", "output", "successful_requests", "request_throughput",
+    "input_throughput", "output_throughput", "total_throughput", "max_tpot_ms",
+    "p50_e2e_latency_ms", "p95_e2e_latency_ms", "p99_e2e_latency_ms",
+    "case_status", "case_exit_code", "benchmark_result_found",
 }
 fields = preferred_fields + [
     field for field in source_fields
@@ -1433,7 +1503,28 @@ for case_id, case_rows in case_groups.items():
         output = dict(row)
         target_hit = num(row, "specified_cache_hit_rate_pct")
         actual_hit = num(row, "actual_cache_hit_rate_pct")
+        input_len = num(row, "system_prompt_len")
+        question_len = num(row, "question_len")
+        if input_len is not None and question_len is not None:
+            input_len += question_len
+        else:
+            input_len = token_value(row.get("input", ""))
+        output_len = token_value(row.get("output", ""))
+        request_rps = row.get("request_throughput", "")
+        input_tp = row.get("input_throughput", "")
+        output_tp = row.get("output_throughput", "")
+        total_tp = row.get("total_throughput", "")
         output.update({
+            "case_name": row.get("case_id", ""),
+            "input_len": csv_number(input_len),
+            "output_len": csv_number(output_len),
+            "tokens_per_request": csv_number(
+                input_len + output_len if input_len is not None and output_len is not None else None
+            ),
+            "rps": request_rps,
+            "input_throughput_tok_s": input_tp,
+            "generate_throughput_tok_s": output_tp,
+            "total_throughput_tok_s": total_tp,
             "result_type": result_type,
             "parameter_status": "confirmed",
             "SLO": slo_json,
@@ -1501,7 +1592,8 @@ if not confirmed:
 
 def key(row):
     return (
-        row.get("case_id", ""), row.get("configured_request_rate") or row.get("request_rate", ""),
+        row.get("case_id") or row.get("case_name", ""),
+        row.get("configured_request_rate") or row.get("request_rate", ""),
         row.get("gsp_num_groups", ""),
         row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
         row.get("question_len", ""),
@@ -1544,7 +1636,8 @@ with open(trials_path, newline="", encoding="utf-8-sig") as f:
 
 def row_key(row):
     return (
-        row.get("case_id", ""), row.get("configured_request_rate") or row.get("request_rate", ""),
+        row.get("case_id") or row.get("case_name", ""),
+        row.get("configured_request_rate") or row.get("request_rate", ""),
         row.get("gsp_num_groups", ""),
         row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
         row.get("question_len", ""),
@@ -1728,7 +1821,7 @@ for raw_case in "${CASES[@]}"; do
     sla_target_met[${sla_index}]=0
   done
   sla_targets_remaining="${#sla_targets[@]}"
-  while IFS= read -r finite_rate; do
+  while read -r finite_rate; do
     [[ -n "${finite_rate}" ]] || continue
     run_trial "${finite_rate}" descending
     finite_log="$(trial_log_path "${finite_rate}" descending)"

@@ -203,7 +203,7 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
 - 每个新生成的 `.log` 开头也会写入上述模型、节点 hostname 和服务地址，便于单独复制日志后追溯来源。
 - `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准 probe；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
-- `gsp_prefix_summary.tsv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `request_rate=inf` 区分基线，并保留确认后的长度/分组/请求数、`confirmed_inf_actual_rps`、请求率、吞吐、实际 cache 命中率和完整客户端指标。`SLO` 统一记录 TTFT/TPOT 要求，TTFT 单位为秒、TPOT 单位为毫秒，例如 `{"ttft":{"mean":[5,6]},"tpot":{"mean":[20]}}`；`page_aligned`、`ttft_metric`、`ttft_targets_s`、`tpot_metric`、`tpot_target_ms` 等过程字段不放入 summary。先按 `confirmed_inf_actual_rps` 降序排列，同一参数块内再按请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
+- `gsp_prefix_summary.tsv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `request_rate=inf` 区分基线，并保留确认后的长度/分组/请求数、请求率、吞吐、实际 cache 命中率和完整客户端指标。`SLO` 统一记录 TTFT/TPOT 要求，TTFT 单位为秒、TPOT 单位为毫秒，例如 `{"ttft":{"mean":[5,6]},"tpot":{"mean":[20]}}`；`page_aligned`、`ttft_metric`、`ttft_targets_s`、`tpot_metric`、`tpot_target_ms` 等过程字段不放入 summary。summary 内部仍按确认后的 INF 实际 RPS 降序排列，同一参数块内再按请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
 - 只有 `gsp_prefix_summary.tsv` 作为可复制汇总文件；它会在每个 trial 完成后刷新一次，收到中断信号时也会保存当前已完成结果。中断时不会执行 trial 清理，因此可以结合 `gsp_prefix_trials.csv` 和日志继续排查。
 - GSP CSV/TSV 会记录 `parallel_config`，优先从服务 `/server_info` 生成；接口不可用时可通过 `PARALLEL_CONFIG` 手动指定。
 - `gsp_prefix_summary.tsv`：唯一的 summary 汇总文件，列之间使用制表符，空值用 `-` 占位以避免终端复制时连续 Tab 导致列错位。执行 `cat gsp_prefix_summary.tsv` 后复制到 Excel/WPS，可直接按列粘贴。
@@ -230,7 +230,7 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 `4096 tokens`、输出 `1024 tokens`；`"0.5 1"` 表示输入 `512 tokens`、输出 `1024 tokens`。
 统一 GSP 入口的 `--case` 支持独立 Prefill（`HIT_RATE=0`，输出长度通常设为 `1`）和带共享前缀的
 GSP 测试。需要十进制 k 时设置 `TOKEN_UNIT=1000`，此时 `"1k"` 表示 `1000 tokens`。
-小数换算后会四舍五入为整数 token；结果可根据 `input_len/output_len` 与 `input_k/output_k` 判断实际口径。
+小数换算后会四舍五入为整数 token；结果直接根据 `input_len/output_len` 判断实际 token 口径。
 
 ## 快速运行
 
@@ -378,6 +378,6 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 - `logs/`：每个 case / BS 的执行日志。
 - `sum_all.csv`：汇总后的核心指标表。
 GSP 的 `gsp_prefix_summary.tsv` 面向复制到表格使用，保留输入/输出、指定和实际 cache 命中率、确认后的 workload 参数、请求率、吞吐和性能指标；执行过程字段如 `page_aligned`、`search_phase`、`log_file`、`backend`、`ttft_metric`、`ttft_targets_s` 等不放入 summary，原始排查信息仍保留在 `gsp_prefix_trials.csv`。`SLO` 将 TTFT/TPOT 要求合并为 JSON，TTFT 使用秒、TPOT 使用毫秒，例如 `{"ttft":{"mean":[5,6],"P90":[8,10]},"tpot":{"mean":[20,30],"P90":[50,60]}}`。
-summary 的客户端指标按统一顺序排列：请求数/并发、请求率/时长、RPS/吞吐、TTFT/TPOT/ITL 的 `mean → p95 → p99`、E2E、cache/token 统计，`p50/p90/max` 等额外分位数统一放到 E2E 后面，便于与其他 benchmark 结果直接对齐。
+summary 的公共客户端指标仍按 `sglc.sh` 的顺序排列；GSP 的指定/实际 cache 命中率、SLO、前缀长度和 groups/prompts 紧跟在 case/输入输出/并行配置之后，先明确 workload，再查看并发、吞吐和 TTFT/TPOT/ITL 指标。这样既保留与 SGLC 的公共字段顺序，也不会把 GSP 的核心条件埋到表格末尾。
 
 `all_result/` 是运行产物目录，建议不要提交到仓库。
