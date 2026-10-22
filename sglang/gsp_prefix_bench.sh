@@ -50,7 +50,6 @@ EXPLICIT_RATES="${GSP_REQUEST_RATES:-}"
 out_dir="./all_result/bench_gsp_prefix_${RUN_ID}"
 log_dir="${out_dir}/logs"
 trials_csv="${out_dir}/gsp_prefix_trials.csv"
-summary_csv="${out_dir}/gsp_prefix_summary.csv"
 summary_tsv="${out_dir}/gsp_prefix_summary.tsv"
 plot_requested=0
 plot_cell="rps"
@@ -1299,7 +1298,7 @@ finite_rate_candidates() {
 }
 
 write_summary() {
-  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" "${summary_tsv}" \
+  "${PYTHON_BIN}" - "${trials_csv}" "${summary_tsv}" \
     "${BASELINE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
 import json
@@ -1307,7 +1306,7 @@ import math
 import os
 import sys
 
-trials_path, summary_path, summary_tsv_path, baseline_tolerance_s = sys.argv[1:]
+trials_path, summary_tsv_path, baseline_tolerance_s = sys.argv[1:]
 baseline_tolerance = float(baseline_tolerance_s)
 rows = []
 if os.path.exists(trials_path):
@@ -1454,10 +1453,6 @@ clipboard_rows = [
     {field: (row.get(field, "") or "-") for field in fields}
     for row in output_rows
 ]
-with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.DictWriter(f, fieldnames=fields)
-    writer.writeheader()
-    writer.writerows(output_rows)
 with open(summary_tsv_path, "w", newline="", encoding="utf-8-sig") as f:
     writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", lineterminator="\n")
     writer.writeheader()
@@ -1467,7 +1462,7 @@ PY
 
 refresh_summary_checkpoint() {
   [[ -s "${trials_csv}" ]] || return 0
-  write_summary || echo "[WARN] 无法刷新 summary checkpoint: ${summary_csv}" >&2
+  write_summary || echo "[WARN] 无法刷新 summary checkpoint: ${summary_tsv}" >&2
 }
 
 handle_benchmark_signal() {
@@ -1481,24 +1476,24 @@ trap 'handle_benchmark_signal 130' INT
 trap 'handle_benchmark_signal 143' TERM
 
 prune_confirmed_trials() {
-  "${PYTHON_BIN}" - "${trials_csv}" "${summary_csv}" <<'PY'
+  "${PYTHON_BIN}" - "${trials_csv}" "${summary_tsv}" <<'PY'
 import csv
 import os
 import sys
 
-trials_path, summary_path = sys.argv[1:]
-if not os.path.exists(trials_path) or not os.path.exists(summary_path):
+trials_path, summary_tsv_path = sys.argv[1:]
+if not os.path.exists(trials_path) or not os.path.exists(summary_tsv_path):
     raise SystemExit(0)
 
-with open(summary_path, newline="", encoding="utf-8-sig") as f:
-    confirmed = list(csv.DictReader(f))
+with open(summary_tsv_path, newline="", encoding="utf-8-sig") as f:
+    confirmed = list(csv.DictReader(f, delimiter="\t"))
 if not confirmed:
     raise SystemExit(0)
 
 def key(row):
     return (
-        row.get("case_id", ""), row.get("configured_request_rate", ""),
-        row.get("search_phase", ""), row.get("gsp_num_groups", ""),
+        row.get("case_id", ""), row.get("configured_request_rate") or row.get("request_rate", ""),
+        row.get("gsp_num_groups", ""),
         row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
         row.get("question_len", ""),
     )
@@ -1517,7 +1512,7 @@ PY
 
 plot_summary() {
   [[ "${plot_requested}" == "1" ]] || return 0
-  "${PYTHON_PLOT_BIN}" - "${summary_csv}" "${trials_csv}" "${out_dir}/gsp_prefix_matrix.png" "${plot_cell}" "${FINITE_HIT_RATE_TOLERANCE}" <<'PY'
+  "${PYTHON_PLOT_BIN}" - "${summary_tsv}" "${trials_csv}" "${out_dir}/gsp_prefix_matrix.png" "${plot_cell}" "${FINITE_HIT_RATE_TOLERANCE}" <<'PY'
 import csv
 import math
 import sys
@@ -1532,16 +1527,16 @@ except ImportError as exc:
     raise SystemExit(f"matplotlib/numpy 不可用，无法作图: {exc}")
 
 with open(summary_path, newline="", encoding="utf-8-sig") as f:
-    summary_rows = list(csv.DictReader(f))
+    summary_rows = list(csv.DictReader(f, delimiter="\t"))
 if not summary_rows:
-    raise SystemExit("summary CSV 没有可作图数据")
+    raise SystemExit("summary TSV 没有可作图数据")
 with open(trials_path, newline="", encoding="utf-8-sig") as f:
     trial_rows = list(csv.DictReader(f))
 
 def row_key(row):
     return (
-        row.get("case_id", ""), row.get("configured_request_rate", ""),
-        row.get("search_phase", ""), row.get("gsp_num_groups", ""),
+        row.get("case_id", ""), row.get("configured_request_rate") or row.get("request_rate", ""),
+        row.get("gsp_num_groups", ""),
         row.get("gsp_prompts_per_group", ""), row.get("system_prompt_len", ""),
         row.get("question_len", ""),
     )
@@ -1759,7 +1754,6 @@ echo "============================================================"
 echo "GSP prefix benchmark finished"
 echo "Result directory : ${out_dir}"
 echo "Trials CSV       : ${trials_csv}"
-echo "Summary CSV      : ${summary_csv}"
 echo "Summary TSV      : ${summary_tsv}  (cat 后可直接复制到表格)"
 if (( plot_requested == 1 )); then
   echo "Plot             : ${out_dir}/gsp_prefix_matrix.png"
