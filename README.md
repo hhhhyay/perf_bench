@@ -8,8 +8,8 @@ SGLang / vLLM 推理服务容量压测脚本集合，重点用于按照 per-DP b
 perf_bench/
 ├── sglang/
 │   ├── sglc.sh      # SGLang 客户端容量压测
-│   ├── prefill_ttft.sh # 单侧 Prefill TTFT 矩阵压测
-│   └── gsp_prefix_bench.sh # GSP prefix 命中率下的 TTFT/TPOT 容量压测
+│   ├── prefill_ttft.sh # 兼容旧用法的单侧 Prefill BS 矩阵压测
+│   └── gsp_prefix_bench.sh # 统一的 Prefill/GSP TTFT/TPOT 容量压测入口
 └── vllm/
     └── vllmc.sh     # vLLM Prefix-Salt 标准容量压测
 ```
@@ -29,6 +29,10 @@ perf_bench/
 
 ### SGLang Prefill: `sglang/prefill_ttft.sh`
 
+单侧 Prefill 已统一到 `sglang/gsp_prefix_bench.sh` 的 `HIT_RATE=0` case；这里的脚本继续保留，
+用于需要按 per-DP BS 规则生成旧版 Prefill 矩阵或兼容已有自动化命令的场景。只需要输入长度、
+输出长度、SLA 和请求率回测时，优先使用 GSP 统一入口。
+
 - 使用与 `sglc.sh` 相同的服务配置和 `bench_serving` 参数。
 - 输出长度固定为 1 token，不再配置输出长度。
 - 不设置 `--max-concurrency`，让 Prefill 测试按请求率自然形成并发；`DP_SIZE × per-DP BS` 只用于计算请求数量和记录 BS。
@@ -42,8 +46,9 @@ perf_bench/
 
 ### SGLang GSP Prefix: `sglang/gsp_prefix_bench.sh`
 
-只要测试需求包含 prefix/cache 命中率，就使用这个脚本。它调用官方
-`generated-shared-prefix` 数据集，同时支持 Prefill、输出大于 1 的普通推理和后续 PD
+这是统一的 Prefill/GSP 压测入口。`HIT_RATE=0` 使用官方 `random-ids` 生成独立 token 输入，
+等价于无 prefix-cache 的单侧 Prefill；`HIT_RATE>0` 调用官方
+`generated-shared-prefix` 数据集。脚本同时支持 Prefill、输出大于 1 的普通推理和后续 PD
 分离场景，不把请求数命中比例当成 token 级 cache 命中率。
 
 命中率按官方 `--cache-report` 的结果计算：
@@ -96,6 +101,16 @@ question_len = L - system_prompt_len
 ```bash
 --case '16k,1,80,mean_ttft_ms,5'
 --case '32k,1,90,mean_ttft_ms,5,mean_tpot_ms,100'
+```
+
+`HIT_RATE=0` 表示使用官方 `random-ids` workload 生成独立 token 输入，不设置共享 system prefix，
+用于真正的无 prefix-cache 对照；结果仍保留 `cache-report`。多个 case 可以在同一次运行中连续测试，
+每个 case 独立执行 `flush-cache`、命中率校验和请求率回测，例如：
+
+```bash
+bash sglang/gsp_prefix_bench.sh \
+  --case '8k,1,0,mean_ttft_ms,3|5' \
+  --case '50k,1,90,mean_ttft_ms,3|5'
 ```
 
 #### 811 节点官方 GSP 验证记录

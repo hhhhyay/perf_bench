@@ -58,6 +58,7 @@ dry_run=0
 run_failure=0
 
 declare -a CASES=()
+CASE_NO_SHARED_PREFIX=0
 
 write_run_metadata() {
   local metadata_path="${out_dir}/run_metadata.json"
@@ -169,6 +170,9 @@ Environment:
   RUN_ID=...                       Result directory suffix
 
 The hit rate is token-level: total_cached_tokens / total_prompt_tokens.
+  HIT_RATE=0 uses the official random-ids workload with independent token ids, so it
+  is a true no-prefix-cache control without downloading ShareGPT. Multiple --case values can be run
+  together; each case is calibrated and measured independently.
   The default calibration assumes four concurrent first requests per ordered prefix group can miss;
   the script adjusts system/question length, then tries alternate GSP layouts when the measured
   cache-report rate still misses the target. Set GSP_AUTO_LAYOUT=0 to keep explicit layouts fixed.
@@ -420,6 +424,9 @@ length, hit_pct, prompts, misses = (
 )
 tolerance = float(sys.argv[8])
 page_size, page_align, extra_tokens = int(sys.argv[4]), sys.argv[5] == "1", int(sys.argv[6])
+if abs(hit_pct) < 1e-12:
+    print(0, length, "0.000000", "0.000000")
+    raise SystemExit(0)
 if prompts <= misses:
     raise SystemExit("prompts_per_group must be greater than cache misses per group")
 if extra_tokens < 0:
@@ -572,8 +579,8 @@ parse_case() {
       return 1
     }
   fi
-  is_positive_decimal "${CASE_HIT_PCT}" || {
-    echo "[ERROR] HIT_RATE 必须是正数: ${raw}" >&2
+  is_nonnegative_decimal "${CASE_HIT_PCT}" || {
+    echo "[ERROR] HIT_RATE 必须是非负数: ${raw}" >&2
     return 1
   }
   awk -v v="${CASE_HIT_PCT}" 'BEGIN { exit !(v < 100) }' || {
@@ -587,6 +594,10 @@ parse_case() {
     }
   else
     CASE_CONCURRENCY="${GSP_MAX_CONCURRENCY}"
+  fi
+  CASE_NO_SHARED_PREFIX=0
+  if awk -v v="${CASE_HIT_PCT}" 'BEGIN { exit !(v == 0) }'; then
+    CASE_NO_SHARED_PREFIX=1
   fi
 
   case "${CASE_TTFT_METRIC}" in
@@ -692,6 +703,9 @@ print_case() {
   echo "Target theory (raw)  : ${CASE_REQUESTED_THEORY_HIT_PCT}%"
   echo "Theoretical hit rate : ${CASE_THEORY_HIT_PCT}% (page size ${GSP_PAGE_SIZE})"
   echo "System/question      : ${CASE_SYSTEM_LEN}/${CASE_QUESTION_LEN}"
+  if (( CASE_NO_SHARED_PREFIX == 1 )); then
+    echo "Workload             : random independent prompts (no shared prefix)"
+  fi
   echo "Groups/prompts       : ${GSP_NUM_GROUPS}/${GSP_PROMPTS_PER_GROUP}"
   echo "Num prompts          : ${CASE_NUM_PROMPTS}"
   echo "TTFT                 : ${CASE_TTFT_METRIC} < ${CASE_TTFT_TARGETS} s"
@@ -709,15 +723,23 @@ print_dry_run_case() {
   echo "Official command:"
   printf '  %q' "${PYTHON_BIN}" -m sglang.bench_serving
   printf ' %q' --backend sglang --base-url "${BASE_URL}" --model "${MODEL:-<model>}"
-  printf ' %q' --dataset-name generated-shared-prefix
-  printf ' %q' --gsp-num-groups "${GSP_NUM_GROUPS}"
-  printf ' %q' --gsp-prompts-per-group "${GSP_PROMPTS_PER_GROUP}"
-  printf ' %q' --gsp-system-prompt-len "${CASE_SYSTEM_LEN}"
-  printf ' %q' --gsp-question-len "${CASE_QUESTION_LEN}"
-  printf ' %q' --gsp-output-len "${CASE_OUTPUT_LEN}"
-  printf ' %q' --gsp-ordered --num-prompts "${CASE_NUM_PROMPTS}"
+  if (( CASE_NO_SHARED_PREFIX == 1 )); then
+    printf ' %q' --dataset-name random-ids
+    printf ' %q' --random-input-len "${CASE_INPUT_LEN}"
+    printf ' %q' --random-output-len "${CASE_OUTPUT_LEN}"
+    printf ' %q' --tokenize-prompt
+    printf ' %q' --num-prompts "${CASE_NUM_PROMPTS}"
+  else
+    printf ' %q' --dataset-name generated-shared-prefix
+    printf ' %q' --gsp-num-groups "${GSP_NUM_GROUPS}"
+    printf ' %q' --gsp-prompts-per-group "${GSP_PROMPTS_PER_GROUP}"
+    printf ' %q' --gsp-system-prompt-len "${CASE_SYSTEM_LEN}"
+    printf ' %q' --gsp-question-len "${CASE_QUESTION_LEN}"
+    printf ' %q' --gsp-output-len "${CASE_OUTPUT_LEN}"
+    printf ' %q' --gsp-ordered --num-prompts "${CASE_NUM_PROMPTS}"
+  fi
   printf ' %q' --flush-cache --warmup-requests 0 --seed "${SEED}" --cache-report
-  if [[ "${GSP_INPUT_IDS}" == "1" ]]; then
+  if (( CASE_NO_SHARED_PREFIX == 0 )) && [[ "${GSP_INPUT_IDS}" == "1" ]]; then
     printf ' %q' --gsp-input-ids
   fi
   printf ' %q' --request-rate "${request_rate}" --disable-tqdm --output-file /dev/null
@@ -759,6 +781,7 @@ check_bench_flags() {
   }
   for flag in \
     generated-shared-prefix \
+    random random-ids --random-input-len --random-output-len --tokenize-prompt \
     --gsp-num-groups --gsp-prompts-per-group --gsp-system-prompt-len \
     --gsp-question-len --gsp-output-len --gsp-ordered --flush-cache \
     --seed --cache-report --output-file; do
@@ -870,14 +893,6 @@ build_bench_command() {
     --backend sglang
     --base-url "${BASE_URL}"
     --model "${MODEL}"
-    --dataset-name generated-shared-prefix
-    --gsp-num-groups "${GSP_NUM_GROUPS}"
-    --gsp-prompts-per-group "${GSP_PROMPTS_PER_GROUP}"
-    --gsp-system-prompt-len "${CASE_SYSTEM_LEN}"
-    --gsp-question-len "${CASE_QUESTION_LEN}"
-    --gsp-output-len "${CASE_OUTPUT_LEN}"
-    --gsp-ordered
-    --num-prompts "${CASE_NUM_PROMPTS}"
     --flush-cache
     --warmup-requests 0
     --seed "${SEED}"
@@ -886,7 +901,27 @@ build_bench_command() {
     --disable-tqdm
     --output-file /dev/null
   )
-  if [[ "${GSP_INPUT_IDS}" == "1" ]]; then
+  if (( CASE_NO_SHARED_PREFIX == 1 )); then
+    cmd+=(
+      --dataset-name random-ids
+      --random-input-len "${CASE_INPUT_LEN}"
+      --random-output-len "${CASE_OUTPUT_LEN}"
+      --tokenize-prompt
+      --num-prompts "${CASE_NUM_PROMPTS}"
+    )
+  else
+    cmd+=(
+      --dataset-name generated-shared-prefix
+      --gsp-num-groups "${GSP_NUM_GROUPS}"
+      --gsp-prompts-per-group "${GSP_PROMPTS_PER_GROUP}"
+      --gsp-system-prompt-len "${CASE_SYSTEM_LEN}"
+      --gsp-question-len "${CASE_QUESTION_LEN}"
+      --gsp-output-len "${CASE_OUTPUT_LEN}"
+      --gsp-ordered
+      --num-prompts "${CASE_NUM_PROMPTS}"
+    )
+  fi
+  if (( CASE_NO_SHARED_PREFIX == 0 )) && [[ "${GSP_INPUT_IDS}" == "1" ]]; then
     cmd+=(--gsp-input-ids)
   fi
   if [[ -n "${CASE_CONCURRENCY:-}" ]]; then
