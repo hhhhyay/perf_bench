@@ -1332,7 +1332,7 @@ metadata_fields = [
 ]
 preferred_fields = [
     "case_id", "input", "output",
-    "specified_cache_hit_rate_pct", "SLO_ms", "actual_cache_hit_rate_pct",
+    "specified_cache_hit_rate_pct", "SLO", "actual_cache_hit_rate_pct",
     "parallel_config", "system_prompt_len", "question_len",
     "gsp_page_size", "gsp_num_groups", "gsp_prompts_per_group",
     "successful_requests", "num_prompts",
@@ -1393,25 +1393,34 @@ for case_id, case_rows in case_groups.items():
     inf_hit = num(baseline, "actual_cache_hit_rate_pct")
     metric = baseline.get("ttft_metric", "")
     if metric == "mean_ttft_ms":
-        slo_key = "mean"
+        ttft_key = "mean"
     elif metric.startswith("p") and metric.endswith("_ttft_ms"):
-        slo_key = metric[1:-len("_ttft_ms")]
+        ttft_key = "P" + metric[1:-len("_ttft_ms")]
     else:
-        slo_key = metric
+        ttft_key = metric
     slo_values = []
     for target_s in baseline.get("ttft_targets_s", "").split("|"):
         if not target_s:
             continue
         try:
-            target_ms = float(target_s) * 1000.0
+            target_seconds = float(target_s)
         except ValueError:
             continue
-        slo_values.append(int(target_ms) if target_ms.is_integer() else target_ms)
-    slo_payload = {slo_key: slo_values[0] if len(slo_values) == 1 else slo_values} if slo_key and slo_values else {}
+        slo_values.append(int(target_seconds) if target_seconds.is_integer() else target_seconds)
+    slo_payload = {"ttft": {ttft_key: slo_values}} if ttft_key and slo_values else {}
     if baseline.get("tpot_metric") and baseline.get("tpot_target_ms"):
         try:
             tpot_target = float(baseline["tpot_target_ms"])
-            slo_payload["tpot"] = int(tpot_target) if tpot_target.is_integer() else tpot_target
+            tpot_metric = baseline["tpot_metric"]
+            if tpot_metric == "mean_tpot_ms":
+                tpot_key = "mean"
+            elif tpot_metric.startswith("p") and tpot_metric.endswith("_tpot_ms"):
+                tpot_key = "P" + tpot_metric[1:-len("_tpot_ms")]
+            else:
+                tpot_key = tpot_metric
+            slo_payload.setdefault("tpot", {})[tpot_key] = [
+                int(tpot_target) if tpot_target.is_integer() else tpot_target
+            ]
         except ValueError:
             pass
     slo_json = json.dumps(slo_payload, ensure_ascii=False, separators=(",", ":"))
@@ -1427,7 +1436,7 @@ for case_id, case_rows in case_groups.items():
         output.update({
             "result_type": result_type,
             "parameter_status": "confirmed",
-            "SLO_ms": slo_json,
+            "SLO": slo_json,
             "request_rate": row.get("configured_request_rate", ""),
             "duration_s": row.get("benchmark_duration_s", row.get("duration_s", "")),
             "confirmed_inf_actual_rps": f"{inf_rps:.2f}" if inf_rps is not None else "",

@@ -1,6 +1,6 @@
 # perf_bench
 
-SGLang / vLLM 推理服务容量压测脚本集合，重点用于按照 per-DP batch size 扫描服务吞吐、TTFT、TPOT、ITL、E2EL 等指标，并把单次压测输出汇总为 CSV。
+SGLang / vLLM 推理服务容量压测脚本集合，重点用于按照 per-DP batch size 扫描服务吞吐、TTFT、TPOT、ITL、E2EL 等指标，并把单次压测输出汇总为 CSV/TSV。
 
 ## 目录结构
 
@@ -221,7 +221,7 @@ bash sglang/gsp_prefix_bench.sh --plot --cell input_throughput \
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
 - 每个新生成的 `.log` 开头也会写入上述模型、节点 hostname 和服务地址，便于单独复制日志后追溯来源。
 - `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准 probe；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
-- `gsp_prefix_summary.tsv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `request_rate=inf` 区分基线，并保留确认后的长度/分组/请求数、`confirmed_inf_actual_rps`、请求率、吞吐、实际 cache 命中率和完整客户端指标。`SLO_ms` 统一记录 TTFT/TPOT 要求，`page_aligned`、`ttft_metric`、`ttft_targets_s`、`tpot_metric`、`tpot_target_ms` 等过程字段不放入 summary。先按 `confirmed_inf_actual_rps` 降序排列，同一参数块内再按请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
+- `gsp_prefix_summary.tsv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `request_rate=inf` 区分基线，并保留确认后的长度/分组/请求数、`confirmed_inf_actual_rps`、请求率、吞吐、实际 cache 命中率和完整客户端指标。`SLO` 统一记录 TTFT/TPOT 要求，TTFT 单位为秒、TPOT 单位为毫秒，例如 `{"ttft":{"mean":[5,6]},"tpot":{"mean":[20]}}`；`page_aligned`、`ttft_metric`、`ttft_targets_s`、`tpot_metric`、`tpot_target_ms` 等过程字段不放入 summary。先按 `confirmed_inf_actual_rps` 降序排列，同一参数块内再按请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
 - 只有 `gsp_prefix_summary.tsv` 作为可复制汇总文件；它会在每个 trial 完成后刷新一次，收到中断信号时也会保存当前已完成结果。中断时不会执行 trial 清理，因此可以结合 `gsp_prefix_trials.csv` 和日志继续排查。
 - GSP CSV/TSV 会记录 `parallel_config`，优先从服务 `/server_info` 生成；接口不可用时可通过 `PARALLEL_CONFIG` 手动指定。
 - `gsp_prefix_summary.tsv`：唯一的 summary 汇总文件，列之间使用制表符，空值用 `-` 占位以避免终端复制时连续 Tab 导致列错位。执行 `cat gsp_prefix_summary.tsv` 后复制到 Excel/WPS，可直接按列粘贴。
@@ -487,7 +487,7 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 - `prefill_ttft_*_capacity_matrix_*.png`：指定 `--plot mean` 或 `--plot p99` 时生成的容量矩阵，文件名末尾标记中央指标。
 - `prefill_ttft_line.png` / `prefill_ttft_heatmap.png`：指定对应绘图模式时生成的辅助图。
 
-GSP 的 `gsp_prefix_summary.tsv` 面向复制到表格使用，保留输入/输出、指定和实际 cache 命中率、确认后的 workload 参数、请求率、吞吐和性能指标；执行过程字段如 `page_aligned`、`search_phase`、`log_file`、`backend`、`ttft_metric`、`ttft_targets_s` 等不放入 summary，原始排查信息仍保留在 `gsp_prefix_trials.csv`。`SLO_ms` 将 TTFT/TPOT 要求合并为 JSON，例如 `{"mean":[5000,6000],"tpot":100}` 或 `{"99":10000}`。
+GSP 的 `gsp_prefix_summary.tsv` 面向复制到表格使用，保留输入/输出、指定和实际 cache 命中率、确认后的 workload 参数、请求率、吞吐和性能指标；执行过程字段如 `page_aligned`、`search_phase`、`log_file`、`backend`、`ttft_metric`、`ttft_targets_s` 等不放入 summary，原始排查信息仍保留在 `gsp_prefix_trials.csv`。`SLO` 将 TTFT/TPOT 要求合并为 JSON，TTFT 使用秒、TPOT 使用毫秒，例如 `{"ttft":{"mean":[5,6],"P90":[8,10]},"tpot":{"mean":[20,30],"P90":[50,60]}}`。
 summary 的客户端指标按统一顺序排列：请求数/并发、请求率/时长、RPS/吞吐、TTFT/TPOT/ITL 的 `mean → p95 → p99`、E2E、cache/token 统计，`p50/p90/max` 等额外分位数统一放到 E2E 后面，便于与其他 benchmark 结果直接对齐。
 
 Prefill CSV 的客户端字段布局与 `sglc.sh` 对齐：保留前置客户端指标、`Mean/P95/P99 TTFT`、`Mean/P95/P99 TPOT`、`Mean/P95/P99 ITL`、`Mean E2E Latency`，并在其后放置 `P50/Std/P75/P90/P999/Max TTFT`。`Median TTFT`、其他 E2E 分位数及额外 TPOT/ITL 分位数不提取。矩阵目标列同时记录 `target_metric`、`target_value_ms` 和 `target_near_ms`。
