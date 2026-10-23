@@ -221,10 +221,17 @@ def write_summary(args):
         {field: (row.get(field, "") or "-") for field in fields}
         for row in output_rows
     ]
+    # This file is intended for direct copy/paste into a spreadsheet. Keep it as
+    # plain TSV instead of CSV-quoting every cell; JSON quotes inside SLO remain
+    # part of the value, while ordinary cells have no surrounding quotes.
     with open(summary_tsv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(clipboard_rows)
+        f.write("\t".join(fields) + "\n")
+        for row in clipboard_rows:
+            values = []
+            for field in fields:
+                value = str(row.get(field, "") or "")
+                values.append(value.replace("\t", " ").replace("\r", " ").replace("\n", " "))
+            f.write("\t".join(values) + "\n")
 
 def prune_confirmed_trials(args):
     import csv
