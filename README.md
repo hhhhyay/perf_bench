@@ -411,6 +411,6 @@ FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
 最大的结果；没有满足点显示 `NO MEET`。默认格子显示 RPS，设置
 `SGLC_PLOT_CELL=output_throughput` 后显示生成 token throughput。
 GSP 的 `gsp_prefix_summary.tsv` 面向复制到表格使用，保留输入/输出、指定和实际 cache 命中率、确认后的 workload 参数、请求率、吞吐和性能指标；执行过程字段如 `page_aligned`、`search_phase`、`log_file`、`backend`、`ttft_metric`、`ttft_targets_s` 等不放入 summary，原始排查信息仍保留在 `gsp_prefix_trials.csv`。`SLO` 将 TTFT/TPOT 要求合并为 JSON，TTFT 使用秒、TPOT 使用毫秒，例如 `{"ttft":{"mean":[5,6],"P90":[8,10]},"tpot":{"mean":[20,30],"P90":[50,60]}}`。
-summary 的公共客户端指标严格按 `sglc.sh` 的顺序排列；GSP 的指定/实际 cache 命中率、SLO、前缀长度和 groups/prompts 放在公共指标块之后。这样 GSP 与 SGLC 可以直接复制到同一张表中对齐，同时保留 GSP 的核心条件。
+summary 的公共客户端指标严格按 `sglc.sh` 的顺序排列；GSP 的指定/实际 cache 命中率和 `SLO` 紧跟在 case/输入输出/并行配置之后，优先展示核心命中率要求；其余前缀长度和 groups/prompts 字段放在公共指标块之后。
 
 `all_result/` 是运行产物目录，建议不要提交到仓库。

@@ -59,6 +59,9 @@ def write_summary(args):
         # be pasted into the same table without moving the standard metrics.
         "case_name", "input_len", "output_len",
         "parallel_config",
+        # Cache-hit requirements are the primary GSP case identity and should be
+        # visible before the common capacity/performance metrics.
+        "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
         "max_running_requests", "max_total_tokens", "tokens_per_request",
         "token_theoretical_per_dp_bs", "effective_theoretical_per_dp_bs",
         "per_dp_bs", "num_prompts",
@@ -76,8 +79,7 @@ def write_summary(args):
         "p90_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "std_tpot_ms", "p75_tpot_ms",
         "p90_tpot_ms", "p999_tpot_ms", "max_tpot_ms", "std_itl_ms", "p75_itl_ms",
         "p90_itl_ms", "p999_itl_ms", "max_itl_ms",
-        # GSP workload fields come after the shared client metrics.
-        "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
+        # Remaining GSP workload fields come after the shared client metrics.
         "system_prompt_len", "question_len", "gsp_page_size", "gsp_num_groups",
         "gsp_prompts_per_group", "total_prompt_tokens", "total_cached_tokens",
         # P50 is retained as an extra after the shared columns.
