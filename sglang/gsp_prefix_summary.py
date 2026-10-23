@@ -43,6 +43,11 @@ def write_summary(args):
             return ""
         return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
 
+    def pair_value(row, left_key, right_key):
+        left = csv_number(num(row, left_key))
+        right = csv_number(num(row, right_key))
+        return f"{left}/{right}" if left and right else "-"
+
     def same_parameters(row, baseline):
         keys = ("gsp_num_groups", "gsp_prompts_per_group", "system_prompt_len", "question_len")
         return all(row.get(key, "") == baseline.get(key, "") for key in keys)
@@ -61,7 +66,7 @@ def write_summary(args):
         "parallel_config",
         # Cache-hit requirements are the primary GSP case identity and should be
         # visible before the common capacity/performance metrics.
-        "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
+        "specified_cache_hit_rate_pct/actual_cache_hit_rate_pct", "SLO",
         "max_running_requests", "max_total_tokens", "tokens_per_request",
         "token_theoretical_per_dp_bs", "effective_theoretical_per_dp_bs",
         "per_dp_bs", "num_prompts",
@@ -80,10 +85,12 @@ def write_summary(args):
         "p90_tpot_ms", "p999_tpot_ms", "max_tpot_ms", "std_itl_ms", "p75_itl_ms",
         "p90_itl_ms", "p999_itl_ms", "max_itl_ms",
         # Remaining GSP workload fields come after the shared client metrics.
-        "system_prompt_len", "question_len", "gsp_page_size", "gsp_num_groups",
-        "gsp_prompts_per_group", "total_prompt_tokens", "total_cached_tokens",
+        "system_prompt_len/question_len", "gsp_page_size",
+        "gsp_num_groups/gsp_prompts_per_group",
         # P50 is retained as an extra after the shared columns.
         "p50_ttft_ms", "p50_tpot_ms", "p50_itl_ms",
+        # Keep aggregate cache-token counts at the end of the GSP-specific block.
+        "total_prompt_tokens", "total_cached_tokens",
     ]
     excluded_fields = {
         "result_type", "parameter_status", "confirmed_inf_phase", "request_rate_order",
@@ -94,6 +101,8 @@ def write_summary(args):
         "confirmed_inf_cache_hit_rate_pct", "configured_request_rate", "benchmark_duration_s",
         "case_id", "input", "output", "successful_requests", "request_throughput",
         "input_throughput", "output_throughput", "total_throughput", "max_tpot_ms",
+        "system_prompt_len", "question_len", "gsp_num_groups", "gsp_prompts_per_group",
+        "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct",
         "p50_e2e_latency_ms", "p95_e2e_latency_ms", "p99_e2e_latency_ms",
         "case_status", "case_exit_code", "benchmark_result_found",
     }
@@ -197,7 +206,16 @@ def write_summary(args):
                 "total_throughput_tok_s": total_tp,
                 "result_type": result_type,
                 "parameter_status": "confirmed",
+                "specified_cache_hit_rate_pct/actual_cache_hit_rate_pct": pair_value(
+                    row, "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct"
+                ),
                 "SLO": slo_json,
+                "system_prompt_len/question_len": pair_value(
+                    row, "system_prompt_len", "question_len"
+                ),
+                "gsp_num_groups/gsp_prompts_per_group": pair_value(
+                    row, "gsp_num_groups", "gsp_prompts_per_group"
+                ),
                 "request_rate": row.get("configured_request_rate", ""),
                 "duration_s": row.get("benchmark_duration_s", row.get("duration_s", "")),
                 "confirmed_inf_actual_rps": f"{inf_rps:.2f}" if inf_rps is not None else "",
