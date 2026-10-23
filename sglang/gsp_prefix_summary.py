@@ -54,18 +54,14 @@ def write_summary(args):
         "actual_cache_hit_rate_delta_pct",
     ]
     preferred_fields = [
-        # Keep the common prefix identical to sglc.sh so the two summaries can be
-        # pasted into the same table without moving the standard metrics.
+        # Keep the complete public metric block identical to sglc.sh. GSP-only
+        # workload fields are appended after this block so the two summaries can
+        # be pasted into the same table without moving the standard metrics.
         "case_name", "input_len", "output_len",
         "parallel_config",
-        # These fields define the GSP workload and must stay visible before the
-        # performance columns; without them the cache metrics are not interpretable.
-        "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
-        "system_prompt_len", "question_len", "gsp_page_size", "gsp_num_groups",
-        "gsp_prompts_per_group", "total_prompt_tokens", "total_cached_tokens",
-        "max_running_requests", "max_total_tokens",
-        "tokens_per_request", "token_theoretical_per_dp_bs",
-        "effective_theoretical_per_dp_bs", "per_dp_bs", "num_prompts",
+        "max_running_requests", "max_total_tokens", "tokens_per_request",
+        "token_theoretical_per_dp_bs", "effective_theoretical_per_dp_bs",
+        "per_dp_bs", "num_prompts",
         "max_concurrency", "concurrency", "peak_output_throughput", "peak_concurrency",
         "request_rate", "duration_s", "rps", "input_throughput_tok_s",
         "generate_throughput_tok_s", "total_throughput_tok_s",
@@ -80,7 +76,11 @@ def write_summary(args):
         "p90_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "std_tpot_ms", "p75_tpot_ms",
         "p90_tpot_ms", "p999_tpot_ms", "max_tpot_ms", "std_itl_ms", "p75_itl_ms",
         "p90_itl_ms", "p999_itl_ms", "max_itl_ms",
-        # P50 is retained as a GSP-specific extra after the shared columns.
+        # GSP workload fields come after the shared client metrics.
+        "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct", "SLO",
+        "system_prompt_len", "question_len", "gsp_page_size", "gsp_num_groups",
+        "gsp_prompts_per_group", "total_prompt_tokens", "total_cached_tokens",
+        # P50 is retained as an extra after the shared columns.
         "p50_ttft_ms", "p50_tpot_ms", "p50_itl_ms",
     ]
     excluded_fields = {
