@@ -258,4 +258,3 @@ git diff --check
 ```
 
 远程 benchmark 不属于本次代码改动；后续真实节点验证仍需先检查 GPU/DCU、容器、端口和剩余显存。
-
