@@ -19,6 +19,7 @@
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${script_dir}/sglc_bs_helpers.sh"
 
 # ============================================================
 # 1. 基础配置
@@ -53,7 +54,8 @@ import tempfile
  node_hostname, output_dir, dp_size, parallel_config) = sys.argv[1:]
 prefixes = ("SLA_", "HARD_STOP_", "TOKEN_UNIT", "DP_SIZE", "TP_SIZE", "PP_SIZE",
             "EP_SIZE", "ATTN_CP_SIZE", "KV_CACHE_DTYPE", "MEM_FRACTION_STATIC",
-            "DP_ATTENTION", "USE_FAKE_PREFILL", "NUM_PROMPTS_MULTIPLIER", "SGLC_PLOT")
+             "DP_ATTENTION", "USE_FAKE_PREFILL", "NUM_PROMPTS_MULTIPLIER",
+             "MAX_TEST_PER_DP_BS", "SGLC_PLOT")
 metadata = {
     "started_at": started_at,
     "script": script,
@@ -185,6 +187,8 @@ USE_FAKE_PREFILL="${USE_FAKE_PREFILL:-0}"
 # ============================================================
 FIXED_PER_DP_BS="${FIXED_PER_DP_BS:-}"
 FIXED_CONCURRENCY="${FIXED_CONCURRENCY:-}"
+# 自动理论 BS 扫描的 per-DP 上限；为空时不限制。
+MAX_TEST_PER_DP_BS="${MAX_TEST_PER_DP_BS:-}"
 
 # 请求数量倍率：
 #   num_prompts = max_concurrency * NUM_PROMPTS_MULTIPLIER
@@ -610,7 +614,7 @@ get_test_bs_list() {
     return
   fi
 
-  printf "%s\n" "${auto_bs_list}"
+  cap_auto_bs_list "${auto_bs_list}" "${MAX_TEST_PER_DP_BS}"
 }
 
 get_test_mode_name() {
@@ -1393,6 +1397,10 @@ if [[ ! "${NUM_PROMPTS_MULTIPLIER}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[ERROR] NUM_PROMPTS_MULTIPLIER 必须是正整数，当前=${NUM_PROMPTS_MULTIPLIER}"
   exit 1
 fi
+if [[ -n "${MAX_TEST_PER_DP_BS}" && ! "${MAX_TEST_PER_DP_BS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] MAX_TEST_PER_DP_BS 必须是正整数，当前=${MAX_TEST_PER_DP_BS}"
+  exit 1
+fi
 
 write_run_metadata
 
@@ -1415,6 +1423,7 @@ echo "USE_FAKE_PREFILL : ${USE_FAKE_PREFILL}"
 echo "TEST_MODE        : $(get_test_mode_name)"
 echo "FIXED_PER_DP_BS  : ${FIXED_PER_DP_BS:-AUTO}"
 echo "FIXED_CONCURRENCY: ${FIXED_CONCURRENCY:-AUTO}"
+echo "MAX_TEST_PER_DP_BS: ${MAX_TEST_PER_DP_BS:-AUTO_THEORY}"
 echo "NUM_PROMPTS_MULT : ${NUM_PROMPTS_MULTIPLIER}"
 echo
 echo "Output Directory : ${out_dir}"
@@ -1650,6 +1659,7 @@ for case_config in "${CASES[@]}"; do
   theoretical_global_bs="$(awk -v bs="${theoretical_bs}" -v dp="${DP_SIZE}" 'BEGIN { printf "%.3f", bs * dp }')"
   auto_bs_list="$(get_bs_list "${input_k}" "${output_k}")"
   bs_list="$(get_test_bs_list "${auto_bs_list}")"
+  test_bs_upper="$(printf '%s\n' ${bs_list} | tail -n 1)"
 
   echo
   echo
@@ -1667,6 +1677,8 @@ for case_config in "${CASES[@]}"; do
   echo "# Limiting Factor   : ${theory_limit_factor}"
   echo "# Test Mode         : $(get_test_mode_name)"
   echo "# Auto BS           : ${auto_bs_list}"
+  echo "# Auto Test Cap     : ${MAX_TEST_PER_DP_BS:-NONE(theory)}"
+  echo "# Test BS Upper     : ${test_bs_upper}"
   if [[ -n "${CUDA_GRAPH_DECODE_BS}" ]]; then
     echo "# BS Source         : server_info.cuda_graph_config.decode.bs + theory ±1/±2"
   else
