@@ -294,6 +294,7 @@ SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
 | `NODE_HOSTNAME` | 覆盖结果元数据中的节点 hostname，适合容器内 hostname 未映射到宿主机节点时使用。 |
 | `FIXED_PER_DP_BS` | 固定 per-DP BS 测试点，支持逗号或空格分隔多个值。 |
 | `FIXED_CONCURRENCY` | 固定全局并发测试点，必须能被 `DP_SIZE` 整除。 |
+| `MAX_TEST_PER_DP_BS` | SGLang 自动理论 BS 扫描的 per-DP 上限；为空时按理论容量扫描，只有自动模式生效，固定 BS/并发模式不截断。 |
 | `NUM_PROMPTS_MULTIPLIER` | 请求数量倍率，`num_prompts = max_concurrency * NUM_PROMPTS_MULTIPLIER`。 |
 | `SLA_DENSE_ENABLE` | 是否开启 SLA inline 加密扫描，默认 `1`。 |
 | `SLA_RULES` | SLA 规则，格式为 `metric:target:near`，多个规则用逗号分隔。 |
@@ -398,6 +399,15 @@ FIXED_PER_DP_BS="8,12,16" bash vllm/vllmc.sh
 ```bash
 FIXED_CONCURRENCY="64 96 128" bash sglang/sglc.sh
 FIXED_CONCURRENCY="64 96 128" bash vllm/vllmc.sh
+```
+
+SGLang 自动理论 BS 扫描可以单独设置本次测试的最大 per-DP BS。理论容量仍会保留在日志中，
+不会因为测试上限而被修改；日志中的 `Effective Theory`、`Auto Test Cap` 和 `Test BS Upper`
+分别表示理论容量、配置上限和本次实际测试到的最大 BS：
+
+```bash
+# 理论 per-DP BS 为 32 时，本次自动扫描最多验证到 BS16；理论值更小时不扩容。
+MAX_TEST_PER_DP_BS=16 bash sglang/sglc.sh
 ```
 
 ## 输出
