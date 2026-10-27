@@ -69,9 +69,12 @@ question_len = L - system_prompt_len
 默认使用官方 `--gsp-input-ids` 直接发送 token ID，避免随机 token 经文本解码和重新编码后产生输入长度漂移；
 如需兼容不支持该参数的旧版 SGLang，可设置 `GSP_INPUT_IDS=0`，但实际输入长度和命中率可能发生偏差。
 
-默认开启自动命中率校准：每个 `inf` 候选先执行一次短 probe；如果实测命中率不满足，
-脚本按 `目标命中率 / 实测命中率` 修正共享前缀长度，并按 page size 对齐，最多再修正两轮；
-命中率确认后，GSP 会重复执行 `inf`，以客户端 `input_throughput` 最高值作为基线；默认最多 5 次，连续 2 次不再提升就进入有限请求率回测。
+默认开启自动命中率校准：每个 `inf` 候选直接使用官方完整 workload 校验命中率；如果实测命中率不满足，
+脚本按 `目标命中率 / 实测命中率` 计算方向，并默认只走 50% 的修正步长再按 page size 对齐，最多再执行 1 次完整校正，
+避免一次校正跨过目标后又触发多轮反向完整压测。
+默认 `inf` 容差为 0.5 个百分点；如需放宽 page 对齐和冷 miss 的正常波动，可显式设置
+`GSP_BASELINE_HIT_RATE_TOLERANCE_PCT=1.0`。命中率确认后，
+GSP 会重复执行 `inf`，以客户端 `input_throughput` 最高值作为基线；默认最多 5 次，连续 2 次不再提升就进入有限请求率回测。
 仍不达标时自动切换 `prompts/group` 和 `groups` 候选布局。校准 trial 会保留在
 `gsp_prefix_trials.csv`，用于保留命中率修正前后的完整试探过程；确认参数后，最终的 `inf` 和有限请求率结果会单独整理到
 `gsp_prefix_summary.tsv`。布局切换只改变请求组织方式，
@@ -136,13 +139,13 @@ prompt/group 候选的 `inf` 命中率都不达标，summary 必须标记为 `BA
 基线，不作为最终容量点。
 在固定 GSP 分组、共享前缀长度和 `--flush-cache` 口径下，请求率通常不会大幅改变
 token-level cache hit rate，但无 `max-concurrency` 时并发冷 miss 数可能随请求率变化。
-因此脚本对 `inf` baseline 使用严格的 `0.5` 个百分点容差，对有限请求率默认使用
+因此脚本对 `inf` baseline 默认使用 `0.5` 个百分点容差，对有限请求率默认使用
 `1.5` 个百分点容差，并且 CSV 仍完整记录每个点的实测命中率和偏差；超过有限速率容差
 仍判定为 `NO_MEET`，不会用理论值替代实测值。对应结果目录为
 `/all_result/bench_gsp_prefix_20261019_dynamic_duration_60/`。
 
 `GSP_SYSTEM_LEN_EXTRA_TOKENS` 仍可用于已有服务的实测校准，但默认不追加额外 token；这不是
-替代实测命中率。`inf` 使用严格的 `0.5` 个百分点容差，有限请求率默认使用 `1.5` 个百分点
+替代实测命中率。`inf` 默认使用 `0.5` 个百分点容差，有限请求率默认使用 `1.5` 个百分点
 容差，并可分别用 `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` 和
 `GSP_FINITE_HIT_RATE_TOLERANCE_PCT` 调整。
 
@@ -215,8 +218,8 @@ GSP_PLOT=0 bash sglang/gsp_prefix_bench.sh --no-plot \
 - `run_metadata.json`：本次运行的模型、服务地址、节点 hostname、启动时间、脚本 commit 和关键环境参数。节点 hostname 默认由 `hostname` 获取，也可通过 `NODE_HOSTNAME` 显式覆盖。
 - `logs/`：每个 case/请求率的官方 benchmark 日志和 `.exitcode`。
 - 每个新生成的 `.log` 开头也会写入上述模型、节点 hostname 和服务地址，便于单独复制日志后追溯来源。
-- `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准 probe；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
-- `gsp_prefix_summary.tsv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `request_rate=inf` 区分基线，并保留确认后的长度/分组/请求数、请求率、吞吐、实际 cache 命中率和完整客户端指标。`SLO` 统一记录 TTFT/TPOT 要求，TTFT 单位为秒、TPOT 单位为毫秒，例如 `{"ttft":{"mean":[5,6]},"tpot":{"mean":[20]}}`；`page_aligned`、`ttft_metric`、`ttft_targets_s`、`tpot_metric`、`tpot_target_ms` 等过程字段不放入 summary。summary 内部仍按确认后的 INF 实际 RPS 降序排列，同一参数块内再按请求率从高到低排列，`inf` 位于块首；总 token 统计列放在末尾。
+- `gsp_prefix_trials.csv`：只保留正式测试前的参数试探记录，包括未确认布局和命中率校准记录；保留指定/理论/page 对齐理论/实际 cache 命中率、候选长度、groups/prompts、请求数、duration、TTFT、TPOT、ITL、Mean E2E 和日志路径。最终确认参数的正式 `inf` 与有限请求率回测会从该文件移出并进入 summary。
+- `gsp_prefix_summary.tsv`：只保留命中率修正后最终确认参数对应的完整明细；每个确认参数块包含 1 行 `inf` 和所有有限请求率回测行，使用 `request_rate=inf` 区分基线，并保留确认后的长度/分组/请求数、请求率、吞吐、实际 cache 命中率和完整客户端指标。`SLO` 统一记录 TTFT/TPOT 要求，TTFT 单位为秒、TPOT 单位为毫秒，例如 `{"ttft":{"mean":[5,6]},"tpot":{"mean":[20]}}`；`page_aligned`、`ttft_metric`、`ttft_targets_s`、`tpot_metric`、`tpot_target_ms` 等过程字段不放入 summary。summary 内部仍按确认后的 INF 实际 RPS 降序排列，同一参数块内再按请求率从高到低排列，`inf` 位于块首；总 token 统计列不再输出。
 - 只有 `gsp_prefix_summary.tsv` 作为可复制汇总文件；它会在每个 trial 完成后刷新一次，收到中断信号时也会保存当前已完成结果。中断时不会执行 trial 清理，因此可以结合 `gsp_prefix_trials.csv` 和日志继续排查。
 - GSP CSV/TSV 会记录 `parallel_config`，优先从服务 `/server_info` 生成；接口不可用时可通过 `PARALLEL_CONFIG` 手动指定。
 - `gsp_prefix_summary.tsv`：唯一的 summary 汇总文件，列之间使用制表符，空值用 `-` 占位以避免终端复制时连续 Tab 导致列错位。执行 `cat gsp_prefix_summary.tsv` 后复制到 Excel/WPS，可直接按列粘贴。
@@ -312,7 +315,8 @@ SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
 | `GSP_PROMPTS_PER_GROUP` | 首选每组 prompt 数；自动布局开启且校正失败时，会继续尝试候选组合。设置 `GSP_AUTO_LAYOUT=0` 才固定为该值。 |
 | `GSP_CACHE_MISS_REQUESTS_PER_GROUP` | 初始长度计算时每组预估的并发未命中请求数，默认 `4`（按 H20 实测）；最终仍以官方 `cache-report` 实测命中率为准。 |
 | `GSP_AUTO_CALIBRATE` | 是否在 `inf` 命中率偏差后自动修正 system/question 长度，默认 `1`。 |
-| `GSP_CALIBRATION_MAX_ITERS` | 每个 GSP 布局最多追加的校准 probe 次数，默认 `2`。 |
+| `GSP_CALIBRATION_MAX_ITERS` | 完整 workload 命中率仍偏离时，每个 GSP 布局最多追加的正式校正次数，默认 `1`。 |
+| `GSP_CALIBRATION_STEP_RATIO` | 每次向实测比例修正值移动的步长比例，默认 `0.5`；用于降低 page/cold-miss 波动造成的过校正。 |
 | `GSP_AUTO_LAYOUT` | 命中率校正仍不达标时是否自动尝试其他 groups/prompts 布局，默认 `1`；设为 `0` 保持显式布局固定。 |
 | `GSP_AUTO_DURATION` | 是否按 pilot RPS 和实测 duration 动态调整每个 case 的请求数，默认 `1`；显式设置 `GSP_NUM_GROUPS` 时不调整 groups。 |
 | `GSP_TARGET_DURATION_S` | 每个 case 的目标 benchmark 时长，默认 `60` 秒，允许 `60-120` 秒；按 prompts/group 向上取整请求数。 |
@@ -325,7 +329,7 @@ SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
 | `GSP_PAGE_ALIGN` | 是否按 KV page 对齐共享前缀，默认 `1`；设为 `0` 保留未对齐理论长度。 |
 | `GSP_SYSTEM_LEN_EXTRA_TOKENS` | 在基础 page 对齐长度上追加的共享前缀 token 数，默认 `0`；仅用于已由官方 `cache-report` 证实的稳定偏差校准，建议使用 page 大小的整数倍。 |
 | `GSP_HIT_RATE_TOLERANCE_PCT` | page 对齐和兼容逻辑使用的命中率容差，默认 `0.5` 个百分点。 |
-| `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` | `inf` baseline 的严格实测命中率容差，默认 `0.5` 个百分点。 |
+| `GSP_BASELINE_HIT_RATE_TOLERANCE_PCT` | `inf` baseline 的严格实测命中率容差，默认 `0.5` 个百分点；需要放宽时可显式设置为 `1.0`。 |
 | `GSP_FINITE_HIT_RATE_TOLERANCE_PCT` | 有限请求率回测的命中率容差，默认 `1.5` 个百分点，用于覆盖无并发上限时的冷 miss 漂移。 |
 | `GSP_INF_MAX_TRIALS` | 命中率确认后重复 `inf` 的最大次数，默认 `5`。 |
 | `GSP_INF_NO_IMPROVEMENT_LIMIT` | `input_throughput` 连续不提升的停止次数，默认 `2`。 |

@@ -77,20 +77,15 @@ def write_summary(args):
         "mean_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
         "mean_itl_ms", "p95_itl_ms", "p99_itl_ms",
         "accept_length", "mean_e2e_latency_ms",
-        "total_input_tokens", "total_input_text_tokens", "total_generated_tokens",
-        "total_generated_tokens_retokenized",
         "std_e2e_latency_ms", "p75_e2e_latency_ms", "p90_e2e_latency_ms",
         "p999_e2e_latency_ms", "max_e2e_latency_ms", "std_ttft_ms", "p75_ttft_ms",
-        "p90_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "std_tpot_ms", "p75_tpot_ms",
-        "p90_tpot_ms", "p999_tpot_ms", "max_tpot_ms", "std_itl_ms", "p75_itl_ms",
-        "p90_itl_ms", "p999_itl_ms", "max_itl_ms",
+        "p90_ttft_ms", "p999_ttft_ms", "max_ttft_ms", "p75_tpot_ms",
+        "p90_tpot_ms", "p75_itl_ms", "p90_itl_ms",
         # Remaining GSP workload fields come after the shared client metrics.
         "system_prompt_len/question_len", "gsp_page_size",
         "gsp_num_groups/gsp_prompts_per_group",
         # P50 is retained as an extra after the shared columns.
         "p50_ttft_ms", "p50_tpot_ms", "p50_itl_ms",
-        # Keep aggregate cache-token counts at the end of the GSP-specific block.
-        "total_prompt_tokens", "total_cached_tokens",
     ]
     excluded_fields = {
         "result_type", "parameter_status", "confirmed_inf_phase", "request_rate_order",
@@ -101,6 +96,9 @@ def write_summary(args):
         "confirmed_inf_cache_hit_rate_pct", "configured_request_rate", "benchmark_duration_s",
         "case_id", "input", "output", "successful_requests", "request_throughput",
         "input_throughput", "output_throughput", "total_throughput", "max_tpot_ms",
+        "total_input_tokens", "total_input_text_tokens", "total_generated_tokens",
+        "total_generated_tokens_retokenized", "std_tpot_ms", "p999_tpot_ms",
+        "std_itl_ms", "p999_itl_ms", "max_itl_ms", "total_prompt_tokens", "total_cached_tokens",
         "system_prompt_len", "question_len", "gsp_num_groups", "gsp_prompts_per_group",
         "specified_cache_hit_rate_pct", "actual_cache_hit_rate_pct",
         "p50_e2e_latency_ms", "p95_e2e_latency_ms", "p99_e2e_latency_ms",

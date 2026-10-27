@@ -18,7 +18,8 @@ GSP_PROMPTS_PER_GROUP="${GSP_PROMPTS_PER_GROUP:-16}"
 GSP_PROMPTS_PER_GROUP_CANDIDATES="${GSP_PROMPTS_PER_GROUP_CANDIDATES:-16,32,64,96,128,256}"
 GSP_CACHE_MISS_REQUESTS_PER_GROUP="${GSP_CACHE_MISS_REQUESTS_PER_GROUP:-4}"
 GSP_AUTO_CALIBRATE="${GSP_AUTO_CALIBRATE:-1}"
-GSP_CALIBRATION_MAX_ITERS="${GSP_CALIBRATION_MAX_ITERS:-2}"
+GSP_CALIBRATION_MAX_ITERS="${GSP_CALIBRATION_MAX_ITERS:-1}"
+GSP_CALIBRATION_STEP_RATIO="${GSP_CALIBRATION_STEP_RATIO:-0.5}"
 GSP_AUTO_LAYOUT="${GSP_AUTO_LAYOUT:-1}"
 GSP_AUTO_DURATION="${GSP_AUTO_DURATION:-1}"
 GSP_TARGET_DURATION_S="${GSP_TARGET_DURATION_S:-60}"
@@ -43,7 +44,7 @@ SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null ||
 PYTHON_PLOT_BIN="${PYTHON_PLOT_BIN:-${PYTHON_BIN}}"
 RATE_STEP="${GSP_RATE_STEP:-0.1}"
 HIT_RATE_TOLERANCE="${GSP_HIT_RATE_TOLERANCE_PCT:-0.5}"
-BASELINE_HIT_RATE_TOLERANCE="${GSP_BASELINE_HIT_RATE_TOLERANCE_PCT:-${HIT_RATE_TOLERANCE}}"
+BASELINE_HIT_RATE_TOLERANCE="${GSP_BASELINE_HIT_RATE_TOLERANCE_PCT:-0.5}"
 FINITE_HIT_RATE_TOLERANCE="${GSP_FINITE_HIT_RATE_TOLERANCE_PCT:-1.5}"
 EXPLICIT_RATES="${GSP_REQUEST_RATES:-}"
 
@@ -145,7 +146,8 @@ Environment:
   GSP_PROMPTS_PER_GROUP_CANDIDATES=16,32,64,96,128,256  inf candidates
   GSP_CACHE_MISS_REQUESTS_PER_GROUP=4  Concurrent cache misses per group used for calibration
   GSP_AUTO_CALIBRATE=1                Auto-correct shared prefix after measured hit-rate drift
-  GSP_CALIBRATION_MAX_ITERS=2         Maximum corrective probes per layout
+  GSP_CALIBRATION_MAX_ITERS=1         Maximum corrective full workloads per layout
+  GSP_CALIBRATION_STEP_RATIO=0.5      Move this fraction toward the measured correction each time
   GSP_AUTO_LAYOUT=1                   Try alternate groups/prompts layouts after hit-rate calibration fails
   GSP_AUTO_DURATION=1             Resize each case to the target benchmark duration
   GSP_TARGET_DURATION_S=60        Target main benchmark duration, allowed range 60-120s
@@ -175,8 +177,11 @@ The hit rate is token-level: total_cached_tokens / total_prompt_tokens.
   is a true no-prefix-cache control without downloading ShareGPT. Multiple --case values can be run
   together; each case is calibrated and measured independently.
   The default calibration assumes four concurrent first requests per ordered prefix group can miss;
-  the script adjusts system/question length, then tries alternate GSP layouts when the measured
-  cache-report rate still misses the target. Set GSP_AUTO_LAYOUT=0 to keep explicit layouts fixed.
+  the script adjusts system/question length with the official full workload and limits correction
+  to one additional full workload by default. The default inf tolerance is 0.5 percentage points to
+  avoid repeating a full run for normal page-alignment drift. Set GSP_BASELINE_HIT_RATE_TOLERANCE_PCT
+  or GSP_CALIBRATION_MAX_ITERS explicitly for stricter or more exhaustive calibration. Set
+  GSP_AUTO_LAYOUT=0 to keep explicit layouts fixed.
 USAGE
 }
 
@@ -679,6 +684,11 @@ validate_global_config() {
   [[ "${GSP_CACHE_MISS_REQUESTS_PER_GROUP}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_CACHE_MISS_REQUESTS_PER_GROUP 必须是非负整数" >&2; return 1; }
   [[ "${GSP_AUTO_CALIBRATE}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_AUTO_CALIBRATE 必须是 0 或 1" >&2; return 1; }
   [[ "${GSP_CALIBRATION_MAX_ITERS}" =~ ^[0-9]+$ ]] || { echo "[ERROR] GSP_CALIBRATION_MAX_ITERS 必须是非负整数" >&2; return 1; }
+  is_positive_decimal "${GSP_CALIBRATION_STEP_RATIO}" || { echo "[ERROR] GSP_CALIBRATION_STEP_RATIO 必须是正数" >&2; return 1; }
+  awk -v v="${GSP_CALIBRATION_STEP_RATIO}" 'BEGIN { exit !(v <= 1) }' || {
+    echo "[ERROR] GSP_CALIBRATION_STEP_RATIO 不能大于 1" >&2
+    return 1
+  }
   [[ "${GSP_AUTO_LAYOUT}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_AUTO_LAYOUT 必须是 0 或 1" >&2; return 1; }
   [[ "${GSP_AUTO_DURATION}" =~ ^[01]$ ]] || { echo "[ERROR] GSP_AUTO_DURATION 必须是 0 或 1" >&2; return 1; }
   [[ "${GSP_TARGET_DURATION_S}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[ERROR] GSP_TARGET_DURATION_S 必须是数字" >&2; return 1; }
@@ -1027,11 +1037,12 @@ adjust_case_prompt_config_from_hit() {
   local measured="$1" lengths
   lengths="$("${PYTHON_BIN}" - "${CASE_SYSTEM_LEN}" "${measured}" "${CASE_HIT_PCT}" \
     "${CASE_INPUT_LEN}" "${GSP_PAGE_SIZE}" "${GSP_PAGE_ALIGN}" \
-    "${GSP_PROMPTS_PER_GROUP}" "${GSP_CACHE_MISS_REQUESTS_PER_GROUP}" <<'PY' | tr -d '\r'
+    "${GSP_PROMPTS_PER_GROUP}" "${GSP_CACHE_MISS_REQUESTS_PER_GROUP}" \
+    "${GSP_CALIBRATION_STEP_RATIO}" <<'PY' | tr -d '\r'
 import math
 import sys
 
-current, actual, target, total, page, align, prompts, misses = sys.argv[1:]
+current, actual, target, total, page, align, prompts, misses, step_ratio = sys.argv[1:]
 current = int(current)
 actual = float(actual)
 target = float(target)
@@ -1040,16 +1051,18 @@ page = int(page)
 align = align == "1"
 prompts = int(prompts)
 misses = int(misses)
+step_ratio = float(step_ratio)
 if actual <= 0 or current <= 0 or current >= total:
     raise SystemExit("invalid measured hit-rate correction inputs")
 
 raw = current * target / actual
+corrected_raw = current + step_ratio * (raw - current)
 if align and page > 1:
-    corrected = int(math.floor(raw / page + 0.5)) * page
+    corrected = int(math.floor(corrected_raw / page + 0.5)) * page
     if corrected == current:
         corrected += page if target > actual else -page
 else:
-    corrected = int(math.floor(raw + 0.5))
+    corrected = int(math.floor(corrected_raw + 0.5))
 corrected = max(1, min(total - 1, corrected))
 if corrected == current:
     raise SystemExit("page alignment cannot produce a different correction")
@@ -1324,7 +1337,7 @@ echo "GSP prefix benchmark finished"
 echo "Result directory : ${out_dir}"
 echo "Trials CSV       : ${trials_csv}"
 echo "Summary TSV      : ${summary_tsv}  (cat 后可直接复制到表格)"
-if (( plot_requested == 1 && -f "${out_dir}/gsp_prefix_matrix.png" )); then
+if [[ "${plot_requested}" == "1" && -f "${out_dir}/gsp_prefix_matrix.png" ]]; then
   echo "Plot             : ${out_dir}/gsp_prefix_matrix.png"
 fi
 echo "============================================================"
