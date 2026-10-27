@@ -14,7 +14,10 @@ perf_bench/
 │   ├── gsp_prefix_summary.py # summary TSV 生成与正式 trial 清理
 │   └── gsp_prefix_plot.py # Prefill/GSP 容量矩阵作图
 └── vllm/
-    └── vllmc.sh     # vLLM Prefix-Salt 标准容量压测
+    ├── vllmc.sh     # vLLM Prefix-Salt 标准容量压测
+    ├── vllm_bench_metrics.py # vLLM benchmark 公共指标解析与 Prefill 回测核心
+    ├── vllm_prefill_bench.sh # vLLM 单侧 Prefill TTFT 回测入口
+    └── vllm_prefill_plot.py # vLLM Prefill 容量矩阵作图
 ```
 
 ## 脚本说明
@@ -253,6 +256,52 @@ BS 或并发 workload，格子选择满足 SLA 的最大实际 RPS 或输出 tok
 - benchmark 只要成功请求数为 0 或存在失败请求，就标记为失败，不会把 vLLM 客户端的 0 退出码当成有效性能结果。
 - 直接从 vLLM benchmark 日志提取 RPS、Token 吞吐、请求数、耗时、平均时延和分位数，不保存结果 JSON。
 
+#### vLLM 单侧 Prefill：`vllm/vllm_prefill_bench.sh`
+
+Prefill 脚本使用官方 `vllm bench serve` 的 `random` 数据集，输出长度固定为 `1`，用于测量输入侧
+TTFT 容量。`--case` 格式为 `输入,TTFT指标,目标秒数`，同一 case 可以用 `|` 指定多个目标：
+
+```bash
+BASE_URL=http://127.0.0.1:8000 \
+MODEL=/data/models/Qwen3.8-27B-Channel-INT8-w8a8 \
+PREFILL_TARGET_DURATION_S=60 \
+bash vllm/vllm_prefill_bench.sh \
+  --case '4k,mean_ttft_ms,3|4' \
+  --case '64k,p99_ttft_ms,5|6'
+```
+
+默认 `TOKEN_UNIT=1024`，输入支持 `0.5k` 等小数；需要十进制 k 时设置
+`TOKEN_UNIT=1000`。脚本默认不设置客户端 `--max-concurrency`，避免人为限制 Prefill 吞吐；
+确实需要固定并发时才设置 `FIXED_CONCURRENCY=64` 等环境变量。默认流程如下：
+
+1. 先用 `request_rate=inf` 做短时 pilot，按实际耗时调整 `num_prompts` 到目标时长附近。
+2. 重复执行 inf baseline，直到输入吞吐不再提升或达到最大 trial 次数，选输入吞吐最高的一次。
+3. 以该 baseline 的实际 RPS 为起点，按 `0.1 req/s` 的最小步长从高到低回测，直到每个 TTFT 目标找到满足点。
+4. 每个 trial 立即写入 `vllm_prefill_trials.csv`，并刷新 `vllm_prefill_summary.tsv`；退出或中断后已完成的日志仍可续查。
+
+常用参数：
+
+- `PREFILL_TARGET_DURATION_S`：每组请求目标时长，默认 `60` 秒。
+- `PREFILL_RATE_STEP`：有限请求率回测步长，默认 `0.1`，不能小于 `0.1`。
+- `PREFILL_NUM_PROMPTS`：显式固定请求数；不设置时由 pilot 根据输入长度和实际耗时自动调整。
+- `PREFILL_INF_MAX_TRIALS` / `PREFILL_INF_NO_IMPROVEMENT_LIMIT`：inf 稳定性回测上限，默认 `5` / `2`。
+- `PREFILL_PLOT=0` 或 `--no-plot`：关闭默认图片；`--cell input_throughput` 可让格子显示输入 token throughput，默认显示实际客户端 RPS。
+
+结果位于 `all_result/bench_vllm_prefill_<RUN_ID>/`，包含：
+
+- `logs/`：每个 case、inf trial 和有限请求率的原始 vLLM benchmark 日志及退出码。
+- `vllm_prefill_trials.csv`：所有已完成的 inf、pilot 和降速回测过程记录。
+- `vllm_prefill_summary.tsv`：按确认参数整理的最终结果；inf 基线位于同一 case 的首行，有限请求率按实际 RPS 从高到低排列，指标顺序与 `vllmc.sh` 对齐。
+- `vllm_prefill_matrix.png`：默认生成的 TTFT 容量矩阵；每格选择满足对应 TTFT SLO 的最大实际 RPS。绘图依赖缺失时只跳过图片，不影响 TSV/日志。
+
+只核对命令、不连接服务时可以使用 `--dry-run`：
+
+```bash
+BASE_URL=http://127.0.0.1:8000 MODEL=/path/to/model \
+bash vllm/vllm_prefill_bench.sh --dry-run --no-plot \
+  --case '4k,mean_ttft_ms,3|4'
+```
+
 ## 长度口径
 
 脚本中的 `CASES` 默认使用二进制 K，即 `TOKEN_UNIT=1024`。例如 `"4 1"` 表示输入
@@ -279,6 +328,14 @@ cd perf_bench
 BASE_URL=http://127.0.0.1:8000 \
 MODEL=/path/to/model \
 bash vllm/vllmc.sh
+```
+
+单侧 Prefill：
+
+```bash
+BASE_URL=http://127.0.0.1:8000 \
+MODEL=/path/to/model \
+bash vllm/vllm_prefill_bench.sh --case '4k,mean_ttft_ms,3|4'
 ```
 
 SGLang 的 `sglc.sh` 和 vLLM 的 `vllmc.sh` 也会在各自结果目录生成
