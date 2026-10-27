@@ -618,10 +618,10 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
 
 def append_trial_row(path: Path, row: dict[str, Any]) -> None:
     rows = _load_csv(path)
-    key = (row.get("case_id", ""), row.get("request_rate", ""), row.get("search_phase", ""))
+    key = (row.get("case_id", ""), row.get("request_rate", ""), row.get("log_file", ""))
     rows = [
         old for old in rows
-        if (old.get("case_id", ""), old.get("request_rate", ""), old.get("search_phase", "")) != key
+        if (old.get("case_id", ""), old.get("request_rate", ""), old.get("log_file", "")) != key
     ]
     rows.append(row)
     _write_csv(path, rows, PREFILL_TRIAL_FIELDS)
@@ -680,6 +680,14 @@ def write_prefill_summary(
     output: list[dict[str, Any]] = []
     for case in cases:
         rows = [row for row in by_case.get(case.case_id, []) if row_is_valid(row)]
+        inf_rows = [row for row in rows if row.get("request_rate", "").lower() == "inf"]
+        finite_rows = [row for row in rows if row.get("request_rate", "").lower() != "inf"]
+        best_inf = max(
+            inf_rows,
+            key=lambda row: _as_float(row, "input_throughput_tok_s") or float("-inf"),
+            default=None,
+        )
+        rows = ([best_inf] if best_inf is not None else []) + finite_rows
         rows.sort(
             key=lambda row: (
                 0 if row.get("request_rate", "").lower() == "inf" else 1,
@@ -703,6 +711,18 @@ def write_prefill_summary(
             handle.write("\t".join(values) + "\n")
 
 
+def case_targets_met(trials_path: Path, case: PrefillCase) -> bool:
+    rows = [
+        row
+        for row in _load_csv(trials_path)
+        if row.get("case_id", "") == case.case_id
+        and row.get("request_rate", "").lower() != "inf"
+        and row_is_valid(row)
+    ]
+    selected = select_sla_rows(rows, case)
+    return all(selected[target] is not None for target in case.targets_s)
+
+
 def _load_cases_json(path: Path) -> list[PrefillCase]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return [case_from_dict(item) for item in payload]
@@ -713,7 +733,8 @@ def _usage() -> str:
         "usage: vllm_bench_metrics.py "
         "parse-log LOG | parse-case SPEC TOKEN_UNIT | rate-list START STEP | "
         "append-trial TRIALS_CSV LOG CASE_JSON REQUEST_RATE NUM_PROMPTS MAX_CONCURRENCY "
-        "PARALLEL_CONFIG EXIT_CODE SEARCH_PHASE | summary TRIALS_CSV SUMMARY_TSV CASES_JSON"
+        "PARALLEL_CONFIG EXIT_CODE SEARCH_PHASE | summary TRIALS_CSV SUMMARY_TSV CASES_JSON | "
+        "targets-met TRIALS_CSV CASE_JSON"
     )
 
 
@@ -750,6 +771,10 @@ def main(argv: list[str]) -> int:
     if command == "summary" and len(argv) == 5:
         cases = _load_cases_json(Path(argv[4]))
         write_prefill_summary(Path(argv[2]), Path(argv[3]), cases)
+        return 0
+    if command == "targets-met" and len(argv) == 4:
+        case = case_from_dict(json.loads(argv[3]))
+        print("1" if case_targets_met(Path(argv[2]), case) else "0")
         return 0
     print(_usage(), file=sys.stderr)
     return 2
