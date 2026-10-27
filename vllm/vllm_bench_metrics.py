@@ -141,7 +141,8 @@ class PrefillCase:
         key = self.metric.removesuffix("_ttft_ms")
         if key.startswith("p"):
             key = "P" + key[1:]
-        payload = {"ttft": {key: list(self.targets_s)}}
+        targets = [int(value) if value.is_integer() else value for value in self.targets_s]
+        payload = {"ttft": {key: targets}}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
