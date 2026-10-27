@@ -1,0 +1,24 @@
+Traffic request rate: inf
+Successful requests: 2
+Failed requests: 0
+Benchmark duration (s): 10.00
+Request throughput (req/s): 0.20
+Input token throughput (tok/s): 819.20
+Output token throughput (tok/s): 0.20
+Total token throughput (tok/s): 819.40
+Peak output token throughput (tok/s): 0.20
+Peak concurrent requests: 2
+Concurrency: 1.00
+Mean TTFT (ms): 150.00
+Median TTFT (ms): 140.00
+P95 TTFT (ms): 180.00
+P99 TTFT (ms): 200.00
+Mean TPOT (ms): 30.00
+P95 TPOT (ms): 35.00
+P99 TPOT (ms): 40.00
+Mean ITL (ms): 30.00
+P95 ITL (ms): 35.00
+P99 ITL (ms): 40.00
+Mean E2EL (ms): 160.00
+P95 E2EL (ms): 190.00
+P99 E2EL (ms): 210.00

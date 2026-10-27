@@ -749,12 +749,13 @@ python3 - \
   "${CACHE_MODE}" \
   "${PARALLEL_CONFIG:-UNKNOWN}" \
   "${NUM_PROMPTS_MULTIPLIER}" \
-  "${TOKEN_UNIT}" <<'PY'
+  "${TOKEN_UNIT}" \
+  "${script_dir}/.." <<'PY'
 import csv, re, sys
 from pathlib import Path
 
-if len(sys.argv) < 11:
-    raise SystemExit(f"merge_results argv mismatch: expected 10 args, got {len(sys.argv)-1}")
+if len(sys.argv) < 12:
+    raise SystemExit(f"merge_results argv mismatch: expected 11 args, got {len(sys.argv)-1}")
 
 log_dir, output_csv = Path(sys.argv[1]), Path(sys.argv[2])
 def to_int_or_none(v):
@@ -770,6 +771,12 @@ run_id, cache_mode = sys.argv[6], sys.argv[7]
 parallel_config = sys.argv[8]
 num_prompts_multiplier = int(sys.argv[9])
 token_unit = int(sys.argv[10])
+repo_root = Path(sys.argv[11]).resolve()
+sys.path.insert(0, str(repo_root))
+from vllm.vllm_bench_metrics import (
+    normalize_row as shared_normalize_row,
+    parse_summary_from_log as shared_parse_summary_from_log,
+)
 
 pattern = re.compile(
     r"(?P<case>.+?)_in(?P<input>\d+)_out(?P<output>\d+)_perdp(?P<perdp>\d+)_global(?P<global>\d+)\.log$"
@@ -1116,9 +1123,9 @@ for log_path in sorted(log_dir.glob("*.log")):
         else ("FAIL" if row.get("case_exit_code") not in ("", None) else "UNKNOWN")
     )
 
-    row.update(parse_summary_from_log(log_path))
+    row.update(shared_parse_summary_from_log(log_path))
 
-    row = normalize_row(row, log_path)
+    row = shared_normalize_row(row, log_path)
     row["log_file"] = log_path.name
     rows.append(row)
 
