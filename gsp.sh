@@ -162,13 +162,14 @@ PY
 # ============================================================
 run_bench() {
   "$PY" - "$BASE_URL" "$C_VAL" "$L_VAL" "$H_VAL" "$SEED" "$MAXRUN" <<'PY'
-import json, sys, time, random, urllib.request
+import json, sys, time, random, urllib.request, os, csv, threading
 from concurrent.futures import ThreadPoolExecutor
 
 base, C, L, H, seed, maxrun_s = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
                                   float(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
 base = base.rstrip('/')
 maxrun = int(maxrun_s) if maxrun_s else None
+CSV_PATH = os.environ.get("CSV_PATH", "")       # 逐请求 CSV, 每条返回即落盘
 
 # ---- 估算（与 estimate 完全一致的口径）----
 Hs = round(L * H)
@@ -209,6 +210,27 @@ def req_idx(i):
 
 print(json.dumps({"P": P, "S": S, "n_star": n_star, "n_req": n_req}), flush=True)
 
+# ---- 逐请求 CSV: 每条返回(或失败)立即 append+flush, 边跑边保存 ----
+_csv_f = csv_lock = None
+if CSV_PATH:
+    _csv_f = open(CSV_PATH, "a", newline="", encoding="utf-8")
+    _csv_w = csv.writer(_csv_f)
+    csv_lock = threading.Lock()
+    if _csv_f.tell() == 0:
+        _csv_w.writerow(["phase", "req_idx", "send_ts", "recv_ts",
+                         "latency_s", "prompt_tokens", "cached_tokens",
+                         "new_tokens", "error"])
+    def csv_row(phase, i, st, en, resp):
+        mi = resp.get("meta_info", {}) if "error" not in resp else {}
+        pt, ct = mi.get("prompt_tokens", 0), mi.get("cached_tokens", 0)
+        with csv_lock:
+            _csv_w.writerow([phase, i, f"{st:.3f}", f"{en:.3f}", round(en - st, 3),
+                             pt, ct, pt - ct, resp.get("error", "")])
+            _csv_f.flush()
+    print(f"[csv] {CSV_PATH}", flush=True)
+else:
+    def csv_row(phase, i, st, en, resp): pass
+
 # ---- flush radix cache: 残留前缀会使命中率/t_warm 失真(重复压测时) ----
 try:
     urllib.request.urlopen(urllib.request.Request(base + "/flush_cache", data=b"", method="POST"), timeout=15).read()
@@ -217,21 +239,24 @@ except Exception as e:
     print(f"[flush_cache] FAIL {e} (继续, 命中率/t_warm 可能受残留缓存影响)", flush=True)
 
 # ---- warmup: 1 条填满前缀 radix 树 ----
-t0 = time.time(); r = req_idx(999999); t_warm = time.time() - t0
+t0 = time.time(); wst = t0; r = req_idx(999999); t_warm = time.time() - t0
 mi = r.get("meta_info", {})
+csv_row("warmup", 999999, wst, time.time(), r)
 print(json.dumps({"warmup": {"t": round(t_warm, 3), "prompt_tokens": mi.get("prompt_tokens"),
                              "cached_tokens": mi.get("cached_tokens")}}), flush=True)
 
 # ---- 主测: n_req 条并发打出; 2 趟, 趟1 仅补齐前缀链(fill), 趟2 计入统计 ----
-def phase():
+def phase(tag):
     results = [None] * n_req
     def run_one(i):
         t = time.time()
         try:
             r = req_idx(i); en = time.time()
             results[i] = (t, en, r)
+            csv_row(tag, i, t, en, r)
         except Exception as e:
             results[i] = (t, time.time(), {"error": str(e)})
+            csv_row(tag, i, t, time.time(), {"error": str(e)})
 
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=n_req) as ex:
@@ -255,13 +280,13 @@ def phase():
             "input_throughput_tok_s": round(new_sum / t_main, 1) if t_main > 0 else 0}
 
 # 趟 1 (fill): hybrid/mamba 模型单条 warmup 常补不满 radix 链, 先打一遍前缀到稳态, 结果不计入
-s_fill = phase()
+s_fill = phase("fill")
 print(json.dumps({"fill": {"hit_rate_pct": s_fill["hit_rate_pct"],
                            "new_tokens_sum": s_fill["new_tokens_sum"]}}), flush=True)
 if s_fill["errors"]:
     print(f"[warn] fill 趟有 {s_fill['errors']} 条错误", flush=True)
 
-s_main = phase()
+s_main = phase("main")
 print(json.dumps({
     "main": s_main,
     "theory": {"H_pct": round(H * 100, 2), "n_star": n_star,
@@ -342,9 +367,12 @@ do_run() {
   echo "================ ESTIMATE ================"
   do_estimate
   echo "================ BENCH ================"
-  local bench_start bench_out_file="$OUT_DIR/gsp_run_$(date +%Y%m%d_%H%M%S).log"
+  local bench_start stamp
+  stamp=$(date +%Y%m%d_%H%M%S)
+  local bench_out_file="$OUT_DIR/gsp_run_${stamp}.log"
+  local csv_file="$OUT_DIR/gsp_bench_${PORT}_${stamp}.csv"
   bench_start=$(date +%s)
-  TIMEOUT="$TIMEOUT" run_bench | tee "$bench_out_file"
+  CSV_PATH="$csv_file" TIMEOUT="$TIMEOUT" run_bench | tee "$bench_out_file"
   echo "================ SERVER LOG ================"
   BENCH_START_EPOCH="$bench_start" analyze_server_log | tee -a "$bench_out_file"
 
