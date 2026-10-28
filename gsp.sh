@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================
-# gsp.sh — GSP Prefill 组批估算 + 快速饱和验证
+# gsp.sh — GSP Prefill 组批估算 + 快速饱和验证 (纯客户端压测脚本)
 # ============================================================
+#
+# 定位: 只做客户端构造 GSP 数据集、发压与校验, 不负责服务生命周期。
+#       服务由使用者在任意机器自行起好 (sglang 等兼容 /generate 与
+#       /get_server_info 的服务), 客户端在本机或远程执行均可。
 #
 # 理论（详见仓库 README 或团队 wiki）：
 #   服务端每轮 prefill 计算量被 --chunked-prefill-size (C) 锁死，
@@ -22,62 +26,52 @@
 #     3. 预算:    稳态每轮 #new-token ≈ min(C, n*·S)
 #     4. 纯吞吐:  Σnew-token / 主测时长 = new-token 口径（不含命中, 上报用）
 #
-# 用法:
-#   # 纯估算（不碰服务器）
-#   ./gsp.sh estimate --C 32768 --L 65536 --H 0.9
-#   ./gsp.sh estimate --C 16384 --L 131072 --H 0.9
+# 参数获取规则:
+#   C: 显式 --C, 否则自动读服务端 chunked_prefill_size
+#   L: 显式 --L, 否则自动读服务端 context_length (L=ctx 最饱和; 贴近 ctx 时
+#      自动钳到 ctx-16 给输出/预留 token 留位; 想测短些可显式 --L)
+#   H: 必须显式 --H —— 压测场景设计参数, 服务端无从获取
 #
-#   # 对已在跑的服务做饱和验证（可带服务端日志分析）
-#   ./gsp.sh run --base-url http://127.0.0.1:31888 --C 32768 --L 65536 --H 0.9 \
+# 用法:
+#   # 纯估算（不碰服务器, C/L/H 全部显式给）
+#   ./gsp.sh estimate --C 32768 --L 65536 --H 0.9
+#
+#   # 客户端压测（在能访问到服务的机器上执行; C/L 自动探测）
+#   ./gsp.sh run --base-url http://127.0.0.1:31888 --H 0.9
+#   ./gsp.sh run --base-url http://server:31888 --C 32768 --L 65536 --H 0.9 \
 #                [--server-log /path/to/server.log] [--out-dir ./all_result]
 #
-#   # 在本机拉起 sglang 容器再跑（h20 节点场景）
-#   ./gsp.sh launch --model Qwen3.6-27B-FP8 --gpu 4 --port 31888 --C 32768
-#   ./gsp.sh run --base-url http://127.0.0.1:31888 --C 32768 --L 65536 --H 0.9 \
-#                --server-log ./all_result/gsp_server_31888.log
-#   ./gsp.sh stop --port 31888
-#
 # 环境变量:
-#   IMAGE=lmsysorg/sglang:v0.5.18   MODEL_DIR=/data/opendas/DL_DATA/llm-models
-#   SEED=42 TIMEOUT=1800 MEM_FRAC=0.85 PAGE=64 HIT_TOL_PT=2.0
-#   EXTRA_ENV="K=V K2=V2"                              #透传容器环境变量, 例: EXTRA_ENV="SGLANG_ENABLE_JIT_DEEPGEMM=0" 可跳过 DeepGEMM 全量 warmup
+#   PYTHON_BIN=python3 SEED=42 TIMEOUT=1800 PAGE=64 HIT_TOL_PT=2.0
+#   逐请求 CSV 边跑边存: $OUT_DIR/gsp_bench_<port>_<stamp>.csv
 set -uo pipefail
 
 PY="${PYTHON_BIN:-python3}"
-IMAGE="${IMAGE:-lmsysorg/sglang:v0.5.18}"
-MODEL_DIR="${MODEL_DIR:-/data/opendas/DL_DATA/llm-models}"
 SEED="${SEED:-42}"
-TIMEOUT="${TIMEOUT:-1800}"   # launch 等待 /health 上限; FP8+DeepGEMM JIT warmup 可达 ~25min
-MEM_FRAC="${MEM_FRAC:-0.85}"
+TIMEOUT="${TIMEOUT:-1800}"   # 单请求 HTTP 超时; L=ctx 级长 prefill 勿低于 600
 PAGE="${PAGE:-64}"
 HIT_TOL_PT="${HIT_TOL_PT:-2.0}"
-CONTAINER_PREFIX="gsp_bench"
 
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 die() { echo "[ERROR] $1" >&2; exit "$2"; }
 
 # ---------- 参数解析 ----------
-ARGS=""
 parse_kv() { # --k v -> K=v
   case "$1" in
     --C) C_VAL="$2" ;;        --L) L_VAL="$2" ;;
-    --H) H_VAL="$2" ;;        --P) P_VAL="$2" ;;
+    --H) H_VAL="$2" ;;
     --base-url) BASE_URL="$2" ;;
     --server-log) SERVER_LOG="$2" ;;
     --out-dir) OUT_DIR="$2" ;;
-    --model) MODEL="$2" ;;
-    --gpu) GPU="$2" ;;
     --port) PORT="$2" ;;
-    --tp) TP="$2" ;;
-    --ctx) CTX="$2" ;;
     --max-running) MAXRUN="$2" ;;
     *) ARGS="$ARGS $1" ;;
   esac
 }
 
 CMD="${1:-}"; shift || true
-C_VAL="" L_VAL="" H_VAL="" P_VAL="" BASE_URL="" SERVER_LOG="" MODEL="" GPU="4" PORT="31888" TP="1" CTX="" MAXRUN=""
+C_VAL="" L_VAL="" H_VAL="" BASE_URL="" SERVER_LOG="" PORT="31888" MAXRUN=""
 OUT_DIR="${OUT_DIR:-./all_result}"
 while (( $# >= 2 )); do parse_kv "$1" "$2"; shift 2; done
 (( $# > 0 )) && parse_kv "$1" ""
@@ -300,15 +294,7 @@ PY
 # 服务端日志分析: 稳态 #new-seq / #new-token
 # ============================================================
 analyze_server_log() {
-  # --server-log 未给时, 尝试对本机 gsp_bench 容器做日志快照
-  if [[ -z "$SERVER_LOG" ]]; then
-    if command -v docker >/dev/null 2>&1 && [[ -n "$(docker ps -q --filter "name=${CONTAINER_PREFIX}_${PORT}" 2>/dev/null)" ]]; then
-      SERVER_LOG="$OUT_DIR/gsp_server_${PORT}.log"
-      docker logs "${CONTAINER_PREFIX}_${PORT}" > "$SERVER_LOG" 2>&1
-      echo "[analyze] 已从容器快照服务端日志: $SERVER_LOG"
-    fi
-  fi
-  [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]] || { echo "[analyze] 无服务端日志可分析 (可 --server-log 指定)"; return 0; }
+  [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]] || { echo "[analyze] 无服务端日志可分析 (可 --server-log 指定; 不传则跳过组批数校验)"; return 0; }
   START_EPOCH="$BENCH_START_EPOCH" "$PY" - "$SERVER_LOG" "$C_VAL" "$L_VAL" "$H_VAL" <<'PY'
 import re, sys, os, statistics as st, time
 from datetime import datetime, timezone
@@ -351,17 +337,33 @@ PY
 # 子命令: run — 估算 + 压测 + 校验
 # ============================================================
 do_run() {
-  [[ -n "$C_VAL" && -n "$L_VAL" && -n "$H_VAL" ]] || die "run 需要 --C --L --H" 1
+  [[ -n "$H_VAL" ]] || die "run 需要 --H (命中率; C/L 缺省自动从服务端探测)" 1
   [[ -n "$BASE_URL" ]] || BASE_URL="http://127.0.0.1:${PORT:-31888}"
   mkdir -p "$OUT_DIR"
   local info
   info=$(probe_server) || die "无法探测 $BASE_URL (服务未起?)" 1
   echo "[probe] $info"
 
-  # 若未显式给 --C, 用服务端的 chunked_prefill_size
+  # C 缺省: 服务端 chunked_prefill_size
   if [[ -z "$C_VAL" ]]; then
     C_VAL=$("$PY" -c "import json,sys; print(json.loads(sys.argv[1]).get('chunked_prefill_size') or '')" "$info")
     [[ -n "$C_VAL" ]] || die "服务端未暴露 chunked_prefill_size, 请显式 --C" 1
+  fi
+  # L 缺省: 服务端 context_length (L=ctx 为最饱和场景, 显存紧张请显式 --L)
+  if [[ -z "$L_VAL" ]]; then
+    L_VAL=$("$PY" -c "import json,sys; print(json.loads(sys.argv[1]).get('context_length') or '')" "$info")
+    [[ -n "$L_VAL" ]] || die "服务端未暴露 context_length, 请显式 --L" 1
+  fi
+  # 满长输入会被服务端按 ctx 减预留量拒绝 (v0.5.18 实测留给 6 token), 钳到 ctx-16
+  local ctx
+  ctx=$("$PY" -c "import json,sys; print(json.loads(sys.argv[1]).get('context_length') or '')" "$info")
+  if [[ -n "$ctx" && "$L_VAL" -ge $((ctx - 16)) ]]; then
+    if [[ "$L_VAL" -gt "$ctx" ]]; then
+      echo "[probe] L($L_VAL) > context_length($ctx): 钳到 ctx-16 (满长输入被服务端 400 拒绝)"
+    else
+      echo "[probe] L($L_VAL) 贴近 context_length($ctx): 钳到 ctx-16 给输出/预留 token 留位"
+    fi
+    L_VAL=$((ctx - 16))
   fi
 
   echo "================ ESTIMATE ================"
@@ -400,14 +402,20 @@ if not main:
     print("  [FAIL] 主测结果缺失"); sys.exit(1)
 
 hit = main["hit_rate_pct"]
-check("命中率", abs(hit - theory["H_pct"]) <= tol,
-      f"实测 {hit:.2f}% vs 理论 {theory['H_pct']:.2f}% (±{tol}pt, page 对齐后前缀取整可致 -1~-2pt)")
+if hit >= theory["H_pct"] - tol:
+    check("命中下限", True,
+          f"实测 {hit:.2f}% >= 理论 {theory['H_pct']:.2f}%-{tol}pt"
+          + (" (100%=radix 连后缀也全命中, dense 模型典型; 偏低才是构造/丢前缀问题)" if hit > theory["H_pct"] + tol else ""))
+else:
+    check("命中下限", False,
+          f"实测 {hit:.2f}% < 理论 {theory['H_pct']:.2f}%-{tol}pt: 前缀构造错误或服务端丢缓存")
 
 if warm:
     ratio_theory = theory["t_main_over_warm"]
     ratio_real = main["t_main_s"] / max(warm["t"], 1e-6)
-    check("时长比 t_main/t_warm", 0.55 <= ratio_real / ratio_theory <= 1.8,
-          f"实测 {ratio_real:.2f} vs 理论 {ratio_theory:.2f} (=N_req×S/L)")
+    # 只判"过慢": 前缀没省到才 FAIL; 偏快(全命中省更多, dense 可到 ~0)是正常
+    check("时长比 t_main/t_warm", ratio_real <= ratio_theory * 1.8,
+          f"实测 {ratio_real:.3f} vs 理论上限 {ratio_theory * 1.8:.2f} (理论 {ratio_theory:.2f}=N_req×S/L; 全命中远低于理论亦 PASS)")
 
 if slog:
     mode = int(slog.get("mode", -1))
@@ -431,55 +439,9 @@ sys.exit(0 if ok else 2)
 PY
 }
 
-# ============================================================
-# 子命令: launch / stop — 本机容器化起停服务
-# ============================================================
-do_launch() {
-  [[ -n "$MODEL" ]] || die "launch 需要 --model (相对 $MODEL_DIR)" 1
-  local name="${CONTAINER_PREFIX}_${PORT}"
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  mkdir -p "$OUT_DIR"
-  local logf="$OUT_DIR/gsp_server_${PORT}.log"
-  echo "[launch] $MODEL on GPU$GPU port$PORT C=${C_VAL:-<default>} ctx=${CTX:-<auto>}"
-  local -a extra_env=()
-  local e
-  for e in ${EXTRA_ENV:-}; do extra_env+=(-e "$e"); done
-  docker run -d --rm --name "$name" \
-    --gpus "\"device=$GPU\"" --network host --shm-size 32g \
-    -v "$MODEL_DIR:/models:ro" \
-    -v "${CONTAINER_PREFIX}_cache:/root/.cache" \
-    ${extra_env[@]+"${extra_env[@]}"} \
-    "$IMAGE" \
-    python3 -m sglang.launch_server \
-      --model-path "/models/$MODEL" --served-model-name "$MODEL" \
-      --host 0.0.0.0 --port "$PORT" --tp "$TP" \
-      ${C_VAL:+--chunked-prefill-size "$C_VAL"} \
-      ${CTX:+--context-length "$CTX"} \
-      --mem-fraction-static "$MEM_FRAC" > /dev/null
-  echo "[launch] 等待 /health 就绪(最长 ${TIMEOUT}s), 日志: $logf"
-  setsid nohup docker logs -f "$name" > "$logf" 2>&1 < /dev/null &
-  local waited=0
-  while (( waited < TIMEOUT )); do
-    if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-      echo "[launch] 服务就绪: http://127.0.0.1:${PORT}  (日志: $logf)"; return 0
-    fi
-    if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-      tail -30 "$logf"; die "容器已退出, 见上方日志" 1
-    fi
-    sleep 5; waited=$((waited + 5))
-  done
-  die "等待超时" 1
-}
-
-do_stop() {
-  docker rm -f "${CONTAINER_PREFIX}_${PORT}" >/dev/null 2>&1 && echo "[stop] 已停止 ${CONTAINER_PREFIX}_${PORT}" || echo "[stop] 无运行中的容器"
-}
-
 case "$CMD" in
   estimate) do_estimate ;;
   run)      do_run ;;
-  launch)   do_launch ;;
-  stop)     do_stop ;;
   help|-h|--help|'') usage ;;
-  *) die "未知子命令: $CMD (可选: estimate|run|launch|stop|help)" 1 ;;
+  *) die "未知子命令: $CMD (可选: estimate|run|help)" 1 ;;
 esac
