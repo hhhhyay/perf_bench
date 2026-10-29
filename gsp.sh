@@ -135,6 +135,7 @@ done
 
 is_decimal() { [[ "$1" =~ ^[0-9]+([.][0-9]*)?$ || "$1" =~ ^[.][0-9]+$ ]]; }
 pos_dec()    { is_decimal "$1" && awk -v v="$1" 'BEGIN{exit !(v>0)}'; }
+nn_dec()     { is_decimal "$1" && awk -v v="$1" 'BEGIN{exit !(v>=0)}'; }
 f_now() { date +%s; }
 slug() { printf '%s' "$1" | sed -E 's/[^A-Za-z0-9_.-]+/_/g; s/^_+//; s/_+$//'; }
 fmt2() { awk -v v="$1" 'BEGIN{printf "%.2f", v}'; }
@@ -665,7 +666,7 @@ do_calib() {
   [[ -n "$CASE_INPUT_RAW" && -n "$CASE_OUTPUT_RAW" && -n "$CASE_HIT_PCT" && -n "$CASE_TTFT_METRIC" \
      && -n "$CASE_TTFT_TARGETS" && -n "$CASE_TPOT_METRIC" && -n "$CASE_TPOT_TARGET_MS" ]] \
     || die "case 字段不足: INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S,TPOT_METRIC,TPOT_TARGET_MS" 1
-  pos_dec "$CASE_HIT_PCT"        || die "HIT_RATE 非法: $CASE_HIT_PCT" 1
+  nn_dec "$CASE_HIT_PCT"        || die "HIT_RATE 非法: $CASE_HIT_PCT" 1
   pos_dec "$CASE_TPOT_TARGET_MS" || die "TPOT_TARGET_MS 非法: $CASE_TPOT_TARGET_MS" 1
   CASE_INPUT_LEN="$(tokens_from_k "$CASE_INPUT_RAW")"   || die "INPUT 非法: $CASE_INPUT_RAW" 1
   CASE_OUTPUT_LEN="$(tokens_from_k "$CASE_OUTPUT_RAW")" || die "OUTPUT 非法: $CASE_OUTPUT_RAW" 1
@@ -735,7 +736,7 @@ do_run() {
   [[ -n "$CASE_INPUT_RAW" && -n "$CASE_OUTPUT_RAW" && -n "$CASE_HIT_PCT" && -n "$CASE_TTFT_METRIC" \
      && -n "$CASE_TTFT_TARGETS" && -n "$CASE_TPOT_METRIC" && -n "$CASE_TPOT_TARGET_MS" ]] \
     || die "case 字段不足: INPUT,OUTPUT,HIT_RATE,TTFT_METRIC,TTFT_TARGETS_S,TPOT_METRIC,TPOT_TARGET_MS[,MAX_CONCURRENCY]" 1
-  pos_dec "$CASE_HIT_PCT"        || die "HIT_RATE 非法: $CASE_HIT_PCT (0-100 百分数)" 1
+  nn_dec "$CASE_HIT_PCT"        || die "HIT_RATE 非法: $CASE_HIT_PCT (0-100 百分数)" 1
   pos_dec "$CASE_TPOT_TARGET_MS" || die "TPOT_TARGET_MS 非法: $CASE_TPOT_TARGET_MS" 1
 
   CASE_INPUT_LEN="$(tokens_from_k "$CASE_INPUT_RAW")"   || die "INPUT 非法: $CASE_INPUT_RAW (如 32k / 4096)" 1
