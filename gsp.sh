@@ -46,6 +46,11 @@
 #   --mode grid|bisect|ladder 回测策略, 默认 bisect
 #                             grid=gsp_prefix 口径: calib 的 inf_rps 起降序 step 网格
 #   --groups N --qpp N        GSP 组数/每组请求数 (默认 8/16, 官方默认 32/16)
+#   --auto                    groups/qpp 自适应档: qpp = max(16, ceil(100/(100-hit))),
+#                             groups = 2 if (input>=128k 且 output>=1k) else 4
+#                             (qpp 保证 cap=(qpp-dp)/qpp>=hit; 长输入x长输出压单点
+#                              耗时, 其余保统计稳定; 显式 --groups/--qpp 优先,
+#                              不加 --auto 时行为与旧版完全一致)
 #   --search-groups N         bisect 搜索阶段用小组数提速(默认 groups/2, ≥2)
 #   --skip-confirm            跳过全尺寸 confirm(更快, 精度略降)
 #   --rate-hi R --rate-lo R   手动指定上下界(给 --rate-hi 可跳过 inf 标定)
@@ -69,6 +74,9 @@ MODE="bisect"
 N_GROUPS="${GSP_NUM_GROUPS:-8}"
 QPP="${GSP_PROMPTS_PER_GROUP:-16}"
 SEARCH_GROUPS=""
+AUTO_MODE="${GSP_AUTO:-0}"
+EXPLICIT_G=0
+EXPLICIT_Q=0
 SKIP_CONFIRM=0
 RATE_HI="${RATE_HI:-}"
 RATE_LO="0.005"
@@ -93,7 +101,7 @@ LOG_DIR=""
 TRIALS_CSV=""
 RUN_FAILURE=0
 
-usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 die() { echo "[ERROR] $1" >&2; exit "${2:-1}"; }
 
 # ---------------- 参数解析 ----------------
@@ -104,8 +112,9 @@ while (( $# > 0 )); do
     --base-url)      BASE_URL="$2"; shift 2 ;;
     --model)         MODEL="$2"; shift 2 ;;
     --mode)          MODE="$2"; shift 2 ;;
-    --groups)        N_GROUPS="$2"; shift 2 ;;
-    --qpp)           QPP="$2"; shift 2 ;;
+    --groups)        N_GROUPS="$2"; EXPLICIT_G=1; shift 2 ;;
+    --qpp)           QPP="$2"; EXPLICIT_Q=1; shift 2 ;;
+    --auto)          AUTO_MODE=1; shift ;;
     --search-groups) SEARCH_GROUPS="$2"; shift 2 ;;
     --skip-confirm)  SKIP_CONFIRM=1; shift ;;
     --rate-hi)       RATE_HI="$2"; shift 2 ;;
@@ -158,6 +167,21 @@ PY
 # 输入: L, H(%), qpp, page, dp, ctx(0=无), out_len
 # 输出: L_used system_len question_len theory% req_theory% notes
 # P = round(H × L × Q/(Q−dp)) → page 对齐取离目标最近 → theory=(Q−dp)×P/(Q×L)
+auto_select_gq() { # IN_LEN OUT_LEN HIT%
+  [[ "$AUTO_MODE" == "1" ]] || return 0
+  local ilen="$1" olen="$2" hit="$3" q g
+  awk -v h="$hit" 'BEGIN{exit !(h>=0 && h<100)}' || die "auto: HIT_RATE need in [0,100), got ${hit}" 1
+  if [[ "$EXPLICIT_Q" == "0" ]]; then
+    q="$(awk -v h="$hit" 'BEGIN{q=100.0/(100.0-h); n=int(q); if(n<q) n++; printf "%d", (n<16?16:n)}')"
+    QPP="$q"
+  fi
+  if [[ "$EXPLICIT_G" == "0" ]]; then
+    if (( ilen >= 131072 && olen >= 1024 )); then g=2; else g=4; fi
+    N_GROUPS="$g"
+  fi
+  echo "[auto] groups=${N_GROUPS} qpp=${QPP} (in=${ilen} out=${olen} hit=${hit}%, explicitG=${EXPLICIT_G} explicitQ=${EXPLICIT_Q})"
+}
+
 derive_lengths() {
   "$PY" - "$1" "$2" "$3" "$4" "$5" "${6:-0}" "${7:-0}" <<'PY' | tr -d '\r'
 import math, sys
@@ -670,6 +694,7 @@ do_calib() {
   pos_dec "$CASE_TPOT_TARGET_MS" || die "TPOT_TARGET_MS 非法: $CASE_TPOT_TARGET_MS" 1
   CASE_INPUT_LEN="$(tokens_from_k "$CASE_INPUT_RAW")"   || die "INPUT 非法: $CASE_INPUT_RAW" 1
   CASE_OUTPUT_LEN="$(tokens_from_k "$CASE_OUTPUT_RAW")" || die "OUTPUT 非法: $CASE_OUTPUT_RAW" 1
+  auto_select_gq "$CASE_INPUT_LEN" "$CASE_OUTPUT_LEN" "$CASE_HIT_PCT"
   STRICT_TTFT_MS="$("$PY" - "$CASE_TTFT_TARGETS" <<'PY' | tr -d '\r'
 import sys
 vals = [float(x) for x in sys.argv[1].split("|") if x.strip()]
@@ -741,6 +766,7 @@ do_run() {
 
   CASE_INPUT_LEN="$(tokens_from_k "$CASE_INPUT_RAW")"   || die "INPUT 非法: $CASE_INPUT_RAW (如 32k / 4096)" 1
   CASE_OUTPUT_LEN="$(tokens_from_k "$CASE_OUTPUT_RAW")" || die "OUTPUT 非法: $CASE_OUTPUT_RAW (如 0.5k / 512)" 1
+  auto_select_gq "$CASE_INPUT_LEN" "$CASE_OUTPUT_LEN" "$CASE_HIT_PCT"
 
   # 多档 TTFT SLO ('5|7') → bisect 判定取最严档 (min×1000 → ms)
   STRICT_TTFT_MS="$("$PY" - "$CASE_TTFT_TARGETS" <<'PY' | tr -d '\r'
