@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# prefix90_bench.sh v6 — prefix90 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
+# prefill_sla_bench.sh v6 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
 # ============================================================
 # 数据集: sglang/prefix90_hit.py (PREFIX_HIT 参数化, input/output len 任意)
 # 模式分流 (按 OUTPUT 自动判定):
@@ -23,7 +23,7 @@
 #     全程 num_prompts=best_np (与最高吞吐同一请求池, 口径一致)。
 # 用法 (perf_bench 仓库根目录, 客户端容器内):
 #   BASE_URL=http://192.168.0.65:30000 MODEL=/mnt/gbj/models/xxx \
-#   bash sglang/prefix90_bench.sh \
+#   bash sglang/prefill_sla_bench.sh \
 #        --case '64k,1,80' --case '128k,1,80' --case '256k,1,90' \
 #        [--np-start 64 --np-step 2 --sat-gain 3]
 # case 语法: INPUT,OUTPUT,HIT   INPUT 任意(k/K 后缀), OUTPUT 任意, HIT 0-100(0=冷)
@@ -117,7 +117,7 @@ while (( $# > 0 )); do
 done
 
 # OUT_DIR 必须在参数解析后赋值, 否则 --run-id 不生效
-OUT_DIR="./all_result/prefix90_${RUN_ID}"
+OUT_DIR="./all_result/sla_${RUN_ID}"
 LOG_DIR="${OUT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
