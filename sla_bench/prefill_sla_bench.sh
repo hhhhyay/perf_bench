@@ -2,7 +2,7 @@
 # ============================================================
 # prefill_sla_bench.sh v6 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
 # ============================================================
-# 数据集: sglang/prefix90_hit.py (PREFIX_HIT 参数化, input/output len 任意)
+# 数据集: sla_bench/prefix_hit.py (PREFIX_HIT 参数化, input/output len 任意)
 # 模式分流 (按 OUTPUT 自动判定):
 #   OUTPUT=1  → prefill 模式: np 饱和扫描 + 0.1 降率 SLA 回测 (下述规则)
 #   OUTPUT>1  → decode 模式: --max-concurrency 限并发 (默认 inf=不传该参),
@@ -23,7 +23,7 @@
 #     全程 num_prompts=best_np (与最高吞吐同一请求池, 口径一致)。
 # 用法 (perf_bench 仓库根目录, 客户端容器内):
 #   BASE_URL=http://192.168.0.65:30000 MODEL=/mnt/gbj/models/xxx \
-#   bash sglang/prefill_sla_bench.sh \
+#   bash sla_bench/prefill_sla_bench.sh \
 #        --case '64k,1,80' --case '128k,1,80' --case '256k,1,90' \
 #        [--np-start 64 --np-step 2 --sat-gain 3]
 # case 语法: INPUT,OUTPUT,HIT   INPUT 任意(k/K 后缀), OUTPUT 任意, HIT 0-100(0=冷)
@@ -45,7 +45,7 @@
 #       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅 prefill)
 #       --run-id ID --dry-run
 # 环境变量: BASE_URL MODEL PYTHON_BIN SEED
-# 输出: ./all_result/prefix90_${RUN_ID}/{np_scan.tsv, bs_scan.tsv,
+# 输出: ./all_result/sla_${RUN_ID}/{np_scan.tsv, bs_scan.tsv,
 #       sla_backtest.tsv, logs/}
 # ============================================================
 
@@ -189,7 +189,7 @@ for raw_case in "${CASES[@]}"; do
     curl -s --max-time 10 -X POST "${BASE_URL}/flush_cache" >/dev/null 2>&1 || true
     sleep 2
     ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
-        "$PYTHON_BIN" "$script_dir/prefix90_hit.py" \
+        "$PYTHON_BIN" "$script_dir/prefix_hit.py" \
         --backend sglang --base-url "$BASE_URL" --model "$MODEL" \
         --dataset-name random-ids --tokenize-prompt \
         --random-input-len "$IN_LEN" --random-output-len "$OUT_LEN" \
