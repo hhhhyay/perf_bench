@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================
-# prefill_sla_bench.sh v6.1 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
+# prefill_sla_bench.sh v6.2 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
 # 每条 trial 统一落 27 列标准指标 (Group/InOut/parallel_config/命中率/np/并发/
 # server 峰值/rate/duration/rps/吞吐×3/TTFT·TPOT·ITL mean|p95|p99/E2E),
 # sla_backtest.tsv 追加 sla_metric/target_s/lock_type 3 列锁点元数据。
+# v6.2: decode 限并发阶梯每档以 --max-concurrency C 逐档下压 (修复全局固定值);
 # ============================================================
 # 数据集: sla_bench/prefix_hit.py (PREFIX_HIT 参数化, input/output len 任意)
 # 模式分流 (按 OUTPUT 自动判定):
 #   OUTPUT=1  → prefill 模式: np 饱和扫描 + 0.1 降率 SLA 回测 (下述规则)
 #   OUTPUT>1  → decode 模式: --max-concurrency 限并发 (默认 inf=不传该参),
 #               只跑 np 扫描/标定, 不做请求率回测
-#   decode 限并发时: 扫描/标定的档位是并发数 C, 实际请求数 = C × --np-mult
-#   (默认 3), 请求池持续补位形成稳态并发, 避免池子=并发跑完即止。
+#   decode 限并发时: --np-list 每个元素 = 该档并发数 C, 以 --max-concurrency C
+#   逐档下压 (阶梯开关=--max-concurrency 传有限值; 全局值兼作档位上限告警),
+#   实际请求数 = C × --np-mult (默认 3), 请求池持续补位形成稳态并发,
+#   避免池子=并发跑完即止。
 #   decode SLA 边界: 升压扫描中某档 SLA 指标 (默认 mean TTFT, --sla-stop-ms
 #     阈值, 缺省取 --sla-targets 首档) 超标即停止升压, 锁定最后一个满足档
 #     → decode_sla_lock (无档满足 → decode_sla_not_found)。
@@ -43,8 +46,8 @@
 #       --sla-targets S|.. 秒阈值列表 (默认 3|4|5|6)
 #       --sla-stop-ms N    decode 升压扫描 SLA 停止阈值 ms (默认=首档×1000)
 #       --rate-step F      固定降率步长 (默认 0.1, 仅 prefill 模式)
-#       --max-concurrency N|inf  最大并发 (默认 inf=不加该参数;
-#                          decode 模式即按此并发出压, prefill 同样生效)
+#       --max-concurrency N|inf  最大并发 (默认 inf=不加该参数, prefill
+#                          同样生效; decode 模式传有限值=启用并发阶梯)
 #       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅 prefill)
 #       --run-id ID --dry-run
 # 环境变量: BASE_URL MODEL PYTHON_BIN SEED
@@ -82,7 +85,8 @@ mc_args=()
 GROUP="${GROUP:-}"                       # Group 列: 战役/分组标签
 PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"   # 空=启动后自动抓 /get_server_info
 PCFG="$PARALLEL_CONFIG"
-MC_COL=""; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"  # 并发两列
+MC_COL=""                                # 并发两列默认值 (解析后按 MAX_CONC 重建)
+MC_ROW=""                                # 并发阶梯逐行覆盖: 该档并发数
 PEAK_SAMPLING="${PEAK_SAMPLING:-1}"      # trial 期间采样 server /metrics 峰值
 PEAK_INT="${PEAK_INT:-2}"                # 采样间隔 s
 PCT_METRICS="${PERCENTILE_METRICS:-ttft,tpot,itl,e2el}"
@@ -128,6 +132,9 @@ while (( $# > 0 )); do
     *)              PASSTHROUGH+=("$1"); shift ;;  # 其余参数透传给 bench CLI
   esac
 done
+
+# 并发两列默认值: 依赖 CLI --max-concurrency, 解析后重建
+MC_COL=""; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"
 
 # OUT_DIR 必须在参数解析后赋值, 否则 --run-id 不生效
 OUT_DIR="./all_result/sla_${RUN_ID}"
@@ -269,7 +276,7 @@ row_core() { # rate np json rps mm dur hit → 打印一行 27 列 (tab)
   pk=$(peaks_of "$3")
   core=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${GROUP}" "${IN_LEN}" "${OUT_LEN}" "${PCFG}" "${hit_s}" "$7" "$2" \
-    "${MC_COL}" "${MC_COL}" \
+    "${MC_ROW:-$MC_COL}" "${MC_ROW:-$MC_COL}" \
     "${pk%%$'\t'*}" "${pk#*$'\t'}" "$1" "$6" "$4")
   printf '%s\t%s\n' "${core}" "${ex}"
 }
@@ -350,7 +357,14 @@ for raw_case in "${CASES[@]}"; do
   best_np=""; best_rps="-1"; best_m=""; best_dur=""; best_done=""; best_hit=""; prev_rps=""
   np_i=0
   for np in "${NP_SEQ[@]}"; do
-    if (( conc_ladder )); then np_eff=$(fmul "$np" "$eff_mult"); else np_eff="$np"; fi
+    if (( conc_ladder )); then
+      np_eff=$(fmul "$np" "$eff_mult"); MC_ROW="$np"
+      (( np > MAX_CONC )) && warn "[np-scan] 档=$np 超过 --max-concurrency=$MAX_CONC 上限 (仍按 $np 出压)"
+      mc_args=(--max-concurrency "$np")   # v6.2: 每档以其并发数下压
+    else
+      np_eff="$np"; MC_ROW=""
+      mc_args=(); [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC")
+    fi
     NUM_PROMPTS="$np_eff"
     json="${LOG_DIR}/${tag}_inf_c${np}.jsonl"; clog="${LOG_DIR}/${tag}_inf_c${np}.log"
     log "[np-scan] 档=$np np=$np_eff rate=inf -> $clog"
@@ -390,16 +404,20 @@ for raw_case in "${CASES[@]}"; do
     if (( conc_ladder )); then best_np=$(fmul "${NP_SEQ[0]}" "$eff_mult"); else best_np="${NP_SEQ[0]}"; fi
   fi
   NUM_PROMPTS="$best_np"
+  lad="$best_np"; (( conc_ladder )) && lad=$(( best_np / eff_mult ))
+  MC_ROW=""; (( conc_ladder )) && MC_ROW="$lad"
+  # 恢复全局 mc_args (阶梯循环曾按档覆盖); calib 回退重跑时再按需改回首档
+  mc_args=(); [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC")
   json="${LOG_DIR}/${tag}_inf.jsonl"; clog="${LOG_DIR}/${tag}_inf.log"
   if [[ -n "$best_rps" && "$best_rps" != "-1" ]]; then
     inf_rps=$best_rps; inf_m=$best_m; inf_dur=$best_dur; inf_done=$best_done; inf_hit=$best_hit
-    [[ -f "${LOG_DIR}/${tag}_inf_np${best_np}.jsonl" || -f "${LOG_DIR}/${tag}_inf_c${best_np}.jsonl" ]] \
-      && cp "${LOG_DIR}/${tag}_inf_np${best_np}.jsonl" "$json" 2>/dev/null \
-      || cp "${LOG_DIR}/${tag}_inf_c${best_np}.jsonl" "$json" 2>/dev/null || true
+    [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] \
+      && cp "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" "$json" 2>/dev/null || true
   elif (( DRY_RUN )); then
     read -r inf_rps inf_m inf_dur inf_done inf_hit <<< "0 0 0 0 0"
   else
     log "[calib] rate=inf np=${NP_SEQ[0]} (扫描全失败, 回退) -> $clog"
+    (( conc_ladder )) && mc_args=(--max-concurrency "${NP_SEQ[0]}")
     if ! run_trial inf "$json" "$clog"; then
       warn "case $tag inf 标定失败, 见 $clog (跳过该 case)"; continue
     fi
@@ -421,10 +439,12 @@ for raw_case in "${CASES[@]}"; do
       l_tgt=$("$PYTHON_BIN" -c "print(float('${dec_stop_ms}')/1000)" 2>/dev/null || echo -)
       warn "[decode] 无档满足 SLA<=${dec_stop_ms:-any}ms (最大 rps=$inf_rps)"
     fi
+    l_lad="$l_np"; (( conc_ladder )) && l_lad=$(( l_np / eff_mult ))
+    MC_ROW=""; (( conc_ladder )) && MC_ROW="$l_lad"
     lf_json="$json"
     if [[ -n "$last_ok_np" && "$last_ok_np" != "$NUM_PROMPTS" && "$eff_mult" -gt 1 ]]; then
       lad=$(( last_ok_np / eff_mult ))
-      [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl"
+      [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl" && MC_ROW="$lad"
     fi
     printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$l_tgt" "$lock_type" >> "$BACK_TSV"
     continue
