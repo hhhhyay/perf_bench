@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
-# prefill_sla_bench.sh v6 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
+# prefill_sla_bench.sh v6.1 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
+# 每条 trial 统一落 27 列标准指标 (Group/InOut/parallel_config/命中率/np/并发/
+# server 峰值/rate/duration/rps/吞吐×3/TTFT·TPOT·ITL mean|p95|p99/E2E),
+# sla_backtest.tsv 追加 sla_metric/target_s/lock_type 3 列锁点元数据。
 # ============================================================
 # 数据集: sla_bench/prefix_hit.py (PREFIX_HIT 参数化, input/output len 任意)
 # 模式分流 (按 OUTPUT 自动判定):
@@ -75,10 +78,20 @@ NP_MULT=""              # 空=自动 (decode 限并发→3, 其余→1); 传值�
 mc_args=()
 [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC")
 
+# ---- 27 列元数据来源 ----
+GROUP="${GROUP:-}"                       # Group 列: 战役/分组标签
+PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"   # 空=启动后自动抓 /get_server_info
+PCFG="$PARALLEL_CONFIG"
+MC_COL=""; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"  # 并发两列
+PEAK_SAMPLING="${PEAK_SAMPLING:-1}"      # trial 期间采样 server /metrics 峰值
+PEAK_INT="${PEAK_INT:-2}"                # 采样间隔 s
+PCT_METRICS="${PERCENTILE_METRICS:-ttft,tpot,itl,e2el}"
+PCT_VALUES="${METRIC_PERCENTILES:-95,99}"
+
 declare -a CASES=()
 declare -a PASSTHROUGH=()
 
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { awk '/^# ={10,}/{c++; next} c==1{sub(/^# ?/,""); print} c>1{exit}' "$0"; exit 0; }
 log()  { echo "[INFO]  $(date '+%F %T') $*"; }
 warn() { echo "[WARN]  $(date '+%F %T') $*"; }
 die()  { echo "[ERROR] $(date '+%F %T') $*" >&2; exit "${2:-1}"; }
@@ -134,6 +147,39 @@ if (( DRY_RUN == 0 )); then
   log "server OK: $BASE_URL"
 fi
 
+# parallel_config 27 列自动识别: /get_server_info 任意层级找 *_size (sglang, 非 1 才拼)
+if [[ -z "$PCFG" && "$DRY_RUN" == 0 ]]; then
+  info=$(curl -s --max-time 5 "${BASE_URL%/}/get_server_info" 2>/dev/null || true)
+  if [[ -n "$info" ]]; then
+    PCFG=$("$PYTHON_BIN" - "$info" <<'PYPCFG'
+import json, sys
+def dig(d, key):
+    if isinstance(d, dict):
+        v = d.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+        for x in d.values():
+            r = dig(x, key)
+            if r is not None:
+                return r
+    return None
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit
+parts = []
+for p in ("tp", "pp", "dp", "ep"):
+    v = dig(d, p + "_size")
+    if isinstance(v, int) and v > 1:
+        parts.append(f"{p}{v}")
+print("".join(parts))
+PYPCFG
+)
+  fi
+  [[ -n "$PCFG" ]] || PCFG="$PARALLEL_CONFIG"
+  [[ -n "$PCFG" ]] && log "[server] parallel_config=$PCFG"
+fi
+
 # 摘指标: rps metric dur completed actual_hit; completed 不齐视为失败(全 0)
 pick_metrics() { # json
   "$PYTHON_BIN" - "$1" "$SLA_METRIC" "$NUM_PROMPTS" <<'PYEOF'
@@ -162,12 +208,80 @@ meet() { "$PYTHON_BIN" -c "import sys; sys.exit(0 if ${1} > 0 and ${1} < ${2} el
 fstep() { "$PYTHON_BIN" -c "print(max(round(float('${1}') - float('${2}'), 2), 0.1))"; }
 fmul() { "$PYTHON_BIN" -c "import math; print(int(math.floor(float('${1}') * float('${2}'))))"; }
 
+# ---- trial 峰值采样: server /metrics (num_running_reqs / gen_throughput) ----
+peak_start() { # $1=输出文件, 返回后台 pid (未启用返回空)
+  (( PEAK_SAMPLING == 1 )) || return 0
+  ( while :; do
+      s=$(curl -s --max-time 2 "${BASE_URL%/}/metrics" 2>/dev/null || true)
+      [[ -n "$s" ]] && \
+        echo "$(awk '/^sglang:num_running_reqs/{t+=$NF} END{if(t>0)printf "%.0f",t}' <<<"$s") $(awk '/^sglang:gen_throughput/{t+=$NF} END{if(t>0)printf "%.1f",t}' <<<"$s")"
+      sleep "$PEAK_INT"
+    done ) >> "$1" 2>/dev/null &
+  echo $!
+}
+peak_stop() { [[ -n "${1:-}" ]] && { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }; return 0; }
+
+peaks_of() { # $1=json → "peak_gen\tpeak_run", 无采样 → ""
+  local f="$1.peaks" r=""
+  [[ -s "$f" ]] \
+    && r=$(awk '{if($1+0>R)R=$1+0;if($2+0>G)G=$2+0} END{printf "%s\t%s",(G>0?G:""),(R>0?R:"")}' "$f")
+  printf '%s' "$r"
+}
+
+# ---- 27 列动态字段: bench jsonl 末行 summary (缺失回退计算, 无则留空) ----
+pick_extra() { # $1=json → 13 个 tab 分隔值: 吞吐×3 + ttft/tpot/itl×3 + e2e
+  "$PYTHON_BIN" - "$1" <<'PYXTRA'
+import json, sys
+rows = []
+try:
+    rows = [json.loads(s) for s in open(sys.argv[1], encoding="utf-8") if s.strip()]
+except Exception:
+    pass
+j = rows[-1] if rows else {}
+d = j.get("duration")
+def num(v): return isinstance(v, (int, float)) and not isinstance(v, bool)
+def g(*keys):
+    for k in keys:
+        v = j.get(k)
+        if num(v):
+            return v
+    return ""
+ti, to = j.get("total_input_tokens"), j.get("total_output_tokens")
+in_tp = g("input_token_throughput") or (round(ti / d, 4) if num(ti) and d else "")
+gen_tp = g("output_throughput") or (round(to / d, 4) if num(to) and d else "")
+tot_tp = g("total_token_throughput") or \
+    (round((ti + to) / d, 4) if num(ti) and num(to) and d else "")
+def met(m, p="mean"):
+    v = j.get(f"{p}_{m}_ms")
+    return round(v, 4) if num(v) else ""
+vals = [in_tp, gen_tp, tot_tp]
+for m in ("ttft", "tpot", "itl"):
+    vals += [met(m, "mean"), met(m, "p95"), met(m, "p99")]
+vals.append(g("mean_e2el_ms", "mean_e2e_latency_ms"))
+print("\t".join("" if x == "" else str(x) for x in vals))
+PYXTRA
+}
+
+# ---- 27 列行组装 (列序见文件头), 静态列取自脚本侧变量 ----
+row_core() { # rate np json rps mm dur hit → 打印一行 27 列 (tab)
+  local ex pk core
+  ex=$(pick_extra "$3")
+  pk=$(peaks_of "$3")
+  core=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "${GROUP}" "${IN_LEN}" "${OUT_LEN}" "${PCFG}" "${hit_s}" "$7" "$2" \
+    "${MC_COL}" "${MC_COL}" \
+    "${pk%%$'\t'*}" "${pk#*$'\t'}" "$1" "$6" "$4")
+  printf '%s\t%s\n' "${core}" "${ex}"
+}
+
 NP_TSV="${OUT_DIR}/np_scan.tsv"
 SCAN_TSV="${OUT_DIR}/bs_scan.tsv"
 BACK_TSV="${OUT_DIR}/sla_backtest.tsv"
-echo -e "case\tinput_len\toutput_len\thit_pct\tnum_prompts\trate\tactual_rps\tduration_s\t${SLA_METRIC}\tgain_vs_prev_pct" > "$NP_TSV"
-echo -e "case\tinput_len\toutput_len\thit_pct\tcached_len\tnum_prompts\trate\tactual_rps\t${SLA_METRIC}\tduration_s\tcompleted\tactual_cache_hit_pct" > "$SCAN_TSV"
-echo -e "case\tinput_len\toutput_len\thit_pct\tsla_metric\ttarget_s\tnum_prompts\tlocked_rate\tlocked_rps\t${SLA_METRIC}\tduration_s\tactual_cache_hit_pct\tlock_type" > "$BACK_TSV"
+COLS="Group,Input tokens,Generated tokens,parallel_config,Target cache hit(%),Actual cache hit(%),num_prompts,max_concurrency,concurrency,peak_output_throughput,peak_concurrency,request_rate,duration_s,rps,input_throughput_tok_s,generate_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms"
+COLS_TSV="${COLS//,/$'\t'}"
+printf '%s\t%s\n' "$COLS_TSV" "gain_vs_prev_pct" > "$NP_TSV"
+printf '%s\n' "$COLS_TSV" > "$SCAN_TSV"
+printf '%s\t%s\t%s\t%s\n' "$COLS_TSV" "sla_metric" "target_s" "lock_type" > "$BACK_TSV"
 
 for raw_case in "${CASES[@]}"; do
   IFS=',' read -r in_s out_s hit_s <<< "$raw_case"
@@ -184,7 +298,8 @@ for raw_case in "${CASES[@]}"; do
     || log "== case=$tag L=$IN_LEN O=$OUT_LEN hit=${hit_s}% (cached=$CACHED_LEN) PREFILL rate-only"
 
   run_trial() { # rate json clog
-    local rate=$1 json=$2 clog=$3
+    local rate=$1 json=$2 clog=$3 rc pid
+    pid=$(peak_start "$json.peaks")
     # [flush-patch] 每 trial 前清 radix cache, 保证首触碰命中率口径 (防跨 trial 污染)
     curl -s --max-time 10 -X POST "${BASE_URL}/flush_cache" >/dev/null 2>&1 || true
     sleep 2
@@ -196,13 +311,17 @@ for raw_case in "${CASES[@]}"; do
         --random-range-ratio 1.0 --request-rate "$rate" \
         --num-prompts "$NUM_PROMPTS" ${mc_args[@]+"${mc_args[@]}"} \
         --warmup-requests 0 --cache-report --output-details \
+        --percentile-metrics "$PCT_METRICS" --metric-percentiles "$PCT_VALUES" \
         --output-file "$json" --disable-tqdm \
         --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
         ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
     ) > "$clog" 2>&1
+    rc=$?
+    peak_stop "$pid"
+    return "$rc"
   }
   record() { # rate rps metric dur completed hit
-    echo -e "$tag\t$IN_LEN\t$OUT_LEN\t${hit_s}\t$CACHED_LEN\t$NUM_PROMPTS\t$1\t$2\t$3\t$4\t$5\t$6" >> "$SCAN_TSV"
+    printf '%s\n' "$(row_core "$1" "$NUM_PROMPTS" "$json" "$2" "$3" "$4" "$6")" >> "$SCAN_TSV"
   }
 
   # ---- 阶段0: np 饱和扫描 (rate=inf, 决定请求池 best_np) ----
@@ -244,7 +363,7 @@ for raw_case in "${CASES[@]}"; do
     gain="-"
     [[ -n "$prev_rps" && "$prev_rps" != "0" ]] \
       && gain=$("$PYTHON_BIN" -c "print(round((float('$rps')-float('$prev_rps'))/float('$prev_rps')*100,2))")
-    echo -e "$tag\t$IN_LEN\t$OUT_LEN\t${hit_s}\t$np_eff\tinf\t$rps\t$dur\t$mm\t$gain" >> "$NP_TSV"
+    printf '%s\t%s\n' "$(row_core inf "$np_eff" "$json" "$rps" "$mm" "$dur" "$hitp")" "$gain" >> "$NP_TSV"
     log "[np-scan] 档=$np np=$np_eff rps=$rps ${SLA_METRIC}=$mm gain=${gain}%"
     if (( DRY_RUN == 0 )) && "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$rps') > float('$best_rps') else 1)"; then
       best_np=$np_eff; best_rps=$rps; best_m=$mm; best_dur=$dur; best_done=$done_; best_hit=$hitp
@@ -302,7 +421,12 @@ for raw_case in "${CASES[@]}"; do
       l_tgt=$("$PYTHON_BIN" -c "print(float('${dec_stop_ms}')/1000)" 2>/dev/null || echo -)
       warn "[decode] 无档满足 SLA<=${dec_stop_ms:-any}ms (最大 rps=$inf_rps)"
     fi
-    echo -e "$tag\t$IN_LEN\t$OUT_LEN\t${hit_s}\t$SLA_METRIC\t${l_tgt}\t$l_np\tinf\t$l_rps\t$l_m\t${l_dur:--}\t$l_hit\t$lock_type" >> "$BACK_TSV"
+    lf_json="$json"
+    if [[ -n "$last_ok_np" && "$last_ok_np" != "$NUM_PROMPTS" && "$eff_mult" -gt 1 ]]; then
+      lad=$(( last_ok_np / eff_mult ))
+      [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$l_tgt" "$lock_type" >> "$BACK_TSV"
     continue
   fi
 
@@ -312,7 +436,7 @@ for raw_case in "${CASES[@]}"; do
     [[ "$tgt_s" =~ ^[0-9.]+$ ]] || die "非法 SLA 阈值: $tgt_s"
     tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
     if meet "$inf_m" "$tgt_ms"; then
-      echo -e "$tag\t$IN_LEN\t$OUT_LEN\t${hit_s}\t$SLA_METRIC\t${tgt_s}\t$NUM_PROMPTS\tinf\t$inf_rps\t$inf_m\t$inf_dur\t$inf_hit\tinf_lock" >> "$BACK_TSV"
+      printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$NUM_PROMPTS" "$json" "$inf_rps" "$inf_m" "$inf_dur" "$inf_hit")" "$SLA_METRIC" "$tgt_s" "inf_lock" >> "$BACK_TSV"
       log "[backtest] <${tgt_s}s: rate=inf rps=$inf_rps (inf 已满足, 锁定)"
       continue
     fi
@@ -337,12 +461,12 @@ for raw_case in "${CASES[@]}"; do
     done
 
     if [[ -z "$lo" ]]; then
-      echo -e "$tag\t$IN_LEN\t$OUT_LEN\t${hit_s}\t$SLA_METRIC\t${tgt_s}\t$NUM_PROMPTS\t-\t-\t-\t-\t-\tnot_found" >> "$BACK_TSV"
+      printf '%s\t%s\t%s\t%s\n' "$(row_core "$cur" "$NUM_PROMPTS" "$json" - - - -)" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
       warn "[backtest] <${tgt_s}s 未找到满足点 (rate 到 0.1 仍不满足)"
       continue
     fi
 
-    echo -e "$tag\t$IN_LEN\t$OUT_LEN\t${hit_s}\t$SLA_METRIC\t${tgt_s}\t$NUM_PROMPTS\t$lo\t$lo_rps\t$lo_m\t$lo_dur\t$lo_hit\tdescend_lock" >> "$BACK_TSV"
+    printf '%s\t%s\t%s\t%s\n' "$(row_core "$lo" "$NUM_PROMPTS" "$json" "$lo_rps" "$lo_m" "$lo_dur" "$lo_hit")" "$SLA_METRIC" "$tgt_s" "descend_lock" >> "$BACK_TSV"
     log "[backtest] <${tgt_s}s: rate=$lo 锁定 (${SLA_METRIC}=$lo_m, cache_hit=$lo_hit%)"
   done
 done
