@@ -274,8 +274,10 @@ peaks_of() { # $1=json → "peak_gen\tpeak_run", 无采样 → ""
   printf '%s' "$r"
 }
 
-# ---- 27 列动态字段: bench jsonl 末行 summary (缺失回退计算, 无则留空) ----
-pick_extra() { # $1=json → 13 个 tab 分隔值: 吞吐×3 + ttft/tpot/itl×3 + e2e
+# ---- 27 列动态字段: bench jsonl 末行 summary ----
+# 返回 16 列: [concurrency, peak_output_throughput, peak_concurrency] + 吞吐×3 + ttft/tpot/itl×9 + e2e
+# 前 3 列被 row_core 用来填 COLS 第 9-11 位 (core 部分), 后 13 列填 rps 之后 (ex 部分)
+pick_extra() { # $1=json
   "$PYTHON_BIN" - "$1" <<'PYXTRA'
 import json, sys
 rows = []
@@ -292,32 +294,47 @@ def g(*keys):
         if num(v):
             return v
     return ""
+# ---- peak 三列 (COLS 第 9-11 位, 放在最前, row_core 拆分使用) ----
+conc = g("concurrency")
+peak_out = g("max_output_tokens_per_s") or g("peak_output_throughput")
+peak_conc = g("max_concurrent_requests") or g("peak_concurrency")
+# ---- 吞吐 × 3 ----
 ti, to = j.get("total_input_tokens"), j.get("total_output_tokens")
 in_tp = g("input_token_throughput") or (round(ti / d, 4) if num(ti) and d else "")
 gen_tp = g("output_throughput") or (round(to / d, 4) if num(to) and d else "")
 tot_tp = g("total_token_throughput") or \
     (round((ti + to) / d, 4) if num(ti) and num(to) and d else "")
+# ---- ttft/tpot/itl × mean/p95/p99 × 9 ----
 def met(m, p="mean"):
     v = j.get(f"{p}_{m}_ms")
     return round(v, 4) if num(v) else ""
-vals = [in_tp, gen_tp, tot_tp]
+rest = [in_tp, gen_tp, tot_tp]
 for m in ("ttft", "tpot", "itl"):
-    vals += [met(m, "mean"), met(m, "p95"), met(m, "p99")]
-vals.append(g("mean_e2el_ms", "mean_e2e_latency_ms"))
-print("\t".join("" if x == "" else str(x) for x in vals))
+    rest += [met(m, "mean"), met(m, "p95"), met(m, "p99")]
+rest.append(g("mean_e2el_ms", "mean_e2e_latency_ms"))
+allv = [conc, peak_out, peak_conc] + rest
+print("\t".join("" if x == "" else str(x) for x in allv))
 PYXTRA
 }
 
-# ---- 27 列行组装 (列序见文件头), 静态列取自脚本侧变量 ----
+# ---- 27 列行组装 (列序见文件头) ----
+# pick_extra 返回 16 列: [conc, peak_out, peak_conc | rest×13]
+# COLS 前 11 列 = core(14 列, 但 peak 三列来自 pick_extra 前 3 列)
+# COLS 后 13 列 = pick_extra 后 13 列
 row_core() { # rate np json rps mm dur hit → 打印一行 27 列 (tab)
-  local ex pk core
-  ex=$(pick_extra "$3")
-  pk=$(peaks_of "$3")
+  local ex_all core ex_part pk_part
+  ex_all=$(pick_extra "$3")
+  # 拆分: 前 3 列是 peak 信息给 core 用, 后 13 列追加到 rps 后
+  pk_part="${ex_all%%$'\t'*}"; tmp="${ex_all#*$'\t'}"
+  pk_part2="${tmp%%$'\t'*}"; tmp2="${tmp#*$'\t'}"
+  pk_part3="${tmp2%%$'\t'*}"
+  ex_part="${tmp2#*$'\t'}"
   core=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${GROUP}" "${IN_LEN}" "${OUT_LEN}" "${PCFG}" "${hit_s}" "$7" "$2" \
-    "${MC_ROW:-$MC_COL}" "${MC_ROW:-$MC_COL}" \
-    "${pk%%$'\t'*}" "${pk#*$'\t'}" "$1" "$6" "$4")
-  printf '%s\t%s\n' "${core}" "${ex}"
+    "${MC_ROW:-$MC_COL}" \
+    "${pk_part}" "${pk_part2}" "${pk_part3}" \
+    "$1" "$6" "$4")
+  printf '%s\t%s\n' "${core}" "${ex_part}"
 }
 
 NP_TSV="${OUT_DIR}/np_scan.tsv"
@@ -376,11 +393,10 @@ for raw_case in "${CASES[@]}"; do
   }
 
   # ---- 阶段0: np 饱和扫描 (rate=inf, 决定请求池 best_np) ----
+  # decode 模式: 自动启用并发阶梯, np_list 每个元素 = 并发 C, 请求数 = C × eff_mult (默认 3)
   conc_ladder=0; eff_mult=1
-  if (( decode_mode )) && [[ "$MAX_CONC" != "inf" ]]; then
-    conc_ladder=1; eff_mult="${NP_MULT:-3}"   # 档位=并发数C, 请求数=C×M (持续补位)
-  elif [[ -n "$NP_MULT" ]] && (( decode_mode )); then
-    eff_mult="$NP_MULT"                        # decode 无限并发: 仅记录用
+  if (( decode_mode )); then
+    conc_ladder=1; eff_mult="${NP_MULT:-3}"   # decode 自动并发阶梯
   fi
   # decode SLA 停止阈值: 未显式给 --sla-stop-ms 则取 --sla-targets 首档
   dec_stop_ms="$SLA_STOP_MS"
@@ -426,12 +442,8 @@ for raw_case in "${CASES[@]}"; do
     if (( DRY_RUN == 0 )) && "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$rps') > float('$best_rps') else 1)"; then
       best_np=$np_eff; best_rps=$rps; best_m=$mm; best_dur=$dur; best_done=$done_; best_hit=$hitp
     fi
-    # decode SLA 硬边界: 超标即停升压, 锁最后一个满足档
-    if (( decode_mode && DRY_RUN == 0 )) && [[ -n "$dec_stop_ms" ]]; then
-      if "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$mm') > float('$dec_stop_ms') else 1)"; then
-        log "[np-scan] 档=$np ${SLA_METRIC}=$mm 超过 SLA ${dec_stop_ms}ms, 停止升压"
-        break
-      fi
+    # decode 模式: 扫描阶段只看 rps 增益 (inf 档不看 TTFT), 锁定由后续回测决定
+    if (( decode_mode )); then
       last_ok_np=$np_eff; last_ok_rps=$rps; last_ok_m=$mm; last_ok_dur=$dur; last_ok_done=$done_; last_ok_hit=$hitp
     fi
     if (( auto_mode && DRY_RUN == 0 && np_i > 0 )); then
@@ -473,45 +485,71 @@ for raw_case in "${CASES[@]}"; do
   else                           record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"; fi
   log "[calib] best_np=$NUM_PROMPTS rps=$inf_rps ${SLA_METRIC}=$inf_m cache_hit=${inf_hit}%"
 
-  # ---- decode 模式: SLA 边界锁定, 不做请求率回测 ----
+  # ---- decode 模式: SLA 并发锁定 + 逐档 0.1 步长降率回测 ----
+  # 自动启用并发阶梯: np_list 每个元素 = 并发 C, 请求数 = C × eff_mult (默认 3)
   if (( decode_mode )); then
+    eff_mult="${NP_MULT:-3}"
     if [[ -n "$last_ok_np" ]]; then
       lock_type="decode_sla_lock"
       l_np=$last_ok_np; l_rps=$last_ok_rps; l_m=$last_ok_m; l_hit=$last_ok_hit; l_dur=$last_ok_dur
-      l_tgt=$("$PYTHON_BIN" -c "print(float('${dec_stop_ms}')/1000)")
-      log "[decode] SLA 锁定: np=$l_np rps=$l_rps ${SLA_METRIC}=$l_m <= ${dec_stop_ms}ms"
+      log "[decode] 并发锁定: np=$l_np max_conc=$l_np rps=$l_rps ${SLA_METRIC}=$l_m cache_hit=${l_hit}%"
     else
       lock_type="decode_sla_not_found"
       l_np=$NUM_PROMPTS; l_rps=$inf_rps; l_m=$inf_m; l_hit=$inf_hit; l_dur=$inf_dur
-      l_tgt=$("$PYTHON_BIN" -c "print(float('${dec_stop_ms}')/1000)" 2>/dev/null || echo -)
-      warn "[decode] 无档满足 SLA<=${dec_stop_ms:-any}ms (最大 rps=$inf_rps)"
+      warn "[decode] 无档满足 SLA (最大 rps=$inf_rps, TTFT=$inf_m ms)"
     fi
-    l_lad="$l_np"; (( conc_ladder )) && l_lad=$(( l_np / eff_mult ))
-    MC_ROW=""; (( conc_ladder )) && MC_ROW="$l_lad"
-    # decode 锁定档的 jsonl 路径
+    # 锁定档的 jsonl 路径
+    MC_ROW=""; (( decode_mode )) && MC_ROW="$l_np"
     lf_json="$json"
-    if [[ -n "$last_ok_np" && "$last_ok_np" != "$NUM_PROMPTS" && "$eff_mult" -gt 1 ]]; then
-      lad=$(( last_ok_np / eff_mult ))
-      [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl" && MC_ROW="$lad"
+    lad=$(( l_np / eff_mult ))
+    [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl"
+
+    if [[ "$lock_type" == "decode_sla_not_found" ]]; then
+      # 无档满足: 所有 SLA 阈值写 not_found
+      IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
+      for tgt_s in "${TARGETS[@]}"; do
+        [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+      done
+      continue
     fi
-    # decode 模式也对每个 SLA 阈值输出一行: 并发锁定后 TTFT 不随 rate 变,
-    # 更松的阈值必然满足, 全部用锁定档指标 + inf_lock 或 descend_lock
+
+    # decode 回测: 以锁定档 inf_rps 为起点, 0.1 步长降率 (和 prefill 同逻辑)
     IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
     for tgt_s in "${TARGETS[@]}"; do
       [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
       tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
-      if [[ "$lock_type" == "decode_sla_not_found" ]]; then
-        # 无档满足: 直接写 not_found
-        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
-      elif meet "$l_m" "$tgt_ms"; then
-        # 锁定档 TTFT <= 当前阈值: inf 已满足
+      if meet "$l_m" "$tgt_ms"; then
         printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "inf_lock" >> "$BACK_TSV"
-      else
-        # 锁定档 TTFT > 当前阈值: 无档满足
-        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+        log "[decode backtest] <${tgt_s}s: rate=inf rps=$l_rps (inf 已满足, 锁定)"
+        continue
       fi
+      # 降率: 以锁定档 inf_rps 为起点, 固定步长 0.1
+      searches=0; lo=""; lo_m=""; lo_rps=""; lo_hit="-"; lo_dur="-"; cur=$l_rps; prev=""
+      while (( searches < MAX_TRIALS )); do
+        [[ "$cur" == "$prev" ]] && break
+        prev=$cur
+        cur=$(fstep "$cur" "$RATE_STEP")
+        djson="${LOG_DIR}/${tag}_t${tgt_s}_c${l_np}_r${cur}.jsonl"
+        dclog="${LOG_DIR}/${tag}_t${tgt_s}_c${l_np}_r${cur}.log"
+        log "[decode descend] <${tgt_s}s rate=$cur (prev ${prev}, max_conc=$l_np)"
+        searches=$(( searches + 1 ))
+        if (( DRY_RUN )); then dm="0 0 0 0 0"; else
+          run_trial "$cur" "$djson" "$dclog" || warn "trial rc=$? 继续"
+          dm=$(pick_metrics "$djson")
+        fi
+        read -r drps dmm ddur ddone dhitp <<< "$dm"
+        record "$cur" "$drps" "$dmm" "$ddur" "$ddone" "$dhitp"
+        if meet "$dmm" "$tgt_ms"; then lo=$cur; lo_m=$dmm; lo_rps=$drps; lo_hit=$dhitp; lo_dur=$ddur; break; fi
+      done
+      if [[ -z "$lo" ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$(row_core "$cur" "$l_np" "$djson" - - - -)" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+        warn "[decode backtest] <${tgt_s}s 未找到满足点 (rate 到 $cur 仍不满足)"
+        continue
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$(row_core "$lo" "$l_np" "$djson" "$lo_rps" "$lo_m" "$lo_dur" "$lo_hit")" "$SLA_METRIC" "$tgt_s" "descend_lock" >> "$BACK_TSV"
+      log "[decode backtest] <${tgt_s}s: rate=$lo 锁定 (${SLA_METRIC}=$lo_m, cache_hit=${lo_hit}%)"
     done
-    log "[decode] SLA 锁定: np=$l_np max_conc=${MC_ROW:-$l_np} rps=$l_rps ${SLA_METRIC}=$l_m cache_hit=${l_hit}%"
     continue
   fi
 
