@@ -421,11 +421,14 @@ for raw_case in "${CASES[@]}"; do
     peak_stop "$pid"
     return "$rc"
   }
-  record() { # rate rps metric dur completed hit
-    local _line
+  record() { # rate rps metric dur completed hit [to_all=1]
+    local _line _all="${7:-1}"
     _line=$(row_core "$1" "$NUM_PROMPTS" "$json" "$2" "$3" "$4" "$6")
     printf '%s\n' "$_line" >> "$SCAN_TSV"
-    printf '%s\t%s\t%s\t\t\t\t\n' "$CUR_MODE" "$CUR_STAGE" "$_line" >> "$ALL_TSV"
+    # to_all=0 时不写全量汇总 (calib 行只是复用 inf 扫描结果, 避免出现
+    # "请求率=实测rps 但性能与 inf 相同" 的误导记录)
+    [[ "$_all" == "1" ]] && printf '%s\t%s\t%s\t\t\t\t\n' "$CUR_MODE" "$CUR_STAGE" "$_line" >> "$ALL_TSV"
+    return 0
   }
   back_row() { # rate np json rps metric dur hit tgt lock
     local _line
@@ -527,8 +530,9 @@ for raw_case in "${CASES[@]}"; do
   # decode-conc 保持 inf (并发阶梯不做请求率回测)
   INF_JSON="$json"   # 固定 inf 标定的 json, 后续回测循环不得覆盖
   CUR_STAGE="calib"
-  if (( conc_ladder )); then record inf "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"
-  else                       record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"; fi
+  # 第 7 参 0 = 不写 all_metrics (该行与 scan 的 best 档完全重复, 只进单点表 bs_scan.tsv)
+  if (( conc_ladder )); then record inf "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit" 0
+  else                       record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit" 0; fi
   log "[calib] best_np=$NUM_PROMPTS rps=$inf_rps ${SLA_METRIC}=$inf_m cache_hit=${inf_hit}%"
 
   # ---- decode-conc: 并发阶梯扫描锁定 (不做 SLA 降率回测) ----
