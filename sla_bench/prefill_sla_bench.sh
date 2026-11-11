@@ -423,7 +423,10 @@ for raw_case in "${CASES[@]}"; do
     fi
     read -r inf_rps inf_m inf_dur inf_done inf_hit <<< "$(pick_metrics "$json")"
   fi
-  record inf "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"
+  # bs_scan rate 列: prefill 模式显式写 inf_rps (= 回测基准请求率),
+  # decode 模式保持 inf (decode 不做请求率回测)
+  if (( decode_mode )); then record inf "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"
+  else                           record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"; fi
   log "[calib] best_np=$NUM_PROMPTS rps=$inf_rps ${SLA_METRIC}=$inf_m cache_hit=${inf_hit}%"
 
   # ---- decode 模式: SLA 边界锁定, 不做请求率回测 ----
