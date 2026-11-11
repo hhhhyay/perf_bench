@@ -419,7 +419,7 @@ for raw_case in "${CASES[@]}"; do
   for np in "${NP_SEQ[@]}"; do
     if (( conc_ladder )); then
       np_eff=$(fmul "$np" "$eff_mult"); MC_ROW="$np"
-      (( np > MAX_CONC )) && warn "[np-scan] 档=$np 超过 --max-concurrency=$MAX_CONC 上限 (仍按 $np 出压)"
+      [[ "$MAX_CONC" != "inf" ]] && (( np > MAX_CONC )) && warn "[np-scan] 档=$np 超过 --max-concurrency=$MAX_CONC 上限 (仍按 $np 出压)"
       mc_args=(--max-concurrency "$np")   # v6.2: 每档以其并发数下压
     else
       np_eff="$np"; MC_ROW=""
