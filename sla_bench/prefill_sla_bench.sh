@@ -489,8 +489,9 @@ for raw_case in "${CASES[@]}"; do
   else                           record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"; fi
   log "[calib] best_np=$NUM_PROMPTS rps=$inf_rps ${SLA_METRIC}=$inf_m cache_hit=${inf_hit}%"
 
-  # ---- decode 模式: SLA 并发锁定 + 逐档 0.1 步长降率回测 ----
-  # 自动启用并发阶梯: np_list 每个元素 = 并发 C, 请求数 = C × eff_mult (默认 3)
+  # ---- decode 模式: 并发阶梯扫描锁定 (不做 SLA 降率回测) ----
+  # 并发阶梯: np_list 元素 C = --max-concurrency, num_prompts = C × eff_mult (默认 3)
+  # 扫描只看 rps 增益停止, 早停显式 --sla-stop-ms 才启用 (默认 0)
   if (( decode_mode )); then
     eff_mult="${NP_MULT:-3}"
     if [[ -n "$last_ok_np" ]]; then
@@ -502,57 +503,22 @@ for raw_case in "${CASES[@]}"; do
       l_np=$NUM_PROMPTS; l_rps=$inf_rps; l_m=$inf_m; l_hit=$inf_hit; l_dur=$inf_dur
       warn "[decode] 无档满足 SLA (最大 rps=$inf_rps, TTFT=$inf_m ms)"
     fi
-    # 锁定档的 jsonl 路径
     MC_ROW=""; (( decode_mode )) && MC_ROW="$l_np"
     lf_json="$json"
     lad=$(( l_np / eff_mult ))
     [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl"
-
-    if [[ "$lock_type" == "decode_sla_not_found" ]]; then
-      # 无档满足: 所有 SLA 阈值写 not_found
-      IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
-      for tgt_s in "${TARGETS[@]}"; do
-        [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
-        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
-      done
-      continue
-    fi
-
-    # decode 回测: 以锁定档 inf_rps 为起点, 0.1 步长降率 (和 prefill 同逻辑)
+    # decode 不做降率回测: 锁定档直接按 SLA_TARGETS 每档输出一行 (并发固定, 指标不变)
     IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
     for tgt_s in "${TARGETS[@]}"; do
       [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
       tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
-      if meet "$l_m" "$tgt_ms"; then
+      if [[ "$lock_type" == "decode_sla_not_found" ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+      elif meet "$l_m" "$tgt_ms"; then
         printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "inf_lock" >> "$BACK_TSV"
-        log "[decode backtest] <${tgt_s}s: rate=inf rps=$l_rps (inf 已满足, 锁定)"
-        continue
+      else
+        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
       fi
-      # 降率: 以锁定档 inf_rps 为起点, 固定步长 0.1
-      searches=0; lo=""; lo_m=""; lo_rps=""; lo_hit="-"; lo_dur="-"; cur=$l_rps; prev=""
-      while (( searches < MAX_TRIALS )); do
-        [[ "$cur" == "$prev" ]] && break
-        prev=$cur
-        cur=$(fstep "$cur" "$RATE_STEP")
-        djson="${LOG_DIR}/${tag}_t${tgt_s}_c${l_np}_r${cur}.jsonl"
-        dclog="${LOG_DIR}/${tag}_t${tgt_s}_c${l_np}_r${cur}.log"
-        log "[decode descend] <${tgt_s}s rate=$cur (prev ${prev}, max_conc=$l_np)"
-        searches=$(( searches + 1 ))
-        if (( DRY_RUN )); then dm="0 0 0 0 0"; else
-          run_trial "$cur" "$djson" "$dclog" || warn "trial rc=$? 继续"
-          dm=$(pick_metrics "$djson")
-        fi
-        read -r drps dmm ddur ddone dhitp <<< "$dm"
-        record "$cur" "$drps" "$dmm" "$ddur" "$ddone" "$dhitp"
-        if meet "$dmm" "$tgt_ms"; then lo=$cur; lo_m=$dmm; lo_rps=$drps; lo_hit=$dhitp; lo_dur=$ddur; break; fi
-      done
-      if [[ -z "$lo" ]]; then
-        printf '%s\t%s\t%s\t%s\n' "$(row_core "$cur" "$l_np" "$djson" - - - -)" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
-        warn "[decode backtest] <${tgt_s}s 未找到满足点 (rate 到 $cur 仍不满足)"
-        continue
-      fi
-      printf '%s\t%s\t%s\t%s\n' "$(row_core "$lo" "$l_np" "$djson" "$lo_rps" "$lo_m" "$lo_dur" "$lo_hit")" "$SLA_METRIC" "$tgt_s" "descend_lock" >> "$BACK_TSV"
-      log "[decode backtest] <${tgt_s}s: rate=$lo 锁定 (${SLA_METRIC}=$lo_m, cache_hit=${lo_hit}%)"
     done
     continue
   fi
