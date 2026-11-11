@@ -488,12 +488,30 @@ for raw_case in "${CASES[@]}"; do
     fi
     l_lad="$l_np"; (( conc_ladder )) && l_lad=$(( l_np / eff_mult ))
     MC_ROW=""; (( conc_ladder )) && MC_ROW="$l_lad"
+    # decode 锁定档的 jsonl 路径
     lf_json="$json"
     if [[ -n "$last_ok_np" && "$last_ok_np" != "$NUM_PROMPTS" && "$eff_mult" -gt 1 ]]; then
       lad=$(( last_ok_np / eff_mult ))
       [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl" && MC_ROW="$lad"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$l_tgt" "$lock_type" >> "$BACK_TSV"
+    # decode 模式也对每个 SLA 阈值输出一行: 并发锁定后 TTFT 不随 rate 变,
+    # 更松的阈值必然满足, 全部用锁定档指标 + inf_lock 或 descend_lock
+    IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
+    for tgt_s in "${TARGETS[@]}"; do
+      [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
+      tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
+      if [[ "$lock_type" == "decode_sla_not_found" ]]; then
+        # 无档满足: 直接写 not_found
+        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+      elif meet "$l_m" "$tgt_ms"; then
+        # 锁定档 TTFT <= 当前阈值: inf 已满足
+        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "inf_lock" >> "$BACK_TSV"
+      else
+        # 锁定档 TTFT > 当前阈值: 无档满足
+        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+      fi
+    done
+    log "[decode] SLA 锁定: np=$l_np max_conc=${MC_ROW:-$l_np} rps=$l_rps ${SLA_METRIC}=$l_m cache_hit=${l_hit}%"
     continue
   fi
 
