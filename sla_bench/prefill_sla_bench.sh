@@ -167,23 +167,58 @@ import json, sys
 def dig(d, key):
     if isinstance(d, dict):
         v = d.get(key)
-        if isinstance(v, int) and not isinstance(v, bool):
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
             return v
         for x in d.values():
             r = dig(x, key)
             if r is not None:
                 return r
     return None
+def gint(d, key):
+    v = dig(d, key)
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+def gfloat(d, key):
+    v = dig(d, key)
+    return v if isinstance(v, float) else None
+def gstr(d, key):
+    v = dig(d, key)
+    return v if isinstance(v, str) else None
 try:
     d = json.loads(sys.argv[1])
 except Exception:
     raise SystemExit
 parts = []
-for p in ("tp", "pp", "dp", "ep"):
-    v = dig(d, p + "_size")
-    if isinstance(v, int) and v > 1:
-        parts.append(f"{p}{v}")
-print("".join(parts))
+# TP
+tp = gint(d, "tp_size") or 1
+parts.append(f"TP{tp}")
+# DP (+ DPA 标记)
+dp = gint(d, "dp_size") or 1
+dp_attn = dig(d, "enable_dp_attention") is True
+parts.append(f"DP{dp}" + ("(DPA)" if dp_attn else ""))
+# PP (1 省略)
+pp = gint(d, "pp_size") or 1
+if pp > 1:
+    parts.append(f"PP{pp}")
+# EP (1 省略)
+ep = gint(d, "ep_size") or 1
+if ep > 1:
+    parts.append(f"EP{ep}")
+# ACP (attention cp, 1 省略)
+acp = gint(d, "attn_cp_size") or 1
+if acp > 1:
+    parts.append(f"ACP{acp}")
+# KV cache dtype
+kv = gstr(d, "kv_cache_dtype") or "auto"
+qnt = gstr(d, "quantization")
+if qnt:
+    parts.append(f"KV{qnt}")
+elif kv and kv != "auto":
+    parts.append(f"KV{kv}")
+# MEM fraction
+mem = gfloat(d, "mem_fraction_static")
+if mem is not None:
+    parts.append(f"MEM{mem:.1f}")
+print("-".join(parts))
 PYPCFG
 )
   fi
