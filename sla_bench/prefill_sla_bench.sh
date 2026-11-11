@@ -1,58 +1,60 @@
 #!/usr/bin/env bash
 # ============================================================
-# prefill_sla_bench.sh v6.2 — 可变命中率 prefix 数据集 + np 饱和扫描 + 0.1 回测 (+decode 模式)
+# prefill_sla_bench.sh v6.8 — 可变命中率 prefix 数据集 + 三流程性能测试
 # 每条 trial 统一落 27 列标准指标 (Group/InOut/parallel_config/命中率/np/并发/
-# server 峰值/rate/duration/rps/吞吐×3/TTFT·TPOT·ITL mean|p95|p99/E2E),
-# sla_backtest.tsv 追加 sla_metric/target_s/lock_type 3 列锁点元数据。
-# v6.2: decode 限并发阶梯每档以 --max-concurrency C 逐档下压 (修复全局固定值);
+# server 峰值/rate/duration/rps/吞吐×3/TTFT·TPOT·ITL mean|p95|p99/E2E)。
+# v6.8: 三流程清晰分流 + 单文件汇总 all_metrics.tsv (prefill 组在最前, 每组每档都记)
 # ============================================================
 # 数据集: sla_bench/prefix_hit.py (PREFIX_HIT 参数化, input/output len 任意)
-# 模式分流 (按 OUTPUT 自动判定):
-#   OUTPUT=1  → prefill 模式: np 饱和扫描 + 0.1 降率 SLA 回测 (下述规则)
-#   OUTPUT>1  → decode 模式: --max-concurrency 限并发 (默认 inf=不传该参),
-#               只跑 np 扫描/标定, 不做请求率回测
-#   decode 限并发时: --np-list 每个元素 = 该档并发数 C, 以 --max-concurrency C
-#   逐档下压 (阶梯开关=--max-concurrency 传有限值; 全局值兼作档位上限告警),
-#   实际请求数 = C × --np-mult (默认 3), 请求池持续补位形成稳态并发,
-#   避免池子=并发跑完即止。
-#   decode SLA 边界: 升压扫描中某档 SLA 指标 (默认 mean TTFT, --sla-stop-ms
-#     阈值, 缺省取 --sla-targets 首档) 超标即停止升压, 锁定最后一个满足档
-#     → decode_sla_lock (无档满足 → decode_sla_not_found)。
-# 客户端 prefill 模式默认不加 --max-concurrency, 只用 --request-rate 限流。
-# 回测规则 (参考 gsp_prefix_bench 口径):
+#
+# 三流程 (脚本按 OUTPUT 与 --max-concurrency 自动判定):
+#  ① prefill 单测 (OUTPUT=1) — 绝不给客户端传 --max-concurrency
+#     rate=inf 扫描求最高吞吐 → 以 inf_rps 为基准按 --rate-step(0.1) 降率回测,
+#     求出满足 SLA (默认 mean TTFT 2|3|4 s) 的最大 rps。
+#  ② decode 限并发 (OUTPUT>1 且 --max-concurrency 传有限值)
+#     max_concurrency = bs, num_prompts = bs × --np-mult(默认 3),
+#     按 --np-list 逐档测试 (每档以其并发数下压), 默认不做 SLA 约束;
+#     早停接口保留: --sla-stop-ms > 0 时某档 SLA 超标即停止升压。
+#  ③ decode PD 模式 (OUTPUT>1 且 --max-concurrency 未传/inf)
+#     与 ① 完全同逻辑: 只用 --request-rate 限流, 按请求率回测。
+#
+# 回测规则:
 #   阶段0 np 饱和扫描: rate=inf 下请求池从 --np-start 起按 --np-step 倍增,
-#     实测 rps 增益 >= --sat-gain% 才继续上打, 增益不足(只高一点点)即止,
+#     实测 rps 增益 >= --sat-gain% 才继续上打, 不足即止;
 #     best_np = 扫描中 rps 最大档; 给 --np-list 则跑固定列表(无自动止)。
-#   阶段1 SLA 回测: 用 best_np 的 inf 标定为基准, 对每档 SLA (默认
-#     mean TTFT 3|4|5|6 s): inf 满足 → inf_lock; 不满足则以 --rate-step
-#     (默认 0.1) 固定步长降率, 首个满足点 → descend_lock。
-#     全程 num_prompts=best_np (与最高吞吐同一请求池, 口径一致)。
+#   阶段1 SLA 回测: 用 best_np 的 inf 标定 (inf_rps) 为基准, 对每档 SLA:
+#     inf 满足 → inf_lock; 不满足则以 --rate-step (默认 0.1) 固定步长降率,
+#     首个满足点 → descend_lock; 到 0.1 仍不满足 → not_found。
+#
 # 用法 (perf_bench 仓库根目录, 客户端容器内):
 #   BASE_URL=http://192.168.0.65:30000 MODEL=/mnt/gbj/models/xxx \
 #   bash sla_bench/prefill_sla_bench.sh \
-#        --case '64k,1,80' --case '128k,1,80' --case '256k,1,90' \
-#        [--np-start 64 --np-step 2 --sat-gain 3]
+#        --case '16k,1,80' --case '16k,512,80' \
+#        --np-list '4,8,16,32' --max-concurrency 32 --sla-targets '2|3|4'
 # case 语法: INPUT,OUTPUT,HIT   INPUT 任意(k/K 后缀), OUTPUT 任意, HIT 0-100(0=冷)
 # 参数: --np-start N      inf 饱和扫描起始请求数 (默认 64)
 #       --np-step F       扫描倍增因子 (默认 2, 即 64→128→256...)
 #       --sat-gain P      继续上打的 rps 增益门槛% (默认 3, 不足即停)
 #       --np-max N        扫描请求数上限 (默认 1024)
 #       --np-list L,N,... 固定扫描列表, 给定则忽略 start/step 自动止
-#                          (decode 限并发时列表元素=并发数)
-#       --np-mult M       decode 限并发时 请求数=并发×M (默认 3; prefill 固定 1)
+#                          (decode 限并发时列表元素=并发数 bs)
+#       --np-mult M       decode 限并发时 请求数=并发×M (默认 3; prefill/PD 固定 1)
 #       --num-prompts N   固定单点 (等价 --np-list N, 跳过扫描)
 #       --sla-metric M     SLA 指标, ttft/tpot/itl × mean/p95/p99 共 9 种
 #                          (默认 mean_ttft_ms)
-#       --sla-targets S|.. 秒阈值列表 (默认 3|4|5|6)
-#       --sla-stop-ms N    decode 升压扫描 SLA 停止阈值 ms (默认=首档×1000)
-#       --rate-step F      固定降率步长 (默认 0.1, 仅 prefill 模式)
-#       --max-concurrency N|inf  最大并发 (默认 inf=不加该参数, prefill
-#                          同样生效; decode 模式传有限值=启用并发阶梯)
-#       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅 prefill)
+#       --sla-targets S|.. 秒阈值列表 (默认 2|3|4)
+#       --sla-stop-ms N    decode 限并发升压早停阈值 ms (默认 0=不做 SLA 约束)
+#       --rate-step F      固定降率步长 (默认 0.1, 仅 prefill/PD 回测)
+#       --max-concurrency N|inf  最大并发 (默认 inf)。传有限值且 OUTPUT>1 即启用
+#                          decode 限并发阶梯 (max_concurrency=bs, 请求数=bs×倍数);
+#                          prefill (OUTPUT=1) 会忽略该参数
+#       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅回测)
 #       --run-id ID --dry-run
 # 环境变量: BASE_URL MODEL PYTHON_BIN SEED
-# 输出: ./all_result/sla_${RUN_ID}/{np_scan.tsv, bs_scan.tsv,
-#       sla_backtest.tsv, logs/}
+# 输出: ./all_result/sla_${RUN_ID}/
+#       all_metrics.tsv   ← 单次任务全量汇总 (Mode/Stage + 27 列 + gain + SLA 3 列)
+#       np_scan.tsv / bs_scan.tsv / sla_backtest.tsv   ← 分表视图
+#       logs/
 # ============================================================
 
 set -uo pipefail
@@ -69,8 +71,8 @@ DRY_RUN=0
 export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${SGLANG_PYTHONPATH:-/sgl-workspace/sglang/python}"
 
 SLA_METRIC="mean_ttft_ms"
-SLA_TARGETS="3|4|5|6"
-SLA_STOP_MS=""          # decode 升压 SLA 停止阈值 ms; 空=首档×1000
+SLA_TARGETS="2|3|4"     # 默认 SLA 档位: mean TTFT 2|3|4 s
+SLA_STOP_MS=""          # decode 阶梯早停阈值 ms; 空/0=不早停 (默认不做 SLA 约束)
 NUM_PROMPTS="${NUM_PROMPTS:-64}"
 NP_START="${NP_START:-64}"
 NP_STEP="2"
@@ -340,11 +342,24 @@ row_core() { # rate np json rps mm dur hit → 打印一行 27 列 (tab)
 NP_TSV="${OUT_DIR}/np_scan.tsv"
 SCAN_TSV="${OUT_DIR}/bs_scan.tsv"
 BACK_TSV="${OUT_DIR}/sla_backtest.tsv"
+ALL_TSV="${OUT_DIR}/all_metrics.tsv"   # 单次任务全量汇总: prefill 组在前, 每组每档都记录
 COLS="Group,Input tokens,Generated tokens,parallel_config,Target cache hit(%),Actual cache hit(%),num_prompts,max_concurrency,concurrency,peak_output_throughput,peak_concurrency,request_rate,duration_s,rps,input_throughput_tok_s,generate_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms"
 COLS_TSV="${COLS//,/$'\t'}"
 printf '%s\t%s\n' "$COLS_TSV" "gain_vs_prev_pct" > "$NP_TSV"
 printf '%s\n' "$COLS_TSV" > "$SCAN_TSV"
 printf '%s\t%s\t%s\t%s\n' "$COLS_TSV" "sla_metric" "target_s" "lock_type" > "$BACK_TSV"
+printf 'Mode\tStage\t%s\tgain_vs_prev_pct\tsla_metric\ttarget_s\tlock_type\n' "$COLS_TSV" > "$ALL_TSV"
+
+# ---- case 排序: prefill (OUTPUT=1) 全部排在最前, decode 在后 ----
+if (( ${#CASES[@]} > 1 )); then
+  declare -a _PF=() _DC=()
+  for _c in "${CASES[@]}"; do
+    IFS=',' read -r _i _o _h <<< "$_c"
+    if [[ "$_o" == "1" ]]; then _PF+=("$_c"); else _DC+=("$_c"); fi
+  done
+  CASES=("${_PF[@]+"${_PF[@]}"}" "${_DC[@]+"${_DC[@]}"}")
+  unset _PF _DC _c _i _o _h
+fi
 
 for raw_case in "${CASES[@]}"; do
   IFS=',' read -r in_s out_s hit_s <<< "$raw_case"
@@ -356,9 +371,27 @@ for raw_case in "${CASES[@]}"; do
 
   tag="${in_s}o${out_s}h${hit_s}"
   decode_mode=0; (( OUT_LEN > 1 )) && decode_mode=1
-  (( decode_mode )) \
-    && log "== case=$tag L=$IN_LEN O=$OUT_LEN hit=${hit_s}% (cached=$CACHED_LEN) DECODE max_concurrency=$MAX_CONC" \
-    || log "== case=$tag L=$IN_LEN O=$OUT_LEN hit=${hit_s}% (cached=$CACHED_LEN) PREFILL rate-only"
+
+  # ---- 模式分流 (三流程) ----
+  #  1) prefill 单测 (OUTPUT=1):            rate=inf 扫描 + -0.1 步长回测, 绝不传 --max-concurrency
+  #  2) decode + --max-concurrency 有限值:  max_concurrency=bs, num_prompts=bs×倍数, 按 np_list 扫描, 不回测
+  #  3) decode 不传 --max-concurrency (PD): 直接按请求数, 走 prefill 同样的请求率回测
+  conc_ladder=0
+  if (( decode_mode == 0 )); then
+    CUR_MODE="prefill"
+    # prefill 强制不带 --max-concurrency (即使 CLI 传了也忽略)
+    if [[ "$MAX_CONC" != "inf" ]]; then
+      warn "[prefill] 忽略 --max-concurrency=$MAX_CONC (prefill 只用 --request-rate 限流)"
+    fi
+    mc_args=(); MC_COL=""
+  elif [[ "$MAX_CONC" != "inf" ]]; then
+    CUR_MODE="decode-conc"
+    conc_ladder=1; MC_COL="$MAX_CONC"
+  else
+    CUR_MODE="decode-pd"
+    mc_args=(); MC_COL=""
+  fi
+  log "== case=$tag L=$IN_LEN O=$OUT_LEN hit=${hit_s}% (cached=$CACHED_LEN) mode=$CUR_MODE max_concurrency=${MAX_CONC}"
 
   run_trial() { # rate json clog
     local rate=$1 json=$2 clog=$3 rc pid
@@ -389,18 +422,24 @@ for raw_case in "${CASES[@]}"; do
     return "$rc"
   }
   record() { # rate rps metric dur completed hit
-    printf '%s\n' "$(row_core "$1" "$NUM_PROMPTS" "$json" "$2" "$3" "$4" "$6")" >> "$SCAN_TSV"
+    local _line
+    _line=$(row_core "$1" "$NUM_PROMPTS" "$json" "$2" "$3" "$4" "$6")
+    printf '%s\n' "$_line" >> "$SCAN_TSV"
+    printf '%s\t%s\t%s\t\t\t\t\n' "$CUR_MODE" "$CUR_STAGE" "$_line" >> "$ALL_TSV"
+  }
+  back_row() { # rate np json rps metric dur hit tgt lock
+    local _line
+    _line=$(row_core "$1" "$2" "$3" "$4" "$5" "$6" "$7")
+    printf '%s\t%s\t%s\t%s\n' "$_line" "$SLA_METRIC" "$8" "$9" >> "$BACK_TSV"
+    printf '%s\t%s\t%s\t\t%s\t%s\t%s\n' "$CUR_MODE" "backtest" "$_line" "$SLA_METRIC" "$8" "$9" >> "$ALL_TSV"
   }
 
   # ---- 阶段0: np 饱和扫描 (rate=inf, 决定请求池 best_np) ----
-  # decode 限并发时 (--max-concurrency 传有限值): 并发阶梯自动启用,
-  #   np_list 每个元素 = 并发 C, 请求数 = C × eff_mult (默认 3)
-  conc_ladder=0; eff_mult=1
-  if (( decode_mode )) && [[ "$MAX_CONC" != "inf" ]]; then
-    conc_ladder=1; eff_mult="${NP_MULT:-3}"
-  fi
-  # decode SLA 早停阈值 (ms): 默认 0 = 不早停 (只看增益停止)
-  # 显式 --sla-stop-ms 才启用; 未显式时不再自动取 sla-targets 首档
+  # conc_ladder 已在 case 入口按模式判定:
+  #   decode-conc: 每档 C=bs, num_prompts=C×eff_mult
+  #   prefill / decode-pd: num_prompts=np, 不传 --max-concurrency
+  eff_mult=1; (( conc_ladder )) && eff_mult="${NP_MULT:-3}"
+  # decode 阶梯 SLA 早停阈值 (ms): 默认 0 = 不早停 (本次默认不做 SLA 约束)
   dec_stop_ms=${SLA_STOP_MS:-0}
   last_ok_np=""; last_ok_rps=""; last_ok_m=""; last_ok_dur=""; last_ok_done=""; last_ok_hit=""
   if [[ -n "$NP_LIST" ]]; then
@@ -411,17 +450,16 @@ for raw_case in "${CASES[@]}"; do
     while (( cur_np <= NP_MAX )); do NP_SEQ+=("$cur_np"); cur_np=$(fmul "$cur_np" "$NP_STEP"); done
     auto_mode=1
   fi
-  log "[np-scan] 档位: ${NP_SEQ[*]} (auto=$auto_mode sat_gain=${SAT_GAIN}% conc_ladder=$conc_ladder mult=$eff_mult)"
+  log "[np-scan] 档位: ${NP_SEQ[*]} (auto=$auto_mode sat_gain=${SAT_GAIN}% conc_ladder=$conc_ladder mult=$eff_mult mode=$CUR_MODE)"
   best_np=""; best_rps="-1"; best_m=""; best_dur=""; best_done=""; best_hit=""; prev_rps=""
   np_i=0
   for np in "${NP_SEQ[@]}"; do
     if (( conc_ladder )); then
       np_eff=$(fmul "$np" "$eff_mult"); MC_ROW="$np"
       [[ "$MAX_CONC" != "inf" ]] && (( np > MAX_CONC )) && warn "[np-scan] 档=$np 超过 --max-concurrency=$MAX_CONC 上限 (仍按 $np 出压)"
-      mc_args=(--max-concurrency "$np")   # v6.2: 每档以其并发数下压
+      mc_args=(--max-concurrency "$np")   # 每档以其并发数 C 下压
     else
-      np_eff="$np"; MC_ROW=""
-      mc_args=(); [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC")
+      np_eff="$np"; MC_ROW=""; mc_args=()   # prefill / decode-pd: 绝不传 --max-concurrency
     fi
     NUM_PROMPTS="$np_eff"
     json="${LOG_DIR}/${tag}_inf_c${np}.jsonl"; clog="${LOG_DIR}/${tag}_inf_c${np}.log"
@@ -435,7 +473,9 @@ for raw_case in "${CASES[@]}"; do
     gain="-"
     [[ -n "$prev_rps" && "$prev_rps" != "0" ]] \
       && gain=$("$PYTHON_BIN" -c "print(round((float('$rps')-float('$prev_rps'))/float('$prev_rps')*100,2))")
-    printf '%s\t%s\n' "$(row_core inf "$np_eff" "$json" "$rps" "$mm" "$dur" "$hitp")" "$gain" >> "$NP_TSV"
+    _npline=$(row_core inf "$np_eff" "$json" "$rps" "$mm" "$dur" "$hitp")
+    printf '%s\t%s\n' "$_npline" "$gain" >> "$NP_TSV"
+    printf '%s\t%s\t%s\t%s\t\t\t\n' "$CUR_MODE" "scan" "$_npline" "$gain" >> "$ALL_TSV"
     log "[np-scan] 档=$np np=$np_eff rps=$rps ${SLA_METRIC}=$mm gain=${gain}%"
     if (( DRY_RUN == 0 )) && "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$rps') > float('$best_rps') else 1)"; then
       best_np=$np_eff; best_rps=$rps; best_m=$mm; best_dur=$dur; best_done=$done_; best_hit=$hitp
@@ -483,16 +523,18 @@ for raw_case in "${CASES[@]}"; do
     fi
     read -r inf_rps inf_m inf_dur inf_done inf_hit <<< "$(pick_metrics "$json")"
   fi
-  # bs_scan rate 列: prefill 模式显式写 inf_rps (= 回测基准请求率),
-  # decode 模式保持 inf (decode 不做请求率回测)
-  if (( decode_mode )); then record inf "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"
-  else                           record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"; fi
+  # bs_scan rate 列: prefill / decode-pd 显式写 inf_rps (= 回测基准请求率),
+  # decode-conc 保持 inf (并发阶梯不做请求率回测)
+  INF_JSON="$json"   # 固定 inf 标定的 json, 后续回测循环不得覆盖
+  CUR_STAGE="calib"
+  if (( conc_ladder )); then record inf "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"
+  else                       record "$inf_rps" "$inf_rps" "$inf_m" "$inf_dur" "$inf_done" "$inf_hit"; fi
   log "[calib] best_np=$NUM_PROMPTS rps=$inf_rps ${SLA_METRIC}=$inf_m cache_hit=${inf_hit}%"
 
-  # ---- decode 模式: 并发阶梯扫描锁定 (不做 SLA 降率回测) ----
-  # 并发阶梯: np_list 元素 C = --max-concurrency, num_prompts = C × eff_mult (默认 3)
-  # 扫描只看 rps 增益停止, 早停显式 --sla-stop-ms 才启用 (默认 0)
-  if (( decode_mode )); then
+  # ---- decode-conc: 并发阶梯扫描锁定 (不做 SLA 降率回测) ----
+  # np_list 元素 C = --max-concurrency, num_prompts = C × eff_mult (默认 3)
+  # 锁定档直接按 SLA_TARGETS 每档写一行, 早停由 --sla-stop-ms 控制 (默认 0 不早停)
+  if (( decode_mode && conc_ladder )); then
     eff_mult="${NP_MULT:-3}"
     if [[ -n "$last_ok_np" ]]; then
       lock_type="decode_sla_lock"
@@ -503,33 +545,32 @@ for raw_case in "${CASES[@]}"; do
       l_np=$NUM_PROMPTS; l_rps=$inf_rps; l_m=$inf_m; l_hit=$inf_hit; l_dur=$inf_dur
       warn "[decode] 无档满足 SLA (最大 rps=$inf_rps, TTFT=$inf_m ms)"
     fi
-    MC_ROW=""; (( decode_mode )) && MC_ROW="$l_np"
+    MC_ROW=""; (( conc_ladder )) && MC_ROW=$(( l_np / eff_mult ))   # 并发列=bs, 不是请求数
     lf_json="$json"
     lad=$(( l_np / eff_mult ))
     [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl"
-    # decode 不做降率回测: 锁定档直接按 SLA_TARGETS 每档输出一行 (并发固定, 指标不变)
+    # decode-conc 不做降率回测: 锁定档直接按 SLA_TARGETS 每档输出一行 (并发固定, 指标不变)
     IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
     for tgt_s in "${TARGETS[@]}"; do
       [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
       tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
-      if [[ "$lock_type" == "decode_sla_not_found" ]]; then
-        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
-      elif meet "$l_m" "$tgt_ms"; then
-        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "inf_lock" >> "$BACK_TSV"
+      if [[ "$lock_type" != "decode_sla_not_found" ]] && meet "$l_m" "$tgt_ms"; then
+        back_row inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit" "$tgt_s" "inf_lock"
       else
-        printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit")" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+        back_row inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit" "$tgt_s" "not_found"
       fi
     done
     continue
   fi
 
-  # ---- SLA 逐档回测 ----
+  # ---- SLA 逐档回测 (prefill 单测 / decode-pd) ----
+  # 以 inf_rps 为基准, 按 --rate-step (默认 0.1) 固定步长降率, 找首个满足点
   IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
   for tgt_s in "${TARGETS[@]}"; do
     [[ "$tgt_s" =~ ^[0-9.]+$ ]] || die "非法 SLA 阈值: $tgt_s"
     tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
     if meet "$inf_m" "$tgt_ms"; then
-      printf '%s\t%s\t%s\t%s\n' "$(row_core inf "$NUM_PROMPTS" "$json" "$inf_rps" "$inf_m" "$inf_dur" "$inf_hit")" "$SLA_METRIC" "$tgt_s" "inf_lock" >> "$BACK_TSV"
+      back_row inf "$NUM_PROMPTS" "$INF_JSON" "$inf_rps" "$inf_m" "$inf_dur" "$inf_hit" "$tgt_s" "inf_lock"
       log "[backtest] <${tgt_s}s: rate=inf rps=$inf_rps (inf 已满足, 锁定)"
       continue
     fi
@@ -549,20 +590,22 @@ for raw_case in "${CASES[@]}"; do
         m=$(pick_metrics "$json")
       fi
       read -r rps mm dur done_ hitp <<< "$m"
+      CUR_STAGE="descend"
       record "$cur" "$rps" "$mm" "$dur" "$done_" "$hitp"
       if meet "$mm" "$tgt_ms"; then lo=$cur; lo_m=$mm; lo_rps=$rps; lo_hit=$hitp; lo_dur=$dur; break; fi
     done
 
     if [[ -z "$lo" ]]; then
-      printf '%s\t%s\t%s\t%s\n' "$(row_core "$cur" "$NUM_PROMPTS" "$json" - - - -)" "$SLA_METRIC" "$tgt_s" "not_found" >> "$BACK_TSV"
+      back_row "$cur" "$NUM_PROMPTS" "$json" - - - - "$tgt_s" "not_found"
       warn "[backtest] <${tgt_s}s 未找到满足点 (rate 到 0.1 仍不满足)"
       continue
     fi
 
-    printf '%s\t%s\t%s\t%s\n' "$(row_core "$lo" "$NUM_PROMPTS" "$json" "$lo_rps" "$lo_m" "$lo_dur" "$lo_hit")" "$SLA_METRIC" "$tgt_s" "descend_lock" >> "$BACK_TSV"
+    back_row "$lo" "$NUM_PROMPTS" "$json" "$lo_rps" "$lo_m" "$lo_dur" "$lo_hit" "$tgt_s" "descend_lock"
     log "[backtest] <${tgt_s}s: rate=$lo 锁定 (${SLA_METRIC}=$lo_m, cache_hit=$lo_hit%)"
   done
 done
 
-log "完成。扫描: $SCAN_TSV  回测: $BACK_TSV"
-(( DRY_RUN == 1 )) || column -t -s $'\t' "$BACK_TSV"
+log "完成。汇总: $ALL_TSV"
+log "     扫描: $NP_TSV  单点: $SCAN_TSV  回测: $BACK_TSV"
+(( DRY_RUN == 1 )) || column -t -s $'\t' "$ALL_TSV"
