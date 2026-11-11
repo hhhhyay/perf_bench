@@ -22,9 +22,10 @@
 #   阶段0 np 饱和扫描: rate=inf 下请求池从 --np-start 起按 --np-step 倍增,
 #     实测 rps 增益 >= --sat-gain% 才继续上打, 不足即止;
 #     best_np = 扫描中 rps 最大档; 给 --np-list 则跑固定列表(无自动止)。
-#   阶段1 SLA 回测: 用 best_np 的 inf 标定 (inf_rps) 为基准, 对每档 SLA:
-#     inf 满足 → inf_lock; 不满足则以 --rate-step (默认 0.1) 固定步长降率,
-#     首个满足点 → descend_lock; 到 0.1 仍不满足 → not_found。
+#   阶段1 SLA 回测: 以 best_np 的 inf 实测 rps (最高吞吐) 为起点, 先按该请求率实跑
+#     一档, 再以 --rate-step (默认 0.1) 递减; 每个请求率只跑一次, 同一次结果同时
+#     判定所有 SLA 档 (TTFT 单调下降), 首个满足点 → descend_lock;
+#     inf 档已满足 → inf_lock; 降到 0.1 仍不满足 → not_found。
 #
 # 用法 (perf_bench 仓库根目录, 客户端容器内):
 #   BASE_URL=http://192.168.0.65:30000 MODEL=/mnt/gbj/models/xxx \
@@ -567,46 +568,54 @@ for raw_case in "${CASES[@]}"; do
     continue
   fi
 
-  # ---- SLA 逐档回测 (prefill 单测 / decode-pd) ----
-  # 以 inf_rps 为基准, 按 --rate-step (默认 0.1) 固定步长降率, 找首个满足点
+  # ---- SLA 回测: 单次降率扫描, 一个请求率跑一次同时判定所有 SLA 档 ----
+  # 起点 = inf 扫描的最高 rps (实测值), 先按该请求率实跑一档, 再按 --rate-step 递减;
+  # 降率过程中 TTFT 单调下降, 因此每档 rate 只需跑一次, 同时为所有未锁定档判定,
+  # 天然避免"同一 rate 为不同 SLA 重复跑"的冗余记录。
   IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
+  pending=()
   for tgt_s in "${TARGETS[@]}"; do
     [[ "$tgt_s" =~ ^[0-9.]+$ ]] || die "非法 SLA 阈值: $tgt_s"
     tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
     if meet "$inf_m" "$tgt_ms"; then
       back_row inf "$NUM_PROMPTS" "$INF_JSON" "$inf_rps" "$inf_m" "$inf_dur" "$inf_hit" "$tgt_s" "inf_lock"
       log "[backtest] <${tgt_s}s: rate=inf rps=$inf_rps (inf 已满足, 锁定)"
-      continue
+    else
+      pending+=("$tgt_s")
     fi
+  done
 
-    searches=0
-    lo=""; lo_m=""; lo_rps=""; lo_hit="-"; lo_dur="-"; cur=$inf_rps; prev=""
-    # 固定步长降率找首个满足点 (rate-step 粒度)
-    while (( searches < MAX_TRIALS )); do
-      [[ "$cur" == "$prev" ]] && break  # 已到 0.1 下限
-      prev=$cur
-      cur=$(fstep "$cur" "$RATE_STEP")
-      json="${LOG_DIR}/${tag}_t${tgt_s}_r${cur}.jsonl"; clog="${LOG_DIR}/${tag}_t${tgt_s}_r${cur}.log"
-      log "[descend] <${tgt_s}s rate=$cur (prev ${prev})"
-      searches=$(( searches + 1 ))
-      if (( DRY_RUN )); then m="0 0 0 0 0"; else
-        run_trial "$cur" "$json" "$clog" || warn "trial rc=$? 继续"
-        m=$(pick_metrics "$json")
+  cur="$inf_rps"; searches=0
+  while (( ${#pending[@]} > 0 && searches <= MAX_TRIALS )); do
+    searches=$(( searches + 1 ))
+    json="${LOG_DIR}/${tag}_r${cur}.jsonl"; clog="${LOG_DIR}/${tag}_r${cur}.log"
+    log "[descend] rate=$cur 待判定 SLA: ${pending[*]}"
+    if (( DRY_RUN )); then m="0 0 0 0 0"; else
+      run_trial "$cur" "$json" "$clog" || warn "trial rc=$? 继续"
+      m=$(pick_metrics "$json")
+    fi
+    read -r rps mm dur done_ hitp <<< "$m"
+    CUR_STAGE="descend"
+    record "$cur" "$rps" "$mm" "$dur" "$done_" "$hitp"
+    still=()
+    for tgt_s in "${pending[@]}"; do
+      tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
+      if meet "$mm" "$tgt_ms"; then
+        back_row "$cur" "$NUM_PROMPTS" "$json" "$rps" "$mm" "$dur" "$hitp" "$tgt_s" "descend_lock"
+        log "[backtest] <${tgt_s}s: rate=$cur 锁定 (${SLA_METRIC}=$mm)"
+      else
+        still+=("$tgt_s")
       fi
-      read -r rps mm dur done_ hitp <<< "$m"
-      CUR_STAGE="descend"
-      record "$cur" "$rps" "$mm" "$dur" "$done_" "$hitp"
-      if meet "$mm" "$tgt_ms"; then lo=$cur; lo_m=$mm; lo_rps=$rps; lo_hit=$hitp; lo_dur=$dur; break; fi
     done
+    pending=("${still[@]+"${still[@]}"}")
+    next=$(fstep "$cur" "$RATE_STEP")
+    [[ "$next" == "$cur" ]] && break
+    cur="$next"
+  done
 
-    if [[ -z "$lo" ]]; then
-      back_row "$cur" "$NUM_PROMPTS" "$json" - - - - "$tgt_s" "not_found"
-      warn "[backtest] <${tgt_s}s 未找到满足点 (rate 到 0.1 仍不满足)"
-      continue
-    fi
-
-    back_row "$lo" "$NUM_PROMPTS" "$json" "$lo_rps" "$lo_m" "$lo_dur" "$lo_hit" "$tgt_s" "descend_lock"
-    log "[backtest] <${tgt_s}s: rate=$lo 锁定 (${SLA_METRIC}=$lo_m, cache_hit=$lo_hit%)"
+  for tgt_s in "${pending[@]+"${pending[@]}"}"; do
+    back_row "$cur" "$NUM_PROMPTS" "$json" "$rps" "$mm" "$dur" "$hitp" "$tgt_s" "not_found"
+    warn "[backtest] <${tgt_s}s 未找到满足点 (rate 降到 $cur 仍不满足)"
   done
 done
 
