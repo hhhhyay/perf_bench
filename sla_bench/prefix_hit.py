@@ -36,26 +36,48 @@ def dataset(args, tokenizer, model_id=None):
     starts = rng.sample(tokens, args.num_prompts + 1)
 
     if cached:
-        body = dict(
-            input_ids=prefix + [starts[0]],
-            sampling_params=dict(
-                max_new_tokens=1, temperature=0.6, top_p=0.95, ignore_eos=True
-            ),
-            stream=False,
-        )
+        backend = getattr(args, "backend", "sglang")
+        if backend.startswith("vllm"):
+            # vllm /v1/completions: prompt 为 token ids, max_tokens=1
+            body = dict(
+                model=args.model,
+                prompt=prefix + [starts[0]],
+                max_tokens=1,
+                temperature=0.6,
+                top_p=0.95,
+                ignore_eos=True,
+            )
+            url = args.base_url.rstrip("/") + "/v1/completions"
+        else:
+            # sglang /generate: input_ids + sampling_params
+            body = dict(
+                input_ids=prefix + [starts[0]],
+                sampling_params=dict(
+                    max_new_tokens=1, temperature=0.6, top_p=0.95, ignore_eos=True
+                ),
+                stream=False,
+            )
+            url = args.base_url.rstrip("/") + "/generate"
         request = urllib.request.Request(
-            args.base_url.rstrip("/") + "/generate",
+            url,
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(request, timeout=3600) as response:
             warmup = json.load(response)
-        if not isinstance(warmup, dict) or "meta_info" not in warmup:
-            raise RuntimeError(f"Unexpected warmup response: {str(warmup)[:400]}")
-        if warmup["meta_info"].get("finish_reason", {}).get("type") == "abort":
-            raise RuntimeError(f"Warmup aborted: {warmup['meta_info']}")
-        Path(args.output_file).with_suffix(".warmup.json").write_text(
+        if backend.startswith("vllm"):
+            # vllm 响应无 meta_info, 只检查 choices 存在
+            if not isinstance(warmup, dict) or "choices" not in warmup:
+                raise RuntimeError(f"Unexpected warmup response: {str(warmup)[:400]}")
+        else:
+            if not isinstance(warmup, dict) or "meta_info" not in warmup:
+                raise RuntimeError(f"Unexpected warmup response: {str(warmup)[:400]}")
+            if warmup["meta_info"].get("finish_reason", {}).get("type") == "abort":
+                raise RuntimeError(f"Warmup aborted: {warmup['meta_info']}")
+        warmup_path = Path(args.output_file).with_suffix(".warmup.json")
+        warmup_path.parent.mkdir(parents=True, exist_ok=True)
+        warmup_path.write_text(
             json.dumps(warmup, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         time.sleep(1)

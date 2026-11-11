@@ -64,6 +64,9 @@ MODEL="${MODEL:-}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN=0
+# 兼容容器内 sglang 源码未安装到 site-packages 的场景:
+# 显式设置 PYTHONPATH 后, 所有 "$PYTHON_BIN" 调用自动继承
+export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${SGLANG_PYTHONPATH:-/sgl-workspace/sglang/python}"
 
 SLA_METRIC="mean_ttft_ms"
 SLA_TARGETS="3|4|5|6"
@@ -137,7 +140,8 @@ done
 MC_COL=""; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"
 
 # OUT_DIR 必须在参数解析后赋值, 否则 --run-id 不生效
-OUT_DIR="./all_result/sla_${RUN_ID}"
+# 用绝对路径, 避免 run_trial() 里 subshell cd 后父 shell 找不到 jsonl
+OUT_DIR="$(pwd)/all_result/sla_${RUN_ID}"
 LOG_DIR="${OUT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
@@ -310,6 +314,11 @@ for raw_case in "${CASES[@]}"; do
     # [flush-patch] 每 trial 前清 radix cache, 保证首触碰命中率口径 (防跨 trial 污染)
     curl -s --max-time 10 -X POST "${BASE_URL}/flush_cache" >/dev/null 2>&1 || true
     sleep 2
+    local pct_args=()
+    # 兼容旧版 prefix_hit.py: 不支持 --percentile-metrics 时不传
+    if "$PYTHON_BIN" "$script_dir/prefix_hit.py" --help 2>&1 | grep -q "percentile-metrics"; then
+      pct_args=(--percentile-metrics "$PCT_METRICS" --metric-percentiles "$PCT_VALUES")
+    fi
     ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
         "$PYTHON_BIN" "$script_dir/prefix_hit.py" \
         --backend sglang --base-url "$BASE_URL" --model "$MODEL" \
@@ -318,7 +327,7 @@ for raw_case in "${CASES[@]}"; do
         --random-range-ratio 1.0 --request-rate "$rate" \
         --num-prompts "$NUM_PROMPTS" ${mc_args[@]+"${mc_args[@]}"} \
         --warmup-requests 0 --cache-report --output-details \
-        --percentile-metrics "$PCT_METRICS" --metric-percentiles "$PCT_VALUES" \
+        ${pct_args[@]+"${pct_args[@]}"} \
         --output-file "$json" --disable-tqdm \
         --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
         ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
