@@ -393,17 +393,15 @@ for raw_case in "${CASES[@]}"; do
   }
 
   # ---- 阶段0: np 饱和扫描 (rate=inf, 决定请求池 best_np) ----
-  # decode 模式: 自动启用并发阶梯, np_list 每个元素 = 并发 C, 请求数 = C × eff_mult (默认 3)
+  # decode 限并发时 (--max-concurrency 传有限值): 并发阶梯自动启用,
+  #   np_list 每个元素 = 并发 C, 请求数 = C × eff_mult (默认 3)
   conc_ladder=0; eff_mult=1
-  if (( decode_mode )); then
-    conc_ladder=1; eff_mult="${NP_MULT:-3}"   # decode 自动并发阶梯
+  if (( decode_mode )) && [[ "$MAX_CONC" != "inf" ]]; then
+    conc_ladder=1; eff_mult="${NP_MULT:-3}"
   fi
-  # decode SLA 停止阈值: 未显式给 --sla-stop-ms 则取 --sla-targets 首档
-  dec_stop_ms="$SLA_STOP_MS"
-  if (( decode_mode )) && [[ -z "$dec_stop_ms" ]]; then
-    first_t="${SLA_TARGETS%%|*}"
-    dec_stop_ms=$("$PYTHON_BIN" -c "print(int(float(${first_t})*1000))")
-  fi
+  # decode SLA 早停阈值 (ms): 默认 0 = 不早停 (只看增益停止)
+  # 显式 --sla-stop-ms 才启用; 未显式时不再自动取 sla-targets 首档
+  dec_stop_ms=${SLA_STOP_MS:-0}
   last_ok_np=""; last_ok_rps=""; last_ok_m=""; last_ok_dur=""; last_ok_done=""; last_ok_hit=""
   if [[ -n "$NP_LIST" ]]; then
     IFS=',' read -ra NP_SEQ <<< "$NP_LIST"
@@ -442,8 +440,14 @@ for raw_case in "${CASES[@]}"; do
     if (( DRY_RUN == 0 )) && "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$rps') > float('$best_rps') else 1)"; then
       best_np=$np_eff; best_rps=$rps; best_m=$mm; best_dur=$dur; best_done=$done_; best_hit=$hitp
     fi
-    # decode 模式: 扫描阶段只看 rps 增益 (inf 档不看 TTFT), 锁定由后续回测决定
-    if (( decode_mode )); then
+    # decode 模式: 扫描阶段先看 TTFT 早停 (显式 --sla-stop-ms 时启用)
+    #   不早停时 dec_stop_ms=0, 只看增益停止; last_ok_* 每档都更新, 最后用 best_np 档作锁定基准
+    if (( decode_mode && DRY_RUN == 0 )); then
+      if [[ "$dec_stop_ms" != "0" ]] \
+        && "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$mm') > float('$dec_stop_ms') else 1)"; then
+        log "[np-scan] 档=$np ${SLA_METRIC}=$mm 超过 SLA ${dec_stop_ms}ms, 停止升压"
+        break
+      fi
       last_ok_np=$np_eff; last_ok_rps=$rps; last_ok_m=$mm; last_ok_dur=$dur; last_ok_done=$done_; last_ok_hit=$hitp
     fi
     if (( auto_mode && DRY_RUN == 0 && np_i > 0 )); then
