@@ -54,6 +54,7 @@
 #                          decode 限并发阶梯 (max_concurrency=bs, 请求数=bs×倍数);
 #                          prefill (OUTPUT=1) 会忽略该参数
 #       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅回测)
+#       --verbose          每条 trial 实时打印客户端 bench 结果 (默认只写 logs/)
 #       --run-id ID --dry-run
 # 环境变量: BASE_URL MODEL PYTHON_BIN SEED
 # 输出: ./all_result/sla_${RUN_ID}/
@@ -71,6 +72,8 @@ MODEL="${MODEL:-}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN=0
+# VERBOSE=1 / --verbose: 把每条 trial 的客户端 bench 输出同时打到终端 (仍写日志)
+VERBOSE="${VERBOSE:-0}"
 # 兼容容器内 sglang 源码未安装到 site-packages 的场景:
 # 显式设置 PYTHONPATH 后, 所有 "$PYTHON_BIN" 调用自动继承
 export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${SGLANG_PYTHONPATH:-/sgl-workspace/sglang/python}"
@@ -141,6 +144,7 @@ while (( $# > 0 )); do
     --max-concurrency) MAX_CONC="$2"; mc_args=(); [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC"); shift 2 ;;
     --np-mult)      NP_MULT="$2"; shift 2 ;;
     --max-trials)   MAX_TRIALS="$2"; shift 2 ;;
+    --verbose)      VERBOSE=1; shift ;;
     --run-id)       RUN_ID="$2"; shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     -h|--help|help) usage ;;
@@ -414,19 +418,36 @@ for raw_case in "${CASES[@]}"; do
     if "$PYTHON_BIN" "$script_dir/prefix_hit.py" --help 2>&1 | grep -q "percentile-metrics"; then
       pct_args=(--percentile-metrics "$PCT_METRICS" --metric-percentiles "$PCT_VALUES")
     fi
-    ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
-        "$PYTHON_BIN" "$script_dir/prefix_hit.py" \
-        --backend sglang --base-url "$BASE_URL" --model "$MODEL" \
-        --dataset-name random-ids --tokenize-prompt \
-        --random-input-len "$IN_LEN" --random-output-len "$OUT_LEN" \
-        --random-range-ratio 1.0 --request-rate "$rate" \
-        --num-prompts "$NUM_PROMPTS" ${mc_args[@]+"${mc_args[@]}"} \
-        --warmup-requests 0 --cache-report --output-details \
-        ${pct_args[@]+"${pct_args[@]}"} \
-        --output-file "$json" --disable-tqdm \
-        --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
-        ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
-    ) > "$clog" 2>&1
+    # VERBOSE=1: stdout/stderr 同时 tee 到终端与日志; 默认只落日志
+    if [[ "$VERBOSE" == "1" ]]; then
+      ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
+          "$PYTHON_BIN" "$script_dir/prefix_hit.py" \
+          --backend sglang --base-url "$BASE_URL" --model "$MODEL" \
+          --dataset-name random-ids --tokenize-prompt \
+          --random-input-len "$IN_LEN" --random-output-len "$OUT_LEN" \
+          --random-range-ratio 1.0 --request-rate "$rate" \
+          --num-prompts "$NUM_PROMPTS" ${mc_args[@]+"${mc_args[@]}"} \
+          --warmup-requests 0 --cache-report --output-details \
+          ${pct_args[@]+"${pct_args[@]}"} \
+          --output-file "$json" --disable-tqdm \
+          --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
+          ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
+      ) > >(tee "$clog") 2>&1
+    else
+      ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
+          "$PYTHON_BIN" "$script_dir/prefix_hit.py" \
+          --backend sglang --base-url "$BASE_URL" --model "$MODEL" \
+          --dataset-name random-ids --tokenize-prompt \
+          --random-input-len "$IN_LEN" --random-output-len "$OUT_LEN" \
+          --random-range-ratio 1.0 --request-rate "$rate" \
+          --num-prompts "$NUM_PROMPTS" ${mc_args[@]+"${mc_args[@]}"} \
+          --warmup-requests 0 --cache-report --output-details \
+          ${pct_args[@]+"${pct_args[@]}"} \
+          --output-file "$json" --disable-tqdm \
+          --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
+          ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
+      ) > "$clog" 2>&1
+    fi
     rc=$?
     peak_stop "$pid"
     return "$rc"
