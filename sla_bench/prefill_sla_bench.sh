@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # prefill_sla_bench.sh v6.8 — 可变命中率 prefix 数据集 + 三流程性能测试
-# 每条 trial 统一落 27 列标准指标 (Group/InOut/parallel_config/命中率/np/并发/
+# 每条 trial 统一落 27 列标准指标 (Model/InOut/parallel_config/命中率/np/并发/
 # server 峰值/rate/duration/rps/吞吐×3/TTFT·TPOT·ITL mean|p95|p99/E2E)。
 # v6.8: 三流程清晰分流 + 单文件汇总 all_metrics.tsv (prefill 组在最前, 每组每档都记)
 # ============================================================
@@ -56,9 +56,10 @@
 #       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅回测)
 #       --verbose          每条 trial 实时打印客户端 bench 结果 (默认只写 logs/)
 #       --run-id ID --dry-run
-# 环境变量: BASE_URL MODEL PYTHON_BIN SEED
+# 环境变量: BASE_URL MODEL PYTHON_BIN SEED GROUP(默认=MODEL末段模型名)
 # 输出: ./all_result/sla_${RUN_ID}/
-#       all_metrics.tsv   ← 单次任务全量汇总 (Mode/Stage + 27 列 + gain + SLA 3 列)
+#       all_metrics.tsv   ← 单次任务全量汇总 (Model 在最前, 之后 Mode/Stage + 其余 26 列
+#                           + gain + SLA 3 列; 空值统一用 "-" 占位)
 #       np_scan.tsv / bs_scan.tsv / sla_backtest.tsv   ← 分表视图
 #       logs/
 # ============================================================
@@ -99,7 +100,14 @@ mc_args=()
 [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC")
 
 # ---- 27 列元数据来源 ----
-GROUP="${GROUP:-}"                       # Group 列: 战役/分组标签
+# Group 列: 优先取 GROUP 环境变量; 未传则从 MODEL 路径取末段模型名 (如
+# /model/DeepSeek-V4-Flash-0731-FP8-DSpark → DeepSeek-V4-Flash-0731-FP8-DSpark);
+# 都为空时用 "-" 占位, 保证该列不出现空字段。
+GROUP="${GROUP:-}"
+if [[ -z "$GROUP" && -n "$MODEL" ]]; then
+  GROUP="${MODEL%/}"; GROUP="${GROUP##*/}"
+fi
+GROUP="${GROUP:--}"
 PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"   # 空=启动后自动抓 /get_server_info
 PCFG="$PARALLEL_CONFIG"
 MC_COL=""                                # 并发两列默认值 (解析后按 MAX_CONC 重建)
@@ -153,7 +161,7 @@ while (( $# > 0 )); do
 done
 
 # 并发两列默认值: 依赖 CLI --max-concurrency, 解析后重建
-MC_COL=""; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"
+MC_COL="-"; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"
 
 # OUT_DIR 必须在参数解析后赋值, 否则 --run-id 不生效
 # 用绝对路径, 避免 run_trial() 里 subshell cd 后父 shell 找不到 jsonl
@@ -329,7 +337,8 @@ for m in ("ttft", "tpot", "itl"):
     rest += [met(m, "mean"), met(m, "p95"), met(m, "p99")]
 rest.append(g("mean_e2el_ms", "mean_e2e_latency_ms"))
 allv = [conc, peak_out, peak_conc] + rest
-print("\t".join("" if x == "" else str(x) for x in allv))
+# 缺失指标统一用 "-" 占位, 避免 TSV 出现空字段导致列错位
+print("\t".join("-" if x == "" else str(x) for x in allv))
 PYXTRA
 }
 
@@ -346,7 +355,7 @@ row_core() { # rate np json rps mm dur hit → 打印一行 27 列 (tab)
   pk_part3="${tmp2%%$'\t'*}"
   ex_part="${tmp2#*$'\t'}"
   core=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-    "${GROUP}" "${IN_LEN}" "${OUT_LEN}" "${PCFG}" "${hit_s}" "$7" "$2" \
+    "${GROUP}" "${IN_LEN}" "${OUT_LEN}" "${PCFG:--}" "${hit_s}" "$7" "$2" \
     "${MC_ROW:-$MC_COL}" \
     "${pk_part}" "${pk_part2}" "${pk_part3}" \
     "$1" "$6" "$4")
@@ -357,12 +366,13 @@ NP_TSV="${OUT_DIR}/np_scan.tsv"
 SCAN_TSV="${OUT_DIR}/bs_scan.tsv"
 BACK_TSV="${OUT_DIR}/sla_backtest.tsv"
 ALL_TSV="${OUT_DIR}/all_metrics.tsv"   # 单次任务全量汇总: prefill 组在前, 每组每档都记录
-COLS="Group,Input_tokens,Generated_tokens,parallel_config,Target_cache_hit(%),Actual_cache_hit(%),num_prompts,max_concurrency,concurrency,peak_output_throughput,peak_concurrency,request_rate,duration_s,rps,input_throughput_tok_s,generate_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms"
+COLS="Model,Input_tokens,Generated_tokens,parallel_config,Target_cache_hit(%),Actual_cache_hit(%),num_prompts,max_concurrency,concurrency,peak_output_throughput,peak_concurrency,request_rate,duration_s,rps,input_throughput_tok_s,generate_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms"
 COLS_TSV="${COLS//,/$'\t'}"
+COLS_TAIL="${COLS_TSV#*$'\t'}"   # 去掉首列 Model, 供 all_metrics 前置 Model 后拼接
 printf '%s\t%s\n' "$COLS_TSV" "gain_vs_prev_pct" > "$NP_TSV"
 printf '%s\n' "$COLS_TSV" > "$SCAN_TSV"
 printf '%s\t%s\t%s\t%s\n' "$COLS_TSV" "sla_metric" "target_s" "lock_type" > "$BACK_TSV"
-printf 'Mode\tStage\t%s\tgain_vs_prev_pct\tsla_metric\ttarget_s\tlock_type\n' "$COLS_TSV" > "$ALL_TSV"
+printf 'Model\tMode\tStage\t%s\tgain_vs_prev_pct\tsla_metric\ttarget_s\tlock_type\n' "$COLS_TAIL" > "$ALL_TSV"
 
 # ---- case 排序: prefill (OUTPUT=1) 全部排在最前, decode 在后 ----
 if (( ${#CASES[@]} > 1 )); then
@@ -397,13 +407,13 @@ for raw_case in "${CASES[@]}"; do
     if [[ "$MAX_CONC" != "inf" ]]; then
       warn "[prefill] 忽略 --max-concurrency=$MAX_CONC (prefill 只用 --request-rate 限流)"
     fi
-    mc_args=(); MC_COL=""
+    mc_args=(); MC_COL="-"
   elif [[ "$MAX_CONC" != "inf" ]]; then
     CUR_MODE="decode-conc"
     conc_ladder=1; MC_COL="$MAX_CONC"
   else
     CUR_MODE="decode-pd"
-    mc_args=(); MC_COL=""
+    mc_args=(); MC_COL="-"
   fi
   log "== case=$tag L=$IN_LEN O=$OUT_LEN hit=${hit_s}% (cached=$CACHED_LEN) mode=$CUR_MODE max_concurrency=${MAX_CONC}"
 
@@ -459,14 +469,16 @@ for raw_case in "${CASES[@]}"; do
     printf '%s\n' "$_line" >> "$SCAN_TSV"
     # to_all=0 时不写全量汇总 (calib 行只是复用 inf 扫描结果, 避免出现
     # "请求率=实测rps 但性能与 inf 相同" 的误导记录)
-    [[ "$_all" == "1" ]] && printf '%s\t%s\t%s\t\t\t\t\n' "$CUR_MODE" "$CUR_STAGE" "$_line" >> "$ALL_TSV"
+    [[ "$_all" == "1" ]] && printf '%s\t%s\t%s\t%s\t-\t-\t-\t-\n' \
+      "$GROUP" "$CUR_MODE" "$CUR_STAGE" "${_line#*$'\t'}" >> "$ALL_TSV"
     return 0
   }
   back_row() { # rate np json rps metric dur hit tgt lock
     local _line
     _line=$(row_core "$1" "$2" "$3" "$4" "$5" "$6" "$7")
     printf '%s\t%s\t%s\t%s\n' "$_line" "$SLA_METRIC" "$8" "$9" >> "$BACK_TSV"
-    printf '%s\t%s\t%s\t\t%s\t%s\t%s\n' "$CUR_MODE" "backtest" "$_line" "$SLA_METRIC" "$8" "$9" >> "$ALL_TSV"
+    printf '%s\t%s\t%s\t%s\t-\t%s\t%s\t%s\n' \
+      "$GROUP" "$CUR_MODE" "backtest" "${_line#*$'\t'}" "$SLA_METRIC" "$8" "$9" >> "$ALL_TSV"
   }
 
   # ---- 阶段0: np 饱和扫描 (rate=inf, 决定请求池 best_np) ----
@@ -510,7 +522,8 @@ for raw_case in "${CASES[@]}"; do
       && gain=$("$PYTHON_BIN" -c "print(round((float('$rps')-float('$prev_rps'))/float('$prev_rps')*100,2))")
     _npline=$(row_core inf "$np_eff" "$json" "$rps" "$mm" "$dur" "$hitp")
     printf '%s\t%s\n' "$_npline" "$gain" >> "$NP_TSV"
-    printf '%s\t%s\t%s\t%s\t\t\t\n' "$CUR_MODE" "scan" "$_npline" "$gain" >> "$ALL_TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t-\t-\t-\n' \
+      "$GROUP" "$CUR_MODE" "scan" "${_npline#*$'\t'}" "$gain" >> "$ALL_TSV"
     log "[np-scan] 档=$np np=$np_eff rps=$rps ${SLA_METRIC}=$mm gain=${gain}%"
     if (( DRY_RUN == 0 )) && "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$rps') > float('$best_rps') else 1)"; then
       best_np=$np_eff; best_rps=$rps; best_m=$mm; best_dur=$dur; best_done=$done_; best_hit=$hitp
