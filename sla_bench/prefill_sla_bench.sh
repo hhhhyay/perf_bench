@@ -25,8 +25,9 @@
 #   阶段1 SLA 回测: 以 best_np 的 inf 实测 rps (最高吞吐) 为起点, 先按该请求率实跑
 #     一档, 再以 --rate-step (默认 0.1) 递减; 每个请求率只跑一次, 同一次结果同时
 #     判定所有 SLA 档 (TTFT 单调下降), 首个满足点 → descend_lock;
-#     回测请求池 = max(best_np, rate × --backtest-pool-sec(默认60s)), 避免池子过小
-#     导致限速下"发完即止"、实际并发过低而低估 TTFT (0=沿用 best_np);
+#     回测并发口径: 默认各档 num_prompts 固定 = best_np (并发一致, 只有请求率变);
+#     --backtest-pool-sec N>0 时改为 pool = max(best_np, rate × N), 压满 N 秒稳态,
+#     但各档并发不同 (跨机器对比口径不统一);
 #     inf 档已满足 → inf_lock; 降到 0.1 仍不满足 → not_found。
 #
 # 用法 (perf_bench 仓库根目录, 客户端容器内):
@@ -49,7 +50,9 @@
 #       --sla-stop-ms N    decode 限并发升压早停阈值 ms (默认 0=不做 SLA 约束)
 #       --rate-step F      固定降率步长 (默认 0.1, 仅 prefill/PD 回测)
 #       --backtest-pool-sec N  回测请求池秒数, pool=max(best_np, rate×N)
-#                          (默认 60; 0=不放大, 沿用 best_np)
+#                          (默认 0=固定并发: 各档 num_prompts 都等于 best_np,
+#                           跨档/跨机器并发口径一致, 只有请求率在变;
+#                           N>0 则按 rate×N 放大池子压满 N 秒, 各档并发不同)
 #       --max-concurrency N|inf  最大并发 (默认 inf)。传有限值且 OUTPUT>1 即启用
 #                          decode 限并发阶梯 (max_concurrency=bs, 请求数=bs×倍数);
 #                          prefill (OUTPUT=1) 会忽略该参数
@@ -84,10 +87,10 @@ export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${SGLANG_PYTHONPATH:-/sgl-work
 SLA_METRIC="mean_ttft_ms"
 SLA_TARGETS="2|3|4"     # 默认 SLA 档位: mean TTFT 2|3|4 s
 SLA_STOP_MS=""          # decode 阶梯早停阈值 ms; 空/0=不早停 (默认不做 SLA 约束)
-# 回测请求池: pool = max(best_np, rate × BACKTEST_POOL_SEC)
-#   仅 best_np 个请求在限速下会"发完即止", 实际并发远低于目标, SLA 结论偏乐观;
-#   按请求率×时长放大池子才能形成稳态压力。0 = 不放大 (沿用 best_np)。
-BACKTEST_POOL_SEC="${BACKTEST_POOL_SEC:-60}"
+# 回测请求池: 0 = 固定并发 (各档 num_prompts 均 = best_np, 跨档/跨机器口径一致,
+#   只有请求率在变); N > 0 = pool = max(best_np, rate × N), 按请求率×时长放大池子
+#   压满 N 秒, 稳态压力更足但各档并发不同 (跨机器对比时口径不统一)。
+BACKTEST_POOL_SEC="${BACKTEST_POOL_SEC:-0}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-6}"    # 启动前 /health 探测次数 (server 刚起时可能未就绪)
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"  # 每次重试间隔秒
 NUM_PROMPTS="${NUM_PROMPTS:-64}"
