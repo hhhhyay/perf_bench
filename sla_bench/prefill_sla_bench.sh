@@ -53,6 +53,8 @@
 #       --max-concurrency N|inf  最大并发 (默认 inf)。传有限值且 OUTPUT>1 即启用
 #                          decode 限并发阶梯 (max_concurrency=bs, 请求数=bs×倍数);
 #                          prefill (OUTPUT=1) 会忽略该参数
+#       --health-retries N 启动前 /health 探测次数 (默认 6, 每次超时 5s)
+#       --health-interval N 重试间隔秒 (默认 5, 即最多等 30s 等服务就绪)
 #       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅回测)
 #       --verbose          每条 trial 实时打印客户端 bench 结果 (默认只写 logs/)
 #       --run-id ID --dry-run
@@ -86,6 +88,8 @@ SLA_STOP_MS=""          # decode 阶梯早停阈值 ms; 空/0=不早停 (默认�
 #   仅 best_np 个请求在限速下会"发完即止", 实际并发远低于目标, SLA 结论偏乐观;
 #   按请求率×时长放大池子才能形成稳态压力。0 = 不放大 (沿用 best_np)。
 BACKTEST_POOL_SEC="${BACKTEST_POOL_SEC:-60}"
+HEALTH_RETRIES="${HEALTH_RETRIES:-6}"    # 启动前 /health 探测次数 (server 刚起时可能未就绪)
+HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"  # 每次重试间隔秒
 NUM_PROMPTS="${NUM_PROMPTS:-64}"
 NP_START="${NP_START:-64}"
 NP_STEP="2"
@@ -148,6 +152,8 @@ while (( $# > 0 )); do
     --sla-targets)  SLA_TARGETS="$2"; shift 2 ;;
     --sla-stop-ms)  SLA_STOP_MS="$2"; shift 2 ;;
     --backtest-pool-sec) BACKTEST_POOL_SEC="$2"; shift 2 ;;
+    --health-retries)  HEALTH_RETRIES="$2"; shift 2 ;;
+    --health-interval) HEALTH_INTERVAL="$2"; shift 2 ;;
     --rate-step)    RATE_STEP="$2"; shift 2 ;;
     --max-concurrency) MAX_CONC="$2"; mc_args=(); [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC"); shift 2 ;;
     --np-mult)      NP_MULT="$2"; shift 2 ;;
@@ -175,8 +181,14 @@ case "$SLA_METRIC" in
 esac
 
 if (( DRY_RUN == 0 )); then
-  curl -s --max-time 5 -o /dev/null "$BASE_URL/health" \
-    || die "server 不可达: $BASE_URL/health"
+  # 健康检查重试: server 刚启动时端口已监听但 /health 未就绪, 单次探测容易误判
+  ready=0
+  for (( i = 1; i <= HEALTH_RETRIES; i++ )); do
+    if curl -s --max-time 5 -o /dev/null "$BASE_URL/health"; then ready=1; break; fi
+    (( i < HEALTH_RETRIES )) && log "[health] ${BASE_URL}/health 未就绪 (${i}/${HEALTH_RETRIES}), ${HEALTH_INTERVAL}s 后重试"
+    sleep "$HEALTH_INTERVAL"
+  done
+  (( ready )) || die "server 不可达: $BASE_URL/health (已重试 ${HEALTH_RETRIES} 次)"
   "$PYTHON_BIN" -c 'from sglang.benchmark.datasets.common import DatasetRow, get_available_tokens' \
     || die "sglang.benchmark.datasets 不可用"
   log "server OK: $BASE_URL"
