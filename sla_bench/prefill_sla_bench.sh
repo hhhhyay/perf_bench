@@ -598,17 +598,26 @@ for raw_case in "${CASES[@]}"; do
     lf_json="$json"
     lad=$(( l_np / eff_mult ))
     [[ -f "${LOG_DIR}/${tag}_inf_c${lad}.jsonl" ]] && lf_json="${LOG_DIR}/${tag}_inf_c${lad}.jsonl"
-    # decode-conc 不做降率回测: 锁定档直接按 SLA_TARGETS 每档输出一行 (并发固定, 指标不变)
+    # decode-conc 不做降率回测: 锁定档按满足/不满足各输出一行 (同 rate 的档位合并 target_s)
     IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
+    ok_t=(); bad_t=()
     for tgt_s in "${TARGETS[@]}"; do
       [[ "$tgt_s" =~ ^[0-9.]+$ ]] || continue
       tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
       if [[ "$lock_type" != "decode_sla_not_found" ]] && meet "$l_m" "$tgt_ms"; then
-        back_row inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit" "$tgt_s" "inf_lock"
+        ok_t+=("$tgt_s")
       else
-        back_row inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit" "$tgt_s" "not_found"
+        bad_t+=("$tgt_s")
       fi
     done
+    if (( ${#ok_t[@]} > 0 )); then
+      joined=$(printf '%s|' "${ok_t[@]}"); joined="${joined%|}"
+      back_row inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit" "$joined" "inf_lock"
+    fi
+    if (( ${#bad_t[@]} > 0 )); then
+      joined=$(printf '%s|' "${bad_t[@]}"); joined="${joined%|}"
+      back_row inf "$l_np" "$lf_json" "$l_rps" "$l_m" "$l_dur" "$l_hit" "$joined" "not_found"
+    fi
     continue
   fi
 
@@ -617,17 +626,18 @@ for raw_case in "${CASES[@]}"; do
   # 降率过程中 TTFT 单调下降, 因此每档 rate 只需跑一次, 同时为所有未锁定档判定,
   # 天然避免"同一 rate 为不同 SLA 重复跑"的冗余记录。
   IFS='|' read -ra TARGETS <<< "$SLA_TARGETS"
-  pending=()
+  pending=(); inf_met=()
   for tgt_s in "${TARGETS[@]}"; do
     [[ "$tgt_s" =~ ^[0-9.]+$ ]] || die "非法 SLA 阈值: $tgt_s"
     tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
-    if meet "$inf_m" "$tgt_ms"; then
-      back_row inf "$NUM_PROMPTS" "$INF_JSON" "$inf_rps" "$inf_m" "$inf_dur" "$inf_hit" "$tgt_s" "inf_lock"
-      log "[backtest] <${tgt_s}s: rate=inf rps=$inf_rps (inf 已满足, 锁定)"
-    else
-      pending+=("$tgt_s")
-    fi
+    if meet "$inf_m" "$tgt_ms"; then inf_met+=("$tgt_s"); else pending+=("$tgt_s"); fi
   done
+  # 同一 rate 锁定的多个 SLA 档合并为一行, target_s 用 | 连接, 避免指标列重复
+  if (( ${#inf_met[@]} > 0 )); then
+    joined=$(printf '%s|' "${inf_met[@]}"); joined="${joined%|}"
+    back_row inf "$NUM_PROMPTS" "$INF_JSON" "$inf_rps" "$inf_m" "$inf_dur" "$inf_hit" "$joined" "inf_lock"
+    log "[backtest] <${joined}s: rate=inf rps=$inf_rps (inf 已满足, 锁定)"
+  fi
 
   cur="$inf_rps"; searches=0
   while (( ${#pending[@]} > 0 && searches <= MAX_TRIALS )); do
@@ -647,27 +657,30 @@ for raw_case in "${CASES[@]}"; do
     fi
     read -r rps mm dur done_ hitp <<< "$m"
     CUR_STAGE="descend"
-    record "$cur" "$rps" "$mm" "$dur" "$done_" "$hitp"
-    still=()
+    still=(); met=()
     for tgt_s in "${pending[@]}"; do
       tgt_ms=$("$PYTHON_BIN" -c "print(int(float(${tgt_s})*1000))")
-      if meet "$mm" "$tgt_ms"; then
-        back_row "$cur" "$NUM_PROMPTS" "$json" "$rps" "$mm" "$dur" "$hitp" "$tgt_s" "descend_lock"
-        log "[backtest] <${tgt_s}s: rate=$cur 锁定 (${SLA_METRIC}=$mm)"
-      else
-        still+=("$tgt_s")
-      fi
+      if meet "$mm" "$tgt_ms"; then met+=("$tgt_s"); else still+=("$tgt_s"); fi
     done
+    if (( ${#met[@]} > 0 )); then
+      # 锁定: 一个 rate 只落一行, target_s 合并 (不再额外写一条 descend 通用行, 避免重复)
+      joined=$(printf '%s|' "${met[@]}"); joined="${joined%|}"
+      back_row "$cur" "$NUM_PROMPTS" "$json" "$rps" "$mm" "$dur" "$hitp" "$joined" "descend_lock"
+      log "[backtest] <${joined}s: rate=$cur 锁定 (${SLA_METRIC}=$mm)"
+    else
+      record "$cur" "$rps" "$mm" "$dur" "$done_" "$hitp"   # 未锁定任何档: 仅记录搜索点
+    fi
     pending=("${still[@]+"${still[@]}"}")
     next=$(fstep "$cur" "$RATE_STEP")
     [[ "$next" == "$cur" ]] && break
     cur="$next"
   done
 
-  for tgt_s in "${pending[@]+"${pending[@]}"}"; do
-    back_row "$cur" "$NUM_PROMPTS" "$json" "$rps" "$mm" "$dur" "$hitp" "$tgt_s" "not_found"
-    warn "[backtest] <${tgt_s}s 未找到满足点 (rate 降到 $cur 仍不满足)"
-  done
+  if (( ${#pending[@]} > 0 )); then
+    joined=$(printf '%s|' "${pending[@]}"); joined="${joined%|}"
+    back_row "$cur" "$NUM_PROMPTS" "$json" "$rps" "$mm" "$dur" "$hitp" "$joined" "not_found"
+    warn "[backtest] <${joined}s 未找到满足点 (rate 降到 $cur 仍不满足)"
+  fi
 done
 
 log "完成。汇总: $ALL_TSV"
