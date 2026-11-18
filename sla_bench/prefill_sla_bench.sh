@@ -357,7 +357,7 @@ NP_TSV="${OUT_DIR}/np_scan.tsv"
 SCAN_TSV="${OUT_DIR}/bs_scan.tsv"
 BACK_TSV="${OUT_DIR}/sla_backtest.tsv"
 ALL_TSV="${OUT_DIR}/all_metrics.tsv"   # 单次任务全量汇总: prefill 组在前, 每组每档都记录
-COLS="Group,Input tokens,Generated tokens,parallel_config,Target cache hit(%),Actual cache hit(%),num_prompts,max_concurrency,concurrency,peak_output_throughput,peak_concurrency,request_rate,duration_s,rps,input_throughput_tok_s,generate_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms"
+COLS="Group,Input_tokens,Generated_tokens,parallel_config,Target_cache_hit(%),Actual_cache_hit(%),num_prompts,max_concurrency,concurrency,peak_output_throughput,peak_concurrency,request_rate,duration_s,rps,input_throughput_tok_s,generate_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,p95_ttft_ms,p99_ttft_ms,mean_tpot_ms,p95_tpot_ms,p99_tpot_ms,mean_itl_ms,p95_itl_ms,p99_itl_ms,mean_e2e_latency_ms"
 COLS_TSV="${COLS//,/$'\t'}"
 printf '%s\t%s\n' "$COLS_TSV" "gain_vs_prev_pct" > "$NP_TSV"
 printf '%s\n' "$COLS_TSV" > "$SCAN_TSV"
