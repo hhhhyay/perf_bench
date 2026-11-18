@@ -103,6 +103,10 @@ BASE_URL="${BASE_URL:-http://12.12.12.37:10015}"
 # 空则尝试从 /metrics 的 model_name 标签自动解析
 MODEL="${MODEL:-/public4/opendas/DL_DATA/llm-models/DeepSeek-V4-Flash-0731-FP8-Channel}"
 
+# sum_all.csv 的 Model 列：优先 GROUP，其次取 MODEL 路径末段模型名，都没有则 '-'
+MODEL_LABEL="${GROUP:-$(printf '%s' "${MODEL}" | sed -E 's#/+$##; s#.*/##')}"
+MODEL_LABEL="${MODEL_LABEL:--}"
+
 
 # DP 数：默认从 /metrics 自动识别 dp_rank 数量。
 # 如 metrics 无 dp_rank，可通过环境变量 DP_SIZE 手动回退。
@@ -779,7 +783,8 @@ python3 - \
   "${MAX_RUNNING_REQUESTS}" \
   "${NUM_PROMPTS_MULTIPLIER}" \
   "${PARALLEL_CONFIG:-UNKNOWN}" \
-  "${TOKEN_UNIT}" <<'PY'
+  "${TOKEN_UNIT}" \
+  "${MODEL_LABEL}" <<'PY'
 
 import csv
 import math
@@ -795,6 +800,7 @@ max_running_requests = int(sys.argv[5])
 num_prompts_multiplier = int(sys.argv[6])
 parallel_config = sys.argv[7]
 token_unit = int(sys.argv[8])
+model_label = sys.argv[9] or "-"
 
 pattern = re.compile(
     r"(?P<case>.+?)"
@@ -1064,6 +1070,7 @@ for input_len, output_len, perdp, log_path, match in log_files:
 
     theoretical_global_bs = theoretical_bs * dp_size
 
+    row["model"] = model_label
     row["case_name"] = case_name
     row["input_len"] = input_len
     row["output_len"] = output_len
@@ -1116,6 +1123,7 @@ for input_len, output_len, perdp, log_path, match in log_files:
 
 preferred_columns = [
     # 固定核心列：前面统一展示，后面不再追加语义重复字段
+    "model",
     "case_name",
     "input_len",
     "output_len",
