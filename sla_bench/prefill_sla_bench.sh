@@ -418,6 +418,9 @@ for raw_case in "${CASES[@]}"; do
     if "$PYTHON_BIN" "$script_dir/prefix_hit.py" --help 2>&1 | grep -q "percentile-metrics"; then
       pct_args=(--percentile-metrics "$PCT_METRICS" --metric-percentiles "$PCT_VALUES")
     fi
+    # 注意: 不要用 --extra-request-body 传 sampling_params, 它会整体覆盖 payload 里的
+    # sampling_params 并丢掉 max_new_tokens(=output_len), 服务端退回默认 128 token。
+    # 采样参数走 bench CLI: 透传 --temperature / --top-p 即可。
     # VERBOSE=1: stdout/stderr 同时 tee 到终端与日志; 默认只落日志
     if [[ "$VERBOSE" == "1" ]]; then
       ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
@@ -430,7 +433,6 @@ for raw_case in "${CASES[@]}"; do
           --warmup-requests 0 --cache-report --output-details \
           ${pct_args[@]+"${pct_args[@]}"} \
           --output-file "$json" --disable-tqdm \
-          --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
           ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
       ) > >(tee "$clog") 2>&1
     else
@@ -444,7 +446,6 @@ for raw_case in "${CASES[@]}"; do
           --warmup-requests 0 --cache-report --output-details \
           ${pct_args[@]+"${pct_args[@]}"} \
           --output-file "$json" --disable-tqdm \
-          --extra-request-body '{"sampling_params":{"temperature":0.6,"top_p":0.95,"ignore_eos":true}}' \
           ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
       ) > "$clog" 2>&1
     fi
