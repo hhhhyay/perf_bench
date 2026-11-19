@@ -25,6 +25,9 @@ source "${script_dir}/sglc_bs_helpers.sh"
 # 1. 基础配置
 # ============================================================
 
+# 显式传 RUN_ID 时, 目录名会再追加时间戳, 避免重复任务覆盖旧结果
+RUN_ID_EXPLICIT=0
+[[ -n "${RUN_ID:-}" ]] && RUN_ID_EXPLICIT=1
 run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 NODE_HOSTNAME="${NODE_HOSTNAME:-$(hostname 2>/dev/null || printf 'unknown')}"
@@ -34,7 +37,12 @@ SGLC_PLOT_BIN="${SGLC_PLOT_BIN:-python3}"
 SGLC_PLOT="${SGLC_PLOT:-1}"
 SGLC_PLOT_CELL="${SGLC_PLOT_CELL:-rps}"
 
-out_dir="./all_result/bench_theory_bs_${run_id}"
+# 显式 run_id 一律再追加时间戳; 未显式传时 run_id 自己就是时间戳
+if (( RUN_ID_EXPLICIT )); then
+  out_dir="./all_result/bench_theory_bs_${run_id}_$(date +%Y%m%d_%H%M%S)"
+else
+  out_dir="./all_result/bench_theory_bs_${run_id}"
+fi
 log_dir="${out_dir}/logs"
 
 mkdir -p "${log_dir}"

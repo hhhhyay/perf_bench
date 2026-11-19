@@ -62,6 +62,7 @@
 #       --verbose          每条 trial 实时打印客户端 bench 结果 (默认已开启, 保留兼容)
 #       --quiet            关闭终端实时输出, 只写 logs/
 #       --run-id ID --dry-run
+#       run-id 默认取时间戳; 显式指定时目录名会自动再追加时间戳, 避免重复运行混写
 # 环境变量: BASE_URL MODEL PYTHON_BIN SEED GROUP(默认取服务端 served_model_name/model_path 末段)
 # 输出: ./all_result/sla_${RUN_ID}/
 #       all_metrics.tsv   ← 单次任务全量汇总 (Model 在最前, 之后 Mode/Stage + 其余 26 列
@@ -77,6 +78,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:30000}"
 MODEL="${MODEL:-}"
 SEED="${SEED:-42}"
+# 显式传 run-id (环境变量或 --run-id) 时, 目录名会再追加时间戳, 避免重复任务混写
+RUN_ID_EXPLICIT=0
+[[ -n "${RUN_ID:-}" ]] && RUN_ID_EXPLICIT=1
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN=0
 # VERBOSE=1 / --verbose: 把每条 trial 的客户端 bench 输出同时打到终端 (仍写日志), 默认开启;
@@ -165,7 +169,7 @@ while (( $# > 0 )); do
     --max-trials)   MAX_TRIALS="$2"; shift 2 ;;
     --verbose)      VERBOSE=1; shift ;;
     --quiet)        VERBOSE=0; shift ;;
-    --run-id)       RUN_ID="$2"; shift 2 ;;
+    --run-id)       RUN_ID="$2"; RUN_ID_EXPLICIT=1; shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     -h|--help|help) usage ;;
     *)              PASSTHROUGH+=("$1"); shift ;;  # 其余参数透传给 bench CLI
@@ -177,7 +181,12 @@ MC_COL="-"; [[ "$MAX_CONC" != "inf" ]] && MC_COL="$MAX_CONC"
 
 # OUT_DIR 必须在参数解析后赋值, 否则 --run-id 不生效
 # 用绝对路径, 避免 run_trial() 里 subshell cd 后父 shell 找不到 jsonl
-OUT_DIR="$(pwd)/all_result/sla_${RUN_ID}"
+# 显式 run-id 一律再追加时间戳; 未显式传时 RUN_ID 自己就是时间戳
+if (( RUN_ID_EXPLICIT )); then
+  OUT_DIR="$(pwd)/all_result/sla_${RUN_ID}_$(date +%Y%m%d_%H%M%S)"
+else
+  OUT_DIR="$(pwd)/all_result/sla_${RUN_ID}"
+fi
 LOG_DIR="${OUT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
