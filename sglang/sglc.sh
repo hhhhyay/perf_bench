@@ -438,13 +438,18 @@ if sv(mem) and sv(eff) and sv(mem)!=sv(eff):
     print("[mem] launch=%s effective=%s" % (sv(mem), sv(eff)), file=sys.stderr)
 if mem is None:
     mem=eff
+# Model: 服务端 served_model_name (只看模型名, 不取 model_path 路径)
+m=d.get("served_model_name")
+if isinstance(m,list): m=m[0] if m else None
+m=str(m).strip() if m else ""
+m=m.rstrip("/"); m=m.split("/")[-1] if m else ""
 cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
-print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
+print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))),sv(m))' 2>/dev/null \
     || true
   )"
 
   if [[ -n "${values}" ]]; then
-    read -r _tp _dp _pp _ep _acp _dpa _kv _mem _cudabs <<< "${values}"
+    read -r _tp _dp _pp _ep _acp _dpa _kv _mem _cudabs _model <<< "${values}"
     [[ -n "${_tp}" ]] && TP_SIZE="${_tp}"
     [[ -n "${_dp}" ]] && DP_SIZE="${_dp}"
     [[ -n "${_pp}" ]] && PP_SIZE="${_pp}"
@@ -460,6 +465,11 @@ print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(in
     PARALLEL_CONFIG="TP${TP_SIZE:-NA}-DP${DP_SIZE:-NA}(${attn_tag})-PP${PP_SIZE:-NA}-EP${EP_SIZE:-NA}-ACP${ATTN_CP_SIZE:-NA}-KV${KV_CACHE_DTYPE:-NA}-MEM${MEM_FRACTION_STATIC:-NA}"
 
     echo "[INFO] server_info: ${PARALLEL_CONFIG}"
+    # CSV Model 列以服务端实际部署为准 (显式传 GROUP 时不覆盖)
+    if [[ -n "${_model}" && -z "${GROUP:-}" ]]; then
+      MODEL_LABEL="${_model}"
+      echo "[INFO] model: ${MODEL_LABEL} (服务端)"
+    fi
     if [[ -n "${CUDA_GRAPH_DECODE_BS}" ]]; then
       echo "[INFO] server_info decode cuda graph bs: ${CUDA_GRAPH_DECODE_BS}"
     else

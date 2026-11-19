@@ -62,7 +62,7 @@
 #       --verbose          每条 trial 实时打印客户端 bench 结果 (默认已开启, 保留兼容)
 #       --quiet            关闭终端实时输出, 只写 logs/
 #       --run-id ID --dry-run
-# 环境变量: BASE_URL MODEL PYTHON_BIN SEED GROUP(默认=MODEL末段模型名)
+# 环境变量: BASE_URL MODEL PYTHON_BIN SEED GROUP(默认取服务端 served_model_name/model_path 末段)
 # 输出: ./all_result/sla_${RUN_ID}/
 #       all_metrics.tsv   ← 单次任务全量汇总 (Model 在最前, 之后 Mode/Stage + 其余 26 列
 #                           + gain + SLA 3 列; 空值统一用 "-" 占位)
@@ -109,10 +109,10 @@ mc_args=()
 [[ "$MAX_CONC" != "inf" ]] && mc_args=(--max-concurrency "$MAX_CONC")
 
 # ---- 27 列元数据来源 ----
-# Group 列: 优先取 GROUP 环境变量; 未传则从 MODEL 路径取末段模型名 (如
-# /model/DeepSeek-V4-Flash-0731-FP8-DSpark → DeepSeek-V4-Flash-0731-FP8-DSpark);
-# 都为空时用 "-" 占位, 保证该列不出现空字段。
-GROUP="${GROUP:-}"
+# Model 列: 优先级 GROUP 环境变量 > 服务端 /get_server_info 的 served_model_name
+# > 客户端 MODEL 末段 > "-"。只看服务端的模型名, 不取 model_path 路径。
+GROUP_ENV="${GROUP:-}"
+GROUP="${GROUP_ENV:-}"
 if [[ -z "$GROUP" && -n "$MODEL" ]]; then
   GROUP="${MODEL%/}"; GROUP="${GROUP##*/}"
 fi
@@ -284,6 +284,24 @@ PYPCFG
   fi
   [[ -n "$PCFG" ]] || PCFG="$PARALLEL_CONFIG"
   [[ -n "$PCFG" ]] && log "[server] parallel_config=$PCFG"
+fi
+
+# Model 列以服务端实际部署为准: 客户端 MODEL 可能只是别名/挂载路径 (曾出现标签为
+# DeepSeek 但服务端实际是 GLM 的情况)。显式传 GROUP 时不覆盖。
+if [[ -z "$GROUP_ENV" && "$DRY_RUN" == 0 ]]; then
+  [[ -n "${info:-}" ]] || info=$(curl -s --max-time 5 "${BASE_URL%/}/get_server_info" 2>/dev/null || true)
+  srv_model=$(printf '%s' "${info:-}" | "$PYTHON_BIN" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+v=d.get("served_model_name")
+if isinstance(v,list): v=v[0] if v else None
+v=str(v).strip() if v else ""
+v=v.rstrip("/")
+print(v.split("/")[-1] if v else "")' 2>/dev/null || true)
+  if [[ -n "$srv_model" ]]; then
+    [[ "$srv_model" != "$GROUP" ]] && log "[model] 客户端=$GROUP 服务端=$srv_model → TSV 记服务端"
+    GROUP="$srv_model"
+  fi
 fi
 
 # 摘指标: rps metric dur completed actual_hit; completed 不齐视为失败(全 0)
