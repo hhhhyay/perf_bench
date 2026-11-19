@@ -427,13 +427,18 @@ d=json.load(sys.stdin)
 tp=d.get("tp_size"); dp=d.get("dp_size"); pp=d.get("pp_size"); ep=d.get("ep_size")
 acp=d.get("attn_cp_size"); dpa=d.get("enable_dp_attention")
 kv=d.get("kv_cache_dtype")
-mem=d.get("mem_fraction_static")
-if mem is None and isinstance(d.get("server_args"), dict):
-    mem=d["server_args"].get("mem_fraction_static")
-cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
 def sv(v):
     if isinstance(v,bool): return "true" if v else "false"
     return "" if v is None else str(v)
+# MEM: 优先 server_args 里实际传入的参数 (原样, 不做小数位格式化), 取不到才回退 effective
+sa=d.get("server_args") if isinstance(d.get("server_args"), dict) else {}
+mem=sa.get("mem_fraction_static")
+eff=d.get("mem_fraction_static")
+if sv(mem) and sv(eff) and sv(mem)!=sv(eff):
+    print("[mem] launch=%s effective=%s" % (sv(mem), sv(eff)), file=sys.stderr)
+if mem is None:
+    mem=eff
+cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
 print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
     || true
   )"

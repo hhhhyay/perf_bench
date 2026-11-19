@@ -59,7 +59,8 @@
 #       --health-retries N 启动前 /health 探测次数 (默认 6, 每次超时 5s)
 #       --health-interval N 重试间隔秒 (默认 5, 即最多等 30s 等服务就绪)
 #       --max-trials N     单 SLA 档 trial 上限 (默认 24, 仅回测)
-#       --verbose          每条 trial 实时打印客户端 bench 结果 (默认只写 logs/)
+#       --verbose          每条 trial 实时打印客户端 bench 结果 (默认已开启, 保留兼容)
+#       --quiet            关闭终端实时输出, 只写 logs/
 #       --run-id ID --dry-run
 # 环境变量: BASE_URL MODEL PYTHON_BIN SEED GROUP(默认=MODEL末段模型名)
 # 输出: ./all_result/sla_${RUN_ID}/
@@ -78,8 +79,9 @@ MODEL="${MODEL:-}"
 SEED="${SEED:-42}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN=0
-# VERBOSE=1 / --verbose: 把每条 trial 的客户端 bench 输出同时打到终端 (仍写日志)
-VERBOSE="${VERBOSE:-0}"
+# VERBOSE=1 / --verbose: 把每条 trial 的客户端 bench 输出同时打到终端 (仍写日志), 默认开启;
+# VERBOSE=0 或 --quiet: 只写日志
+VERBOSE="${VERBOSE:-1}"
 # 兼容容器内 sglang 源码未安装到 site-packages 的场景:
 # 显式设置 PYTHONPATH 后, 所有 "$PYTHON_BIN" 调用自动继承
 export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${SGLANG_PYTHONPATH:-/sgl-workspace/sglang/python}"
@@ -162,6 +164,7 @@ while (( $# > 0 )); do
     --np-mult)      NP_MULT="$2"; shift 2 ;;
     --max-trials)   MAX_TRIALS="$2"; shift 2 ;;
     --verbose)      VERBOSE=1; shift ;;
+    --quiet)        VERBOSE=0; shift ;;
     --run-id)       RUN_ID="$2"; shift 2 ;;
     --dry-run)      DRY_RUN=1; shift ;;
     -h|--help|help) usage ;;
@@ -216,12 +219,16 @@ def dig(d, key):
 def gint(d, key):
     v = dig(d, key)
     return v if isinstance(v, int) and not isinstance(v, bool) else None
-def gfloat(d, key):
-    v = dig(d, key)
-    return v if isinstance(v, float) else None
 def gstr(d, key):
     v = dig(d, key)
     return v if isinstance(v, str) else None
+def get_path(d, path):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
 try:
     d = json.loads(sys.argv[1])
 except Exception:
@@ -253,11 +260,25 @@ if qnt:
     parts.append(f"KV{qnt}")
 elif kv and kv != "auto":
     parts.append(f"KV{kv}")
-# MEM fraction
-mem = gfloat(d, "mem_fraction_static")
+# MEM fraction: 原样输出 server_args 里实际传入的值, 不做任何小数位格式化
+# (sglang 启动后会按显存/模型自动调整 effective 值, 与 --mem-fraction-static 不一定相等,
+#  因此优先取启动参数; 取不到才回退顶层 effective)
+def raw_str(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, str):
+        return v.strip() or None
+    return str(v)
+mem_launch = raw_str(get_path(d, ("server_args", "mem_fraction_static")))
+mem_eff = raw_str(d.get("mem_fraction_static"))
+if mem_eff is None:
+    mem_eff = raw_str(dig(d, "mem_fraction_static"))
+mem = mem_launch if mem_launch is not None else mem_eff
 if mem is not None:
-    parts.append(f"MEM{mem:.1f}")
+    parts.append("MEM" + mem)
 print("-".join(parts))
+if mem_launch is not None and mem_eff is not None and mem_launch != mem_eff:
+    print(f"[mem] launch={mem_launch} effective={mem_eff}", file=sys.stderr)
 PYPCFG
 )
   fi
@@ -446,7 +467,7 @@ for raw_case in "${CASES[@]}"; do
     # 注意: 不要用 --extra-request-body 传 sampling_params, 它会整体覆盖 payload 里的
     # sampling_params 并丢掉 max_new_tokens(=output_len), 服务端退回默认 128 token。
     # 采样参数走 bench CLI: 透传 --temperature / --top-p 即可。
-    # VERBOSE=1: stdout/stderr 同时 tee 到终端与日志; 默认只落日志
+    # VERBOSE=1(默认): stdout/stderr 同时 tee 到终端与日志; VERBOSE=0/--quiet: 只落日志
     if [[ "$VERBOSE" == "1" ]]; then
       ( cd "$script_dir/.." && PREFIX_HIT="$hit_s" PREFIX_SEED="$SEED" \
           "$PYTHON_BIN" "$script_dir/prefix_hit.py" \
