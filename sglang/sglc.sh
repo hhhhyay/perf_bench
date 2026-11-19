@@ -227,7 +227,29 @@ esac
 # 4 1      => 4K in / 1K out
 # 0.5 1    => 默认 512 in / 1024 out
 # 1024 1   => 默认 1M in / 1K out
+#
+# 用例可直接从命令行传入, 不再需要改脚本:
+#   bash sglc.sh --case "8 1" --case "16 1"
+#   bash sglc.sh --cases "8 1,16 1,128 1"
+#   bash sglc.sh --sla-rules mean_tpot_ms:50:5,p99_tpot_ms:75:5
+#   bash sglc.sh --hard-stop-rules mean_tpot_ms:ge:100
 # ============================================================
+
+# 命令行参数解析: 覆盖脚本内的测试参数
+declare -a CLI_CASES=()
+while (( $# > 0 )); do
+  case "$1" in
+    --case)            CLI_CASES+=("${2:?--case 需要一个 'IN OUT' 参数}"); shift 2 ;;
+    --cases)           IFS=',' read -ra _cs <<< "${2:?--cases 需要 'a,b' 形式}"; CLI_CASES+=("${_cs[@]}"); shift 2 ;;
+    --sla-rules)       SLA_RULES="${2:?--sla-rules 需要参数}"; shift 2 ;;
+    --hard-stop-rules) HARD_STOP_RULES="${2:?--hard-stop-rules 需要参数}"; shift 2 ;;
+    -h|--help)
+      sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'
+      printf '\n用法: %s [--case "IN OUT"]... [--cases "a,b"] [--sla-rules R] [--hard-stop-rules R]\n' "$0"
+      exit 0 ;;
+    *) echo "[ERROR] 未知参数: $1 (用 --help 查看)" >&2; exit 2 ;;
+  esac
+done
 
 CASES=(
 #  "4 1"
@@ -238,6 +260,20 @@ CASES=(
 #  "128 1"
 #  "1024 1"
 )
+
+# 命令行 --case/--cases 优先于上面的默认列表
+if (( ${#CLI_CASES[@]} > 0 )); then
+  CASES=("${CLI_CASES[@]}")
+fi
+
+# case 格式校验: 必须为 "IN OUT" 两段
+for _case in "${CASES[@]}"; do
+  read -r _case_in _case_out _case_extra <<< "${_case}"
+  if [[ -z "${_case_in}" || -z "${_case_out}" || -n "${_case_extra:-}" ]]; then
+    echo "[ERROR] case 格式应为 'IN OUT' (单位 K), 当前: '${_case}'" >&2
+    exit 2
+  fi
+done
 
 
 # ============================================================
