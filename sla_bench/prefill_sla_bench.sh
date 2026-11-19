@@ -9,8 +9,8 @@
 #
 # 三流程 (脚本按 OUTPUT 与 --max-concurrency 自动判定):
 #  ① prefill 单测 (OUTPUT=1) — 绝不给客户端传 --max-concurrency
-#     rate=inf 扫描求最高吞吐 → 以 inf_rps 为基准按 --rate-step(0.1) 降率回测,
-#     求出满足 SLA (默认 mean TTFT 2|3|4 s) 的最大 rps。
+#     rate=inf 扫描求最高吞吐; 传了 SLA 参数时再以 inf_rps 为基准按
+#     --rate-step(0.1) 降率回测, 求出满足 SLA 的最大 rps; 不传则只出峰值。
 #  ② decode 限并发 (OUTPUT>1 且 --max-concurrency 传有限值)
 #     max_concurrency = bs, num_prompts = bs × --np-mult(默认 3),
 #     按 --np-list 逐档测试 (每档以其并发数下压), 默认不做 SLA 约束;
@@ -18,7 +18,9 @@
 #  ③ decode PD 模式 (OUTPUT>1 且 --max-concurrency 未传/inf)
 #     与 ① 完全同逻辑: 只用 --request-rate 限流, 按请求率回测。
 #
-# 回测规则:
+# 回测规则 (默认关闭, 需显式传 SLA 参数):
+#   默认只做阶段0 np 饱和扫描, 输出峰值吞吐; 只有传了 --sla-targets /
+#   --sla-metric / --sla-stop-ms / --sla 才继续阶段1 的 SLA 回测。
 #   阶段0 np 饱和扫描: rate=inf 下请求池从 --np-start 起按 --np-step 倍增,
 #     实测 rps 增益 >= --sat-gain% 才继续上打, 不足即止;
 #     best_np = 扫描中 rps 最大档; 给 --np-list 则跑固定列表(无自动止)。
@@ -45,9 +47,12 @@
 #       --np-mult M       decode 限并发时 请求数=并发×M (默认 3; prefill/PD 固定 1)
 #       --num-prompts N   固定单点 (等价 --np-list N, 跳过扫描)
 #       --sla-metric M     SLA 指标, ttft/tpot/itl × mean/p95/p99 共 9 种
-#                          (默认 mean_ttft_ms)
-#       --sla-targets S|.. 秒阈值列表 (默认 2|3|4)
-#       --sla-stop-ms N    decode 限并发升压早停阈值 ms (默认 0=不做 SLA 约束)
+#                          (默认 mean_ttft_ms; 传该参数即启用 SLA 回测)
+#       --sla-targets S|.. 秒阈值列表 (默认 2|3|4; 传该参数即启用 SLA 回测)
+#       --sla-stop-ms N    decode 限并发升压早停阈值 ms (默认 0=不做 SLA 约束;
+#                          传该参数即启用 SLA 回测)
+#       --sla              显式启用 SLA 回测 (使用上面的默认档位/指标)
+#       --no-sla           显式关闭 SLA 回测 (仅跑 np 饱和扫描, 默认行为)
 #       --rate-step F      固定降率步长 (默认 0.1, 仅 prefill/PD 回测)
 #       --backtest-pool-sec N  回测请求池秒数, pool=max(best_np, rate×N)
 #                          (默认 0=固定并发: 各档 num_prompts 都等于 best_np,
@@ -93,6 +98,9 @@ export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${SGLANG_PYTHONPATH:-/sgl-work
 SLA_METRIC="mean_ttft_ms"
 SLA_TARGETS="2|3|4"     # 默认 SLA 档位: mean TTFT 2|3|4 s
 SLA_STOP_MS=""          # decode 阶梯早停阈值 ms; 空/0=不早停 (默认不做 SLA 约束)
+# SLA 回测开关: 默认 0 = 只跑 np 饱和扫描, 不做降率回测。
+# 显式传 --sla-targets / --sla-metric / --sla-stop-ms / --sla 才置 1。
+SLA_ENABLE="${SLA_ENABLE:-0}"
 # 回测请求池: 0 = 固定并发 (各档 num_prompts 均 = best_np, 跨档/跨机器口径一致,
 #   只有请求率在变); N > 0 = pool = max(best_np, rate × N), 按请求率×时长放大池子
 #   压满 N 秒, 稳态压力更足但各档并发不同 (跨机器对比时口径不统一)。
@@ -157,9 +165,11 @@ while (( $# > 0 )); do
     --np-max)       NP_MAX="$2"; shift 2 ;;
     --np-list)      NP_LIST="$2"; shift 2 ;;
     --num-prompts)  NP_LIST="$2"; shift 2 ;;
-    --sla-metric)   SLA_METRIC="$2"; shift 2 ;;
-    --sla-targets)  SLA_TARGETS="$2"; shift 2 ;;
-    --sla-stop-ms)  SLA_STOP_MS="$2"; shift 2 ;;
+    --sla-metric)   SLA_METRIC="$2"; SLA_ENABLE=1; shift 2 ;;
+    --sla-targets)  SLA_TARGETS="$2"; SLA_ENABLE=1; shift 2 ;;
+    --sla-stop-ms)  SLA_STOP_MS="$2"; SLA_ENABLE=1; shift 2 ;;
+    --sla)          SLA_ENABLE=1; shift ;;
+    --no-sla)       SLA_ENABLE=0; shift ;;
     --backtest-pool-sec) BACKTEST_POOL_SEC="$2"; shift 2 ;;
     --health-retries)  HEALTH_RETRIES="$2"; shift 2 ;;
     --health-interval) HEALTH_INTERVAL="$2"; shift 2 ;;
@@ -657,6 +667,10 @@ for raw_case in "${CASES[@]}"; do
   # np_list 元素 C = --max-concurrency, num_prompts = C × eff_mult (默认 3)
   # 锁定档直接按 SLA_TARGETS 每档写一行, 早停由 --sla-stop-ms 控制 (默认 0 不早停)
   if (( decode_mode && conc_ladder )); then
+    if (( SLA_ENABLE == 0 )); then
+      log "[decode] 未指定 SLA 参数, 跳过 SLA 锁定行 (仅保留饱和扫描结果)"
+      continue
+    fi
     eff_mult="${NP_MULT:-3}"
     if [[ -n "$last_ok_np" ]]; then
       lock_type="decode_sla_lock"
@@ -695,6 +709,11 @@ for raw_case in "${CASES[@]}"; do
   fi
 
   # ---- SLA 回测: 单次降率扫描, 一个请求率跑一次同时判定所有 SLA 档 ----
+  # 未显式传 SLA 参数时默认不回测, 只保留上面的 np 饱和扫描结果。
+  if (( SLA_ENABLE == 0 )); then
+    log "[backtest] 未指定 SLA 参数 (--sla-targets/--sla-metric/--sla), 跳过回测"
+    continue
+  fi
   # 起点 = inf 扫描的最高 rps (实测值), 先按该请求率实跑一档, 再按 --rate-step 递减;
   # 降率过程中 TTFT 单调下降, 因此每档 rate 只需跑一次, 同时为所有未锁定档判定,
   # 天然避免"同一 rate 为不同 SLA 重复跑"的冗余记录。
