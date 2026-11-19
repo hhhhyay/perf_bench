@@ -117,7 +117,7 @@ if [[ -z "$GROUP" && -n "$MODEL" ]]; then
   GROUP="${MODEL%/}"; GROUP="${GROUP##*/}"
 fi
 GROUP="${GROUP:--}"
-PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"   # 空=启动后自动抓 /get_server_info
+PARALLEL_CONFIG="${PARALLEL_CONFIG:-}"   # 空=启动后自动抓 /server_info
 PCFG="$PARALLEL_CONFIG"
 MC_COL=""                                # 并发两列默认值 (解析后按 MAX_CONC 重建)
 MC_ROW=""                                # 并发阶梯逐行覆盖: 该档并发数
@@ -200,9 +200,19 @@ if (( DRY_RUN == 0 )); then
   log "server OK: $BASE_URL"
 fi
 
-# parallel_config 27 列自动识别: /get_server_info 任意层级找 *_size (sglang, 非 1 才拼)
+# parallel_config 27 列自动识别: /server_info 任意层级找 *_size (sglang, 非 1 才拼)
+# 服务端信息接口: 新版为 /server_info, 旧版为 /get_server_info (已 deprecated), 依次尝试
+fetch_server_info() {
+  local u out
+  for u in "${BASE_URL%/}/server_info" "${BASE_URL%/}/get_server_info"; do
+    out=$(curl -s --max-time 5 "$u" 2>/dev/null || true)
+    [[ -n "$out" ]] && { printf '%s' "$out"; return 0; }
+  done
+  return 0
+}
+
 if [[ -z "$PCFG" && "$DRY_RUN" == 0 ]]; then
-  info=$(curl -s --max-time 5 "${BASE_URL%/}/get_server_info" 2>/dev/null || true)
+  info=$(fetch_server_info)
   if [[ -n "$info" ]]; then
     PCFG=$("$PYTHON_BIN" - "$info" <<'PYPCFG'
 import json, sys
@@ -289,7 +299,7 @@ fi
 # Model 列以服务端实际部署为准: 客户端 MODEL 可能只是别名/挂载路径 (曾出现标签为
 # DeepSeek 但服务端实际是 GLM 的情况)。显式传 GROUP 时不覆盖。
 if [[ -z "$GROUP_ENV" && "$DRY_RUN" == 0 ]]; then
-  [[ -n "${info:-}" ]] || info=$(curl -s --max-time 5 "${BASE_URL%/}/get_server_info" 2>/dev/null || true)
+  [[ -n "${info:-}" ]] || info=$(fetch_server_info)
   srv_model=$(printf '%s' "${info:-}" | "$PYTHON_BIN" -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(0)
