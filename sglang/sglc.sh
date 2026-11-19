@@ -12,7 +12,7 @@
 #    自动 BS 扫描围绕最终 effective theoretical BS，而不是只围绕 KV token 理论值。
 # 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory 前侧加密点（不超过 theory）与 SLA inline 连续加密
 # 5) 支持 mean_tpot_ms 硬停止阈值；达到阈值立即停止当前 case 后续 BS
-# 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL
+# 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL；--cache-report(默认开) 的命中率一并解析出列
 # 7) K 口径由 TOKEN_UNIT 控制，默认 1024；可设为 1000 使用十进制 K
 # ============================================================
 
@@ -178,6 +178,12 @@ HARD_STOP_RULES="${HARD_STOP_RULES:-}"
 
 USE_FAKE_PREFILL="${USE_FAKE_PREFILL:-0}"
 
+# 官方 bench_serving --cache-report：在日志里打印 Cache Hit Details
+# (Total prompt tokens / Total cached tokens / Device·Host·Storage / Cache hit rate)，
+# 汇总时解析为 sum_all.csv 的 cache_hit_rate_pct / total_cached_tokens 列。
+# 默认 1=开启；CACHE_REPORT=0 或 CLI --no-cache-report 可关闭。
+CACHE_REPORT="${CACHE_REPORT:-1}"
+
 # ============================================================
 # 固定并发接口（可选）
 #
@@ -251,9 +257,11 @@ while (( $# > 0 )); do
     --cases)           IFS=',' read -ra _cs <<< "${2:?--cases 需要 'a,b' 形式}"; CLI_CASES+=("${_cs[@]}"); shift 2 ;;
     --sla-rules)       SLA_RULES="${2:?--sla-rules 需要参数}"; shift 2 ;;
     --hard-stop-rules) HARD_STOP_RULES="${2:?--hard-stop-rules 需要参数}"; shift 2 ;;
+    --cache-report)    CACHE_REPORT=1; shift ;;
+    --no-cache-report) CACHE_REPORT=0; shift ;;
     -h|--help)
       sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'
-      printf '\n用法: %s [--case "IN OUT"]... [--cases "a,b"] [--sla-rules R] [--hard-stop-rules R]\n' "$0"
+      printf '\n用法: %s [--case "IN OUT"]... [--cases "a,b"] [--sla-rules R] [--hard-stop-rules R] [--cache-report|--no-cache-report]\n' "$0"
       exit 0 ;;
     *) echo "[ERROR] 未知参数: $1 (用 --help 查看)" >&2; exit 2 ;;
   esac
@@ -878,6 +886,9 @@ SPECIAL_KEYS = {
     "Benchmark duration (s)": "benchmark_duration_s",
     "Total input tokens": "total_input_tokens",
     "Total input text tokens": "total_input_text_tokens",
+    "Total prompt tokens": "total_prompt_tokens",
+    "Total cached tokens": "total_cached_tokens",
+    "Cache hit rate": "cache_hit_rate_pct",
     "Total generated tokens": "total_generated_tokens",
     "Total generated tokens (retokenized)": "total_generated_tokens_retokenized",
     "Request throughput (req/s)": "request_throughput",
@@ -1044,7 +1055,11 @@ def parse_log(path):
         value = match.group(2).strip()
         if not label:
             continue
-        result[normalize_key(label)] = parse_value(value)
+        key = normalize_key(label)
+        # cache-report 的命中率形如 "45.3%"，去掉百分号按数值保存
+        if key == "cache_hit_rate_pct":
+            value = value.rstrip("%").strip()
+        result[key] = parse_value(value)
     return result, True
 
 
@@ -1222,6 +1237,10 @@ preferred_columns = [
     "total_generated_tokens",
     "total_generated_tokens_retokenized",
 
+    # 官方 cache-report 实测值（未开启时为 0/空）
+    "cache_hit_rate_pct",
+    "total_cached_tokens",
+
     # 额外统计：只保留与前面 mean/p95/p99 不重复的维度
     "std_e2e_latency_ms",
     "p75_e2e_latency_ms",
@@ -1341,6 +1360,11 @@ hidden_columns = {
     "p50_tpot_ms",
     "median_itl_ms",
     "p50_itl_ms",
+    # cache-report 明细：与 total_cached_tokens 语义重复或过于细分，不单独出列
+    "total_prompt_tokens",
+    "device",
+    "host",
+    "storage",
 }
 
 extra_columns = sorted(
@@ -1487,6 +1511,7 @@ echo "CUDA_GRAPH_BS     : ${CUDA_GRAPH_DECODE_BS:-FALLBACK_DP_LAYOUT}"
 echo "SLA DENSE          : enable=${SLA_DENSE_ENABLE} rules=${SLA_RULES} mode=inline"
 echo "HARD STOP          : rules=${HARD_STOP_RULES:-OFF} (after SLA inline dense)"
 echo "USE_FAKE_PREFILL : ${USE_FAKE_PREFILL}"
+echo "CACHE_REPORT     : ${CACHE_REPORT}"
 echo "TEST_MODE        : $(get_test_mode_name)"
 echo "FIXED_PER_DP_BS  : ${FIXED_PER_DP_BS:-AUTO}"
 echo "FIXED_CONCURRENCY: ${FIXED_CONCURRENCY:-AUTO}"
@@ -1562,6 +1587,10 @@ run_one_bs() {
 
   if (( USE_FAKE_PREFILL == 1 )); then
     cmd+=(--fake-prefill)
+  fi
+
+  if (( CACHE_REPORT == 1 )); then
+    cmd+=(--cache-report)
   fi
 
   write_log_header "${log_file}"
