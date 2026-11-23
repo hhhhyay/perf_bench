@@ -12,7 +12,7 @@
 #    自动 BS 扫描围绕最终 effective theoretical BS，而不是只围绕 KV token 理论值。
 # 4) BS 扫描：优先使用 /server_info decode CUDA Graph BS；拿不到时回退 DP_SIZE 布局；再叠加 effective-theory 前侧加密点（不超过 theory）与 SLA inline 连续加密
 # 5) 支持 mean_tpot_ms 硬停止阈值；达到阈值立即停止当前 case 后续 BS
-# 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL
+# 6) 汇总 log -> sum_all.csv，不保存逐请求 JSONL；--cache-report(默认开) 的命中率一并解析出列
 # 7) K 口径由 TOKEN_UNIT 控制，默认 1024；可设为 1000 使用十进制 K
 # ============================================================
 
@@ -25,6 +25,9 @@ source "${script_dir}/sglc_bs_helpers.sh"
 # 1. 基础配置
 # ============================================================
 
+# 显式传 RUN_ID 时, 目录名会再追加时间戳, 避免重复任务覆盖旧结果
+RUN_ID_EXPLICIT=0
+[[ -n "${RUN_ID:-}" ]] && RUN_ID_EXPLICIT=1
 run_id="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 NODE_HOSTNAME="${NODE_HOSTNAME:-$(hostname 2>/dev/null || printf 'unknown')}"
@@ -34,7 +37,12 @@ SGLC_PLOT_BIN="${SGLC_PLOT_BIN:-python3}"
 SGLC_PLOT="${SGLC_PLOT:-1}"
 SGLC_PLOT_CELL="${SGLC_PLOT_CELL:-rps}"
 
-out_dir="./all_result/bench_theory_bs_${run_id}"
+# 显式 run_id 一律再追加时间戳; 未显式传时 run_id 自己就是时间戳
+if (( RUN_ID_EXPLICIT )); then
+  out_dir="./all_result/bench_theory_bs_${run_id}_$(date +%Y%m%d_%H%M%S)"
+else
+  out_dir="./all_result/bench_theory_bs_${run_id}"
+fi
 log_dir="${out_dir}/logs"
 
 mkdir -p "${log_dir}"
@@ -103,6 +111,10 @@ BASE_URL="${BASE_URL:-http://12.12.12.37:10015}"
 # 空则尝试从 /metrics 的 model_name 标签自动解析
 MODEL="${MODEL:-/public4/opendas/DL_DATA/llm-models/DeepSeek-V4-Flash-0731-FP8-Channel}"
 
+# sum_all.csv 的 Model 列：优先 GROUP，其次取 MODEL 路径末段模型名，都没有则 '-'
+MODEL_LABEL="${GROUP:-$(printf '%s' "${MODEL}" | sed -E 's#/+$##; s#.*/##')}"
+MODEL_LABEL="${MODEL_LABEL:--}"
+
 
 # DP 数：默认从 /metrics 自动识别 dp_rank 数量。
 # 如 metrics 无 dp_rank，可通过环境变量 DP_SIZE 手动回退。
@@ -166,6 +178,12 @@ HARD_STOP_RULES="${HARD_STOP_RULES:-}"
 
 USE_FAKE_PREFILL="${USE_FAKE_PREFILL:-0}"
 
+# 官方 bench_serving --cache-report：在日志里打印 Cache Hit Details
+# (Total prompt tokens / Total cached tokens / Device·Host·Storage / Cache hit rate)，
+# 汇总时解析为 sum_all.csv 的 cache_hit_rate_pct / total_cached_tokens 列。
+# 默认 1=开启；CACHE_REPORT=0 或 CLI --no-cache-report 可关闭。
+CACHE_REPORT="${CACHE_REPORT:-1}"
+
 # ============================================================
 # 固定并发接口（可选）
 #
@@ -223,7 +241,31 @@ esac
 # 4 1      => 4K in / 1K out
 # 0.5 1    => 默认 512 in / 1024 out
 # 1024 1   => 默认 1M in / 1K out
+#
+# 用例可直接从命令行传入, 不再需要改脚本:
+#   bash sglc.sh --case "8 1" --case "16 1"
+#   bash sglc.sh --cases "8 1,16 1,128 1"
+#   bash sglc.sh --sla-rules mean_tpot_ms:50:5,p99_tpot_ms:75:5
+#   bash sglc.sh --hard-stop-rules mean_tpot_ms:ge:100
 # ============================================================
+
+# 命令行参数解析: 覆盖脚本内的测试参数
+declare -a CLI_CASES=()
+while (( $# > 0 )); do
+  case "$1" in
+    --case)            CLI_CASES+=("${2:?--case 需要一个 'IN OUT' 参数}"); shift 2 ;;
+    --cases)           IFS=',' read -ra _cs <<< "${2:?--cases 需要 'a,b' 形式}"; CLI_CASES+=("${_cs[@]}"); shift 2 ;;
+    --sla-rules)       SLA_RULES="${2:?--sla-rules 需要参数}"; shift 2 ;;
+    --hard-stop-rules) HARD_STOP_RULES="${2:?--hard-stop-rules 需要参数}"; shift 2 ;;
+    --cache-report)    CACHE_REPORT=1; shift ;;
+    --no-cache-report) CACHE_REPORT=0; shift ;;
+    -h|--help)
+      sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'
+      printf '\n用法: %s [--case "IN OUT"]... [--cases "a,b"] [--sla-rules R] [--hard-stop-rules R] [--cache-report|--no-cache-report]\n' "$0"
+      exit 0 ;;
+    *) echo "[ERROR] 未知参数: $1 (用 --help 查看)" >&2; exit 2 ;;
+  esac
+done
 
 CASES=(
 #  "4 1"
@@ -234,6 +276,20 @@ CASES=(
 #  "128 1"
 #  "1024 1"
 )
+
+# 命令行 --case/--cases 优先于上面的默认列表
+if (( ${#CLI_CASES[@]} > 0 )); then
+  CASES=("${CLI_CASES[@]}")
+fi
+
+# case 格式校验: 必须为 "IN OUT" 两段
+for _case in "${CASES[@]}"; do
+  read -r _case_in _case_out _case_extra <<< "${_case}"
+  if [[ -z "${_case_in}" || -z "${_case_out}" || -n "${_case_extra:-}" ]]; then
+    echo "[ERROR] case 格式应为 'IN OUT' (单位 K), 当前: '${_case}'" >&2
+    exit 2
+  fi
+done
 
 
 # ============================================================
@@ -423,19 +479,29 @@ d=json.load(sys.stdin)
 tp=d.get("tp_size"); dp=d.get("dp_size"); pp=d.get("pp_size"); ep=d.get("ep_size")
 acp=d.get("attn_cp_size"); dpa=d.get("enable_dp_attention")
 kv=d.get("kv_cache_dtype")
-mem=d.get("mem_fraction_static")
-if mem is None and isinstance(d.get("server_args"), dict):
-    mem=d["server_args"].get("mem_fraction_static")
-cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
 def sv(v):
     if isinstance(v,bool): return "true" if v else "false"
     return "" if v is None else str(v)
-print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))))' 2>/dev/null \
+# MEM: 优先 server_args 里实际传入的参数 (原样, 不做小数位格式化), 取不到才回退 effective
+sa=d.get("server_args") if isinstance(d.get("server_args"), dict) else {}
+mem=sa.get("mem_fraction_static")
+eff=d.get("mem_fraction_static")
+if sv(mem) and sv(eff) and sv(mem)!=sv(eff):
+    print("[mem] launch=%s effective=%s" % (sv(mem), sv(eff)), file=sys.stderr)
+if mem is None:
+    mem=eff
+# Model: 服务端 served_model_name (只看模型名, 不取 model_path 路径)
+m=d.get("served_model_name")
+if isinstance(m,list): m=m[0] if m else None
+m=str(m).strip() if m else ""
+m=m.rstrip("/"); m=m.split("/")[-1] if m else ""
+cfg=d.get("cuda_graph_config") or {}; dec=cfg.get("decode") or {}; bs=dec.get("bs") or []
+print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(int(x)) for x in bs if isinstance(x,(int,float))),sv(m))' 2>/dev/null \
     || true
   )"
 
   if [[ -n "${values}" ]]; then
-    read -r _tp _dp _pp _ep _acp _dpa _kv _mem _cudabs <<< "${values}"
+    read -r _tp _dp _pp _ep _acp _dpa _kv _mem _cudabs _model <<< "${values}"
     [[ -n "${_tp}" ]] && TP_SIZE="${_tp}"
     [[ -n "${_dp}" ]] && DP_SIZE="${_dp}"
     [[ -n "${_pp}" ]] && PP_SIZE="${_pp}"
@@ -451,6 +517,11 @@ print(sv(tp),sv(dp),sv(pp),sv(ep),sv(acp),sv(dpa),sv(kv),sv(mem),",".join(str(in
     PARALLEL_CONFIG="TP${TP_SIZE:-NA}-DP${DP_SIZE:-NA}(${attn_tag})-PP${PP_SIZE:-NA}-EP${EP_SIZE:-NA}-ACP${ATTN_CP_SIZE:-NA}-KV${KV_CACHE_DTYPE:-NA}-MEM${MEM_FRACTION_STATIC:-NA}"
 
     echo "[INFO] server_info: ${PARALLEL_CONFIG}"
+    # CSV Model 列以服务端实际部署为准 (显式传 GROUP 时不覆盖)
+    if [[ -n "${_model}" && -z "${GROUP:-}" ]]; then
+      MODEL_LABEL="${_model}"
+      echo "[INFO] model: ${MODEL_LABEL} (服务端)"
+    fi
     if [[ -n "${CUDA_GRAPH_DECODE_BS}" ]]; then
       echo "[INFO] server_info decode cuda graph bs: ${CUDA_GRAPH_DECODE_BS}"
     else
@@ -779,7 +850,8 @@ python3 - \
   "${MAX_RUNNING_REQUESTS}" \
   "${NUM_PROMPTS_MULTIPLIER}" \
   "${PARALLEL_CONFIG:-UNKNOWN}" \
-  "${TOKEN_UNIT}" <<'PY'
+  "${TOKEN_UNIT}" \
+  "${MODEL_LABEL}" <<'PY'
 
 import csv
 import math
@@ -795,6 +867,7 @@ max_running_requests = int(sys.argv[5])
 num_prompts_multiplier = int(sys.argv[6])
 parallel_config = sys.argv[7]
 token_unit = int(sys.argv[8])
+model_label = sys.argv[9] or "-"
 
 pattern = re.compile(
     r"(?P<case>.+?)"
@@ -813,6 +886,9 @@ SPECIAL_KEYS = {
     "Benchmark duration (s)": "benchmark_duration_s",
     "Total input tokens": "total_input_tokens",
     "Total input text tokens": "total_input_text_tokens",
+    "Total prompt tokens": "total_prompt_tokens",
+    "Total cached tokens": "total_cached_tokens",
+    "Cache hit rate": "cache_hit_rate_pct",
     "Total generated tokens": "total_generated_tokens",
     "Total generated tokens (retokenized)": "total_generated_tokens_retokenized",
     "Request throughput (req/s)": "request_throughput",
@@ -979,7 +1055,11 @@ def parse_log(path):
         value = match.group(2).strip()
         if not label:
             continue
-        result[normalize_key(label)] = parse_value(value)
+        key = normalize_key(label)
+        # cache-report 的命中率形如 "45.3%"，去掉百分号按数值保存
+        if key == "cache_hit_rate_pct":
+            value = value.rstrip("%").strip()
+        result[key] = parse_value(value)
     return result, True
 
 
@@ -1064,6 +1144,7 @@ for input_len, output_len, perdp, log_path, match in log_files:
 
     theoretical_global_bs = theoretical_bs * dp_size
 
+    row["model"] = model_label
     row["case_name"] = case_name
     row["input_len"] = input_len
     row["output_len"] = output_len
@@ -1116,6 +1197,7 @@ for input_len, output_len, perdp, log_path, match in log_files:
 
 preferred_columns = [
     # 固定核心列：前面统一展示，后面不再追加语义重复字段
+    "model",
     "case_name",
     "input_len",
     "output_len",
@@ -1154,6 +1236,10 @@ preferred_columns = [
     "total_input_text_tokens",
     "total_generated_tokens",
     "total_generated_tokens_retokenized",
+
+    # 官方 cache-report 实测值（未开启时为 0/空）
+    "cache_hit_rate_pct",
+    "total_cached_tokens",
 
     # 额外统计：只保留与前面 mean/p95/p99 不重复的维度
     "std_e2e_latency_ms",
@@ -1274,6 +1360,11 @@ hidden_columns = {
     "p50_tpot_ms",
     "median_itl_ms",
     "p50_itl_ms",
+    # cache-report 明细：与 total_cached_tokens 语义重复或过于细分，不单独出列
+    "total_prompt_tokens",
+    "device",
+    "host",
+    "storage",
 }
 
 extra_columns = sorted(
@@ -1420,6 +1511,7 @@ echo "CUDA_GRAPH_BS     : ${CUDA_GRAPH_DECODE_BS:-FALLBACK_DP_LAYOUT}"
 echo "SLA DENSE          : enable=${SLA_DENSE_ENABLE} rules=${SLA_RULES} mode=inline"
 echo "HARD STOP          : rules=${HARD_STOP_RULES:-OFF} (after SLA inline dense)"
 echo "USE_FAKE_PREFILL : ${USE_FAKE_PREFILL}"
+echo "CACHE_REPORT     : ${CACHE_REPORT}"
 echo "TEST_MODE        : $(get_test_mode_name)"
 echo "FIXED_PER_DP_BS  : ${FIXED_PER_DP_BS:-AUTO}"
 echo "FIXED_CONCURRENCY: ${FIXED_CONCURRENCY:-AUTO}"
@@ -1495,6 +1587,10 @@ run_one_bs() {
 
   if (( USE_FAKE_PREFILL == 1 )); then
     cmd+=(--fake-prefill)
+  fi
+
+  if (( CACHE_REPORT == 1 )); then
+    cmd+=(--cache-report)
   fi
 
   write_log_header "${log_file}"
