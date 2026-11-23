@@ -12,7 +12,10 @@ perf_bench/
 │   ├── gsp_prefix_bench.sh # 统一的 Prefill/GSP TTFT/TPOT 容量压测入口
 │   ├── gsp_prefix_metrics.py # benchmark 日志解析与 trials CSV
 │   ├── gsp_prefix_summary.py # summary TSV 生成与正式 trial 清理
-│   └── gsp_prefix_plot.py # Prefill/GSP 容量矩阵作图
+│   ├── gsp_prefix_plot.py # Prefill/GSP 容量矩阵作图
+│   ├── prof_capture.sh # 在线抓 torch profiler (CPU/GPU) + 自动分析
+│   ├── prof_analyze.py # trace 汇总: GPU busy / kernel TopN / CPU 顶层 op / 空档分桶 / 通信子类
+│   └── prof_dashboard.py # 分析产物 → 自包含 HTML 可视化看板 (对账/类目/rank/空泡/调度通信)
 └── vllm/
     ├── vllmc.sh     # vLLM Prefix-Salt 标准容量压测
     ├── vllm_bench_metrics.py # vLLM benchmark 公共指标解析与 Prefill 回测核心
@@ -243,6 +246,167 @@ BS 或并发 workload，格子选择满足 SLA 的最大实际 RPS 或输出 tok
 
 脚本支持 `--dry-run` 核对官方命令而不连接服务；同一 `RUN_ID` 重新执行时会跳过已有成功
 日志。缺少 `--cache-report` 或 benchmark 失败时保留日志并标记为失败，不用理论值伪造实测命中率。
+
+### SGLang: `sglang/prof_capture.sh` + `prof_analyze.py` + `prof_dashboard.py`
+
+在线抓取服务端 torch profiler（`/start_profile`），并在抓完后直接产出可读摘要与 HTML 可视化看板。
+
+- 支持 `--mode prefill|decode`：prefill 默认 4096 in / 1 out / 5 步，decode 默认 4096 in / 1024 out / 10 步。
+- `--start-step` 对应 `/start_profile` 的 `start_step`，是服务端的**绝对** forward 计数
+  （服务端取 `max(start_step, forward_ct+1)`），在已经有流量的服务上并不等于“再等 5 步”。
+- “等稳定了再抓”由**负载就绪门控**实现：脚本轮询 `/v1/loads` 的 `num_running_reqs`
+  （不可用时回退 `/metrics` 的 `sglang:num_running_reqs`），相对起压前基线增长到
+  `--load-need`（decode 默认等于 `--bs`，prefill 默认 4）且连续 3 次采样（约 6s）保持后，
+  再等 `--wait-sec`（prefill 默认 8s、decode 默认 20s）才发 `/start_profile`。
+  驱动启动要先 import sglang，高负载节点上约 40s，固定秒数盲等会抓到空闲步
+  或同一服务上其他人的流量；等待上限由 `--ready-timeout`（默认 240s）控制，超时直接报错而不是产出空 trace。
+- 内置负载驱动按模式区分：
+  - **decode**：`python3 -m sglang.bench_serving`（与 `sglc.sh` 完全一致，`--max-concurrency BS`，
+    `random-ids` 冷输入）。decode 没有 prefix cache 命中率概念，不需要 `prefix_hit.py` 的共享前缀逻辑。
+  - **prefill**：`sla_bench/prefix_hit.py`，用 `PREFIX_HIT` 控制共享前缀比例（0=冷）。
+  驱动预检按模式查具体子模块（decode 查 `sglang.bench_serving`，prefill 查 `sglang.benchmark`），
+  避免“装了顶层 `sglang` 但缺 benchmark”时漏过。
+  decode 可加 `--fake-prefill` 透传给 `bench_serving`：客户端会往请求体注入
+  `bootstrap_host`/`bootstrap_room`，让带 `--disaggregation-transfer-backend fake` 的
+  PD decode 实例跳过真实 prefill KV 传输，只压纯 decode。普通单机服务没有该后端，传了不会生效
+  （请求仍走真实 prefill），prefill 模式下显式报错。
+  已有外部流量时用 `--no-driver` 只负责抓取（同样会等确认到有请求在跑）。
+  `--flush-cache` 在每次驱动启动前 `POST /flush_cache` 清空 radix/prefix cache：
+  SEED 固定时第二轮驱动会命中第一轮的 prompt 前缀 cache，吞吐虚高且不可复现；
+  性能基准轮和抓取轮各清一次。
+  `--perf-first` 在抓取前先用同样负载完整跑一遍作为客户端性能基准（输出到
+  `<local>/perf_pass/driver.jsonl`，脚本直接打印 Mean TPOT/吞吐等指标），
+  再清 cache 进入抓取轮，用于把 prof 步长时间与客户端实测对账：
+  `客户端 Mean TPOT ≈ prof 每步耗时 / accept_length`。
+  `--no-driver` 时 `--perf-first` 没有内置负载可跑，跳过基准轮并告警。
+- `--output-dir` 是服务端可见路径；当共享存储在客户端映射成另一个路径时，用
+  `--local-trace-dir` 指向客户端视图，用于轮询和离线分析。
+- 轮询 `*.trace.json.gz` 直到 tp_size 个 rank 全部落盘；服务端先建 0 字节文件、抓完才写入，
+  所以按 `-size +0c` 计数，再用“大小连续两次不变 + `gzip -t` 全部通过”判定写完，避免读到半截文件。
+- `num_steps` 到点只是**停止采集**，写盘（8 个几十 MB 的 gzip）可能比采集本身慢一个量级：
+  nmz35 上 decode 采 10 步只用几十秒，8×50MB 的文件却在 `start_profile` 之后约 11 分钟才写齐。
+  因此 `--capture-timeout` 默认 1800s，等待期间每 30s 打印一次“有内容 N 个 / 空文件 N 个”的进度；
+  驱动负载提前结束时也不会立刻放弃，而是继续等服务端把文件写完。
+- 抓完后立即结束驱动负载；已经发到服务端的 decode 请求不会被撤销，`num_running_reqs`
+  需要一段时间才回落到 0，共享实例上连续抓多次时注意留出回落时间。
+- `prof_analyze.py` 只依赖标准库，输出 `prof_summary.md`、`prof_kernels.csv`、`prof_ranks.csv`：
+  每个 rank 的 GPU busy 占比、kernel 累计时长 TopN、GPU memcpy/memset、CPU 顶层 op 独占时长 TopN；
+  另输出调度/通信两份扩展 CSV：`prof_sched.csv`（每 rank GPU 空档分桶（<10µs / 10~100µs / 0.1~1ms / ≥1ms
+  的次数与合计 ms）、通信聚合（deep_ep dispatch / combine / notify 子类与 allreduce/allgather 等集合通信，
+  占比按 span 计）、`head_gap_ms` / `tail_gap_ms` / `span_active_ms`（去窗口边界空档的有效窗口）、
+  `comm_exposed_ms` / `comm_hidden_ms`（通信暴露 = 通信区间未与算力/memcpy 重叠的时长，串行流≈100%）、
+  `bcc_n` / `bcc_ms`（内部距通信 ≤100µs 的空档））、`prof_gaps_top.csv`（每 rank Top10 大空档：
+  距窗口起点偏移 rel_ms、时长、归因 band（B=窗口边界、C=紧邻通信、G=其他）、距通信 µs）。
+- **口径说明（重要）**：`GPU busy` 含通信/memcpy、按整窗 span 计，是对账/回归基线，勿与其它口径混用；
+  每步 TPOT/吞吐改用 `span_active`（span − 窗口首尾空档，剔除 profiler 起停与上一批调度残留）。
+  旧版 `comm_overlap_pct`（空档∩通信）恒为 0 属结构性错误——busy 已含通信，空档是 busy 补集，
+  与通信区间永不相交；现由 `comm_exposed`（通信暴露）取代。band=B 的空档不计入每步耗时。
+- 分析器按 4 MB 解压文本一批做整体反序列化、解析期间关闭 GC、并对多个 rank 文件多进程并行
+  （`--jobs`，默认 min(8, 文件数, 核数)）。实测 nmz35 的 decode 数据 8 个 rank × 69 MB gzip
+  （每 rank 37.5 万条事件）`--jobs 8` 总耗时 12.6s；另用 8 个 rank × 69 MB 合成 trace
+  （每 rank 1167 万条事件）与逐条 `json.raw_decode` 严格解析对比，span / GPU busy / kernel
+  累计时长逐项一致，并行耗时 47s（单文件串行 44s）。
+- CPU op 事件数量随 torch.compile 增长，默认每文件只分析前 50 万条并在摘要中标注截断，
+  需要完整结果时加 `--cpu-ops-limit 0`。
+- **每次 prof 自动产出 HTML 可视化看板**：`prof_capture.sh` 在分析步自动调用 `prof_dashboard.py`
+  生成 `<dir>/prof_dashboard.html`（自包含单文件，无第三方依赖，失败只告警不影响摘要）。
+  面板含：顶部 chips 自动显示并行方式与运行配置——并行维度从 trace 文件名 `*-TP-x-DP-y-EP-z` 解析
+  （如 decode 为 TP8/DP8/EP8），MTP/speculative 算法及步数、CUDA Graph 开关、tbo、overlap 调度
+  从目录内 `server_info.json`（prof_capture 抓取后自动保存的服务端参数快照）读取，accept 率取
+  `--accept` 或 driver 实测；旧目录缺 server_info.json 时显示「配置未知」，端到端对账
+  （prof wall/busy 每 step vs 客户端 `TPOT×accept`（decode）或 `TTFT`（prefill），
+  经验签名 +12~17%/+3~8% 判 ✓/△）、kernel 类目构成环图、Top10 kernel、各 rank 对称性
+  （busy 差距 >1.5pp 标 ⚠）、空泡 (GPU idle) 诊断与改进建议（判级 <5% ✓ / 5~15% △ / >15% ⚠，
+  按 Perfetto 空档形态给出归因与改进：launch gap→开图、通信等待→tbo/负载均衡、memcpy→显存管理、
+  MTP 切换→spec 联调、窗口边界空档已自动扣除；并注明 CUPTI/禁图抓取对空泡的本底放大；
+  有 prof_sched.csv 时追加「本窗口实测 → 空泡改进优先级」数据驱动建议：窗口边界空档（band=B，
+  采集起停+调度残留）自动扣除并重判有效空泡等级（如整窗 8.7% △ → 去边界 0.1% ✓）、
+  按有效空档形态给优先级 1 抓手（launch gap 主导→开图/torch.compile/绑核，
+  内部紧邻通信空档主导→tbo/EPLB/慢 rank 单查）、通信暴露（未与算力重叠，串行流≈100%）
+  给出 tbo 可覆盖上限、deep_ep 占比 ≥5% 提示通算 overlap 收益、rank 空档不均时提示
+  「busy 最低 + 内部空档最多」才是慢侧、memcpy/memset 超 3% 提示显存管理）、
+  ⑦ 调度与通信（每 rank 空档分桶表：边界空档 ms / 有效空档率 / 通信暴露 ms 与占比 + 形态判读；
+  deep_ep 子类表 + 通信/算力比（算力=busy−comm）+ 暴露/隐藏拆分；全 rank Top 大空档表给出
+  rel_ms、band 与距通信 µs 供 Perfetto 平移定位。注意通信 kernel 时长含「早到者」自旋等待，
+  comm 高不一定是慢 rank。旧产物缺这两个 CSV 时面板给重跑提示，对已有 trace 重跑
+  `prof_analyze.py` 即可补齐，无需重抓）
+  与 Perfetto 使用提示。对账数据自动读取 `<dir>/driver.jsonl`
+  或 `--perf-first` 的 `<dir>/perf_pass/driver.jsonl`。结果目录无写权限时回退写到当前目录
+  （容器内 root 创建的目录常见）。也可手动单独生成：
+
+```bash
+python3 sglang/prof_dashboard.py /path/to/profiles --mode decode \
+  --num-steps 10 --bs 64 --case '4k,1024,0'
+```
+
+- 只用核心参数时：
+
+```bash
+bash sglang/prof_capture.sh --mode decode  --case '4k,1024,0' --bs 32
+bash sglang/prof_capture.sh --mode prefill --case '4096,1,0'
+```
+
+- 服务端目录与客户端不一致时：
+
+```bash
+bash sglang/prof_capture.sh --mode prefill --case '4k,1,0' \
+  --output-dir /mnt11/prof_prefill --local-trace-dir /public/home/guobj/prof_prefill
+```
+
+- 只分析已有 trace（不重新抓取）：
+
+```bash
+python3 sglang/prof_analyze.py /path/to/profiles --mode decode --top 20
+```
+
+- trace 目录由服务端（容器内 root）创建时客户端可能没有写权限，此时用 `--out-dir` 把
+  `prof_summary.md` / `prof_kernels.csv` / `prof_ranks.csv` / `prof_sched.csv` / `prof_gaps_top.csv`
+  写到可写目录；分析本身只需读权限。
+
+#### nmz35 验证记录（GLM-5.3 TP8/EP8/CP8，`--disable-cuda-graph`）
+
+- prefill `--case '4096,1,0' --num-steps 5`（端到端）：8 个 rank trace 全部落盘，
+  每个 191612 条事件、26120 个 kernel；单 rank 时间跨度 10.15s、GPU busy 93.9%～97.1%
+  （合计 78.48s / 81.18s，占比 96.7%，空档 2.69s），并行分析 6.6s。Top kernel 为
+  `sparse_attn_fwd_kernel`（20.8%）、`deep_ep::intranode::cached_notify_combine_kernel`（16.6%）、
+  `m_grouped_fp8_gemm_nt_contiguous_wasp_pair32`（9.6%）。该次起压前基线为 0，
+  就绪判定等到 56 并发稳定 3 次采样（约 41s，覆盖驱动 `import sglang` 时间）后才发 `start_profile`。
+- decode `--case '4096,1024,0' --bs 32 --num-steps 10`（端到端 `RC=0`）：8 个 rank 全部落盘，
+  每个约 59MB gzip、326080 条事件、45350 个 kernel；单 rank 时间跨度 3.94s、GPU busy
+  82.8%～84.0%（合计 26.33s / 31.54s，占比 83.5%，空档 5.21s），并行分析 10.2s。Top kernel 为
+  `m_grouped_fp8_gemm_nt_contiguous_wasp_pair32`（29.4%）、
+  `flash_fwd_headshare8_ropewait_mla_fp8_sparse_kernel`（28.0%）、
+  `deep_ep::intranode::combine`（4.7%）、`cached_notify_combine_kernel`（3.2%）。
+  该次抓取前 `num_running_reqs` 基线为 6，就绪判定等到 34 并发稳定 3 次采样后才发 `start_profile`；
+  抓完驱动负载被正确回收（无残留 `bench_serving` 进程）。
+- 若抓取窗口里混入了 prefill 尾部队列（例如上一轮请求还没排空），单 rank 时间跨度会从 4s 涨到
+  12s 量级、事件数升到 374697，busy 也会被抬到 95% 左右——这类数据仍可分析，但不再是纯 decode 稳态。
+- 同一份 8×70MB 数据在改动前（逐事件 `buf = buf[end:]` 切片）629s 仍未解析完第一个文件，
+  现在按 4MB 分批 + 多进程并行后 10～13s 完成。
+
+#### decode 窗口与客户端 TPOT 的口径差异
+
+profile 抓到的是**纯 decode 窗口**：BS32 × 输出 1024 时，队列里其余请求要等前 32 条完成才进入，
+`--wait-sec 20` 落在“32 条请求全部 prefill 完成、无新 prefill 插入”的区间
+（可用 trace 里 `sparse_attn_fwd_kernel` 计数为 0 佐证）。此时实测单步 394ms
+（GPU busy 329ms + 空档 65ms）、按 accept length 3.57 折合每 token 约 110ms。
+
+而客户端长期平均的 TPOT 包含**持续 prefill 抢占**：同参数 512 prompts 实测
+Output 138.3 tok/s、Concurrency 31.4、Accept 3.57、Mean TPOT 216.7ms，
+反推单步 770～810ms，约为 prof 窗口的 2 倍。两者差的是 prefill 混入，不是分析误差。
+
+要让 profile 代表客户端实际观测到的稳态，把抓取点后移到请求开始周转之后
+（例如 `--case 4096,1024,0 --bs 32 --wait-sec 115`），或用 `--no-driver` 直接对
+`sglc.sh` 的压测流量取样。反之，想单独看 decode 算子开销就保持默认的纯 decode 窗口。
+
+#### 与郑州 `超节点/prefill_zz/4k` 的一致性
+
+同一模型（GLM-5.3-Channel-FP8-w8a8）、同一 8 卡配置下，两边结果一致：
+`sparse_attn_fwd_kernel` 单次调用 6.768ms vs 6.806ms（差 0.6%）、份额同为 20.8%；
+按 79 层折算每 forward 2.54s vs 2.47s（差 2.6%）；`m_grouped_fp8_gemm`（9.6%+7.6% vs 16.6%）、
+`cached_notify_combine`（16.6% vs 15.2%）、`combine`（7.4% vs 7.4%）、`dispatch`（4.2% vs 4.2%）
+份额差均在 1.5 个百分点内。差异有两处：本仓库这次抓到 4 个 forward（kernel 数 316/79）而 zz 那份是 5 个，
+以及 GPU 空档 2.9% vs 0.70%（抓取时 nmz35 节点负载较高）。
 
 ### vLLM: `vllm/vllmc.sh`
 
