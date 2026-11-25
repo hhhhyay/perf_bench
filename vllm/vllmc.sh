@@ -171,34 +171,61 @@ PERCENTILE_METRICS="${PERCENTILE_METRICS:-ttft,tpot,itl,e2el}"
 
 # ============================================================
 # Input / Output（单位 K，可使用小数）
+#
+# 默认 case: 4K 输入 / 1K 输出
+# 命令行指定（与 sglc.sh 对齐，优先级最高）:
+#   bash vllm/vllmc.sh --case "4 1"
+#   bash vllm/vllmc.sh --case "8 1" --case "16 1"
+#   bash vllm/vllmc.sh --cases "8 1,32 1"
+# 兼容环境变量方式:
+#   VLLM_CASES="8 1,32 1" bash vllm/vllmc.sh
+# 优先级: --case/--cases > VLLM_CASES > 默认 "4 1"
 # ============================================================
 
 DEFAULT_CASES=(
-  "1 1"
-  "8 1"
-  "16 1"
-  "32 1"
-  "64 16"
-  "128 1"
-  "1024 1"
+  "4 1"
 )
 
-# 可选：用逗号指定本次要跑的输入/输出 case，例如：
-#   VLLM_CASES="8 1,32 1" bash vllm/vllmc.sh
-if [[ -n "${VLLM_CASES:-}" ]]; then
+vllmc_usage() {
+  printf '用法: %s [--case "IN OUT"]... [--cases "a,b"]\n' "$(basename "$0")"
+  printf '  case 单位为 K（可用小数）: "4 1" = 4K 输入 / 1K 输出（默认）\n'
+  printf '  --case "IN OUT"    追加一个 case，可重复传入\n'
+  printf '  --cases "a,b,..."  逗号分隔批量传入\n'
+  printf '  -h|--help          显示本帮助\n'
+  printf '  环境变量 VLLM_CASES="8 1,32 1" 仍可用，优先级低于命令行\n'
+}
+
+declare -a CLI_CASES=()
+while (( $# > 0 )); do
+  case "$1" in
+    --case)  CLI_CASES+=("${2:?--case 需要一个 'IN OUT' 参数}"); shift 2 ;;
+    --cases) IFS=',' read -ra _cs <<< "${2:?--cases 需要 'a,b' 形式}"; CLI_CASES+=("${_cs[@]}"); shift 2 ;;
+    -h|--help) vllmc_usage; exit 0 ;;
+    *) echo "[ERROR] 未知参数: $1 (用 --help 查看)" >&2; exit 2 ;;
+  esac
+done
+
+# case 来源: 命令行 > VLLM_CASES 环境变量 > 默认
+if (( ${#CLI_CASES[@]} > 0 )); then
+  CASES=("${CLI_CASES[@]}")
+elif [[ -n "${VLLM_CASES:-}" ]]; then
   CASES=()
   IFS=',' read -ra case_items <<< "${VLLM_CASES}"
   for case_item in "${case_items[@]}"; do
-    read -r case_input case_output extra <<< "${case_item}"
-    if [[ -z "${case_input:-}" || -z "${case_output:-}" || -n "${extra:-}" ]]; then
-      echo "[ERROR] VLLM_CASES 格式应为 '输入 输出,输入 输出'，当前为: ${VLLM_CASES}" >&2
-      exit 1
-    fi
-    CASES+=("${case_input} ${case_output}")
+    CASES+=("${case_item}")
   done
 else
   CASES=("${DEFAULT_CASES[@]}")
 fi
+
+# case 格式校验: 必须为 "IN OUT" 两段（单位 K）
+for _case in "${CASES[@]}"; do
+  read -r _case_in _case_out _case_extra <<< "${_case}"
+  if [[ -z "${_case_in}" || -z "${_case_out}" || -n "${_case_extra:-}" ]]; then
+    echo "[ERROR] case 格式应为 'IN OUT' (单位 K)，当前: '${_case}'" >&2
+    exit 1
+  fi
+done
 
 
 # DP<=3 时使用较稀疏但更实用的基础点：
