@@ -39,7 +39,7 @@ SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null ||
 # ============================================================
 
 BASE_URL="${BASE_URL:-http://12.12.12.108:8332}"
-SERVER_INFO_URL="${SERVER_INFO_URL:-${BASE_URL%/}/server_info}"
+SERVER_INFO_URL="${SERVER_INFO_URL:-${BASE_URL%/}/server_info?config_format=json}"
 SERVER_LOG="${SERVER_LOG:-}"   # 可选：vLLM 服务端启动日志路径，用于提取 max_num_seqs 等未暴露配置
 MODEL="${MODEL:-/model/Qwen3-8B}"
 TOKENIZER="${TOKENIZER:-}"
@@ -135,6 +135,8 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
 # vLLM 不同版本暴露的配置字段不同；以下字段优先从 /metrics label 尝试读取，
 # 获取不到时可手动覆盖。最终只合并成 parallel_config 一列。
 TP_SIZE="${TP_SIZE:-}"
+CP_SIZE="${CP_SIZE:-}"
+GPU_MEM="${GPU_MEM:-}"
 PP_SIZE="${PP_SIZE:-}"
 EP_SIZE="${EP_SIZE:-}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
@@ -272,43 +274,84 @@ try:
 except Exception:
     raise SystemExit(1)
 
-cfg = d.get("vllm_config", "")
-if not isinstance(cfg, str):
-    cfg = str(cfg)
+vc = d.get("vllm_config") if isinstance(d, dict) else None
+out = {"tp": "", "cp": "", "dp": "", "pp": "", "ep": "",
+       "kv": "", "mns": "", "cg": "", "mem": ""}
 
-def pick_int(name):
-    m = re.search(rf'\b{name}=([0-9]+)\b', cfg)
-    return m.group(1) if m else ""
 
-def pick_str(name):
-    m = re.search(rf'\b{name}=([^,\s]+)', cfg)
-    return m.group(1) if m else ""
+def num(x):
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else ""
 
-tp = pick_int("tensor_parallel_size")
-dp = pick_int("data_parallel_size")
-pp = pick_int("pipeline_parallel_size")
-ep = pick_int("expert_parallel_size")
-kv = pick_str("kv_cache_dtype")
 
-# cudagraph_capture_sizes=[...]
-cg = ""
-m = re.search(r"'cudagraph_capture_sizes':\s*\[([^\]]*)\]", cfg)
-if m:
-    vals = []
-    for x in m.group(1).split(","):
-        x = x.strip()
-        if x.isdigit():
-            vals.append(x)
-    cg = ",".join(vals)
+if isinstance(vc, dict):
+    # vLLM >= 0.34: /server_info?config_format=json 返回嵌套 dict
+    pc = vc.get("parallel_config") or {}
+    sc = vc.get("scheduler_config") or {}
+    cc = vc.get("cache_config") or {}
+    cx = vc.get("compilation_config") or {}
 
-# Explicitly DO NOT treat VLLM_MAX_N_SEQUENCES as max_num_seqs.
-# Try real max_num_seqs only if it appears in the resolved config string.
-mns = ""
-m = re.search(r'\bmax_num_seqs=([0-9]+)\b', cfg)
-if m:
-    mns = m.group(1)
+    cp = num(pc.get("prefill_context_parallel_size"))
+    if cp == "":
+        cp = num(pc.get("decode_context_parallel_size"))
 
-print("|".join([tp, dp, pp, ep, kv, mns, cg]))
+    kv = cc.get("cache_dtype") or cc.get("kv_cache_dtype") or ""
+    if str(kv).lower() in ("", "auto"):
+        kv = ""
+
+    cg = cx.get("cudagraph_capture_sizes") or []
+    if isinstance(cg, str):
+        cg = re.findall(r"\d+", cg)
+    try:
+        cg = ",".join(str(int(x)) for x in cg)
+    except Exception:
+        cg = ""
+
+    mem = num(cc.get("gpu_memory_utilization"))
+    if mem == "":
+        mem = cc.get("gpu_memory_utilization") or ""
+
+    out = {
+        "tp": num(pc.get("tensor_parallel_size")),
+        "cp": cp,
+        "dp": num(pc.get("data_parallel_size")),
+        "pp": num(pc.get("pipeline_parallel_size")),
+        # 0.34 只有 enable_expert_parallel 布尔开关: 1=启用, 0=未启用
+        "ep": 1 if pc.get("enable_expert_parallel") else 0,
+        "kv": kv,
+        "mns": num(sc.get("max_num_seqs")),
+        "cg": cg,
+        "mem": mem,
+    }
+else:
+    # 旧版本: vllm_config 为字符串, 正则兜底
+    cfg = vc if isinstance(vc, str) else str(vc)
+
+    def pick(rx):
+        m = re.search(rx, cfg)
+        return m.group(1) if m else ""
+
+    kv = pick(r"\b(?:kv_cache_dtype|cache_dtype)=([^,\s]+)")
+    if kv.lower() in ("auto",):
+        kv = ""
+    ep_flag = pick(r"\benable_expert_parallel=(True|False)\b")
+    cg = ""
+    m = re.search(r"'cudagraph_capture_sizes':\s*\[([^\]]*)\]", cfg)
+    if m:
+        vals = [x.strip() for x in m.group(1).split(",") if x.strip().isdigit()]
+        cg = ",".join(vals)
+    out = {
+        "tp": pick(r"\btensor_parallel_size=([0-9]+)\b"),
+        "cp": pick(r"\b(?:prefill_context_parallel_size|decode_context_parallel_size)=([0-9]+)\b"),
+        "dp": pick(r"\bdata_parallel_size=([0-9]+)\b"),
+        "pp": pick(r"\bpipeline_parallel_size=([0-9]+)\b"),
+        "ep": {"True": "1", "False": "0"}.get(ep_flag, ""),
+        "kv": kv,
+        "mns": pick(r"\bmax_num_seqs=([0-9]+)\b"),
+        "cg": cg,
+        "mem": pick(r"\bgpu_memory_utilization=([0-9]+(?:\.[0-9]+)?)"),
+    }
+
+print("|".join(str(out.get(k, "")) for k in ("tp", "cp", "dp", "pp", "ep", "kv", "mns", "cg", "mem")))
 PY
   )"
 
@@ -317,16 +360,18 @@ PY
     return 0
   fi
 
-  local _tp _dp _pp _ep _kv _mns _cg
-  IFS='|' read -r _tp _dp _pp _ep _kv _mns _cg <<< "${parsed}"
+  local _tp _cp _dp _pp _ep _kv _mns _cg _mem
+  IFS='|' read -r _tp _cp _dp _pp _ep _kv _mns _cg _mem <<< "${parsed}"
 
   [[ -z "${TP_SIZE}" && -n "${_tp}" ]] && TP_SIZE="${_tp}"
+  [[ -z "${CP_SIZE}" && -n "${_cp}" ]] && CP_SIZE="${_cp}"
   [[ -z "${DP_SIZE}" && -n "${_dp}" ]] && DP_SIZE="${_dp}"
   [[ -z "${PP_SIZE}" && -n "${_pp}" ]] && PP_SIZE="${_pp}"
   [[ -z "${EP_SIZE}" && -n "${_ep}" ]] && EP_SIZE="${_ep}"
   [[ -z "${KV_CACHE_DTYPE}" && -n "${_kv}" ]] && KV_CACHE_DTYPE="${_kv}"
   [[ -z "${MAX_NUM_SEQS}" && -n "${_mns}" ]] && MAX_NUM_SEQS="${_mns}"
   [[ -z "${CUDA_GRAPH_BS}" && -n "${_cg}" ]] && CUDA_GRAPH_BS="${_cg}"
+  [[ -z "${GPU_MEM}" && -n "${_mem}" ]] && GPU_MEM="${_mem}"
 
   # Sanity check: KV dtype should not accidentally become a CUDA graph list.
   if [[ "${KV_CACHE_DTYPE:-}" == *,* ]]; then
@@ -336,9 +381,11 @@ PY
 
   echo "[INFO] server_info:"
   echo "       TP_SIZE=${TP_SIZE:-N/A}"
+  echo "       CP_SIZE=${CP_SIZE:-N/A}"
   echo "       DP_SIZE=${DP_SIZE:-N/A}"
   echo "       PP_SIZE=${PP_SIZE:-N/A}"
   echo "       EP_SIZE=${EP_SIZE:-N/A}"
+  echo "       GPU_MEM=${GPU_MEM:-N/A}"
   echo "       KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-N/A}"
   echo "       MAX_NUM_SEQS=${MAX_NUM_SEQS:-N/A}"
   echo "       CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-N/A}"
@@ -544,11 +591,13 @@ load_vllm_capacity() {
 
   if [[ -z "${PARALLEL_CONFIG}" ]]; then
     parts=()
-    [[ -n "${TP_SIZE}" ]] && parts+=("TP${TP_SIZE}")
-    parts+=("DP${DP_SIZE}")
-    [[ -n "${PP_SIZE}" ]] && parts+=("PP${PP_SIZE}")
+    parts+=("TP${TP_SIZE:-1}")
+    parts+=("CP${CP_SIZE:-1}")
+    parts+=("DP${DP_SIZE:-1}")
+    [[ -n "${PP_SIZE}" && "${PP_SIZE}" != "1" ]] && parts+=("PP${PP_SIZE}")
     [[ -n "${EP_SIZE}" ]] && parts+=("EP${EP_SIZE}")
-    [[ -n "${KV_CACHE_DTYPE}" ]] && parts+=("KV${KV_CACHE_DTYPE}")
+    [[ -n "${KV_CACHE_DTYPE}" && "${KV_CACHE_DTYPE}" != "auto" ]] && parts+=("KV${KV_CACHE_DTYPE}")
+    [[ -n "${GPU_MEM}" ]] && parts+=("MEM${GPU_MEM}")
     PARALLEL_CONFIG="$(IFS=-; echo "${parts[*]}")"
   fi
 
@@ -1164,8 +1213,6 @@ preferred = [
     "token_theoretical_per_dp_bs",
     "effective_theoretical_per_dp_bs",
     "per_dp_bs",
-    "successful_requests",
-    "failed_requests",
     "num_prompts",
     "max_concurrency",
     "concurrency",
@@ -1190,6 +1237,8 @@ preferred = [
     "mean_e2e_latency_ms",
     "cache_mode",
     "cache_salt",
+    "successful_requests",
+    "failed_requests",
 
     # Case / debug
     "case_status",
@@ -1218,6 +1267,14 @@ duplicate_aliases = {
     "total_throughput",
     "theoretical_per_dp_bs",
     "kv_tokens",
+    # 重复指标: 规范列已在 preferred/extras, 丢弃这些重复列
+    "max-concurrency",      # == max_concurrency
+    "median_e2el_ms",       # == p50_e2e_latency_ms (normalize 已回填 p50)
+    "median_ttft_ms",       # == p50_ttft_ms
+    "median_tpot_ms",       # == p50_tpot_ms
+    "median_itl_ms",        # == p50_itl_ms
+    "p95_e2el_ms",          # == p95_e2e_latency_ms
+    "p99_e2el_ms",          # == p99_e2e_latency_ms
 }
 
 hidden_columns = {
