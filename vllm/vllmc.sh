@@ -552,10 +552,20 @@ load_vllm_capacity() {
       | grep -oE '(kv_cache_dtype|cache_dtype)="[^"]+"' \
       | head -1 | sed -E 's/^[^=]+="([^"]+)"/\1/' || true
   )"
+  gmem="$(
+    printf "%s\n" "${m}" \
+      | grep -oE 'gpu_memory_utilization="[0-9]+(\.[0-9]+)?"' \
+      | head -1 | sed -E 's/^[^=]+="([^"]+)"/\1/' || true
+  )"
 
   echo "detected DP_SIZE     = ${dp:-N/A}"
   echo "detected KV_TOKENS   = ${kv:-N/A}"
   echo "detected MAX_NUM_SEQS= ${max_num_seqs:-N/A}"
+  echo "detected TP_SIZE     = ${tp_size:-N/A}"
+  echo "detected PP_SIZE     = ${pp_size:-N/A}"
+  echo "detected EP_SIZE     = ${ep_size:-N/A}"
+  echo "detected KV_DTYPE    = ${kv_cache_dtype:-N/A}"
+  echo "detected GPU_MEM     = ${gmem:-N/A}"
 
   if [[ -n "${dp}" && "${dp}" -gt 0 ]]; then
     if [[ -n "${DP_SIZE}" && "${DP_SIZE}" != "${dp}" ]]; then
@@ -593,7 +603,8 @@ load_vllm_capacity() {
   [[ -z "${TP_SIZE}" && -n "${tp_size}" ]] && TP_SIZE="${tp_size}"
   [[ -z "${PP_SIZE}" && -n "${pp_size}" ]] && PP_SIZE="${pp_size}"
   [[ -z "${EP_SIZE}" && -n "${ep_size}" ]] && EP_SIZE="${ep_size}"
-  [[ -z "${KV_CACHE_DTYPE}" && -n "${kv_cache_dtype}" ]] && KV_CACHE_DTYPE="${kv_cache_dtype}"
+  [[ -z "${KV_CACHE_DTYPE}" && -n "${kv_cache_dtype}" && "${kv_cache_dtype}" != "None" ]] && KV_CACHE_DTYPE="${kv_cache_dtype}"
+  [[ -z "${GPU_MEM}" && -n "${gmem}" ]] && GPU_MEM="${gmem}"
 
   if [[ -z "${PARALLEL_CONFIG}" ]]; then
     parts=()
@@ -602,7 +613,7 @@ load_vllm_capacity() {
     parts+=("DP${DP_SIZE:-1}")
     [[ -n "${PP_SIZE}" && "${PP_SIZE}" != "1" ]] && parts+=("PP${PP_SIZE}")
     [[ -n "${EP_SIZE}" ]] && parts+=("EP${EP_SIZE}")
-    [[ -n "${KV_CACHE_DTYPE}" && "${KV_CACHE_DTYPE}" != "auto" ]] && parts+=("KV${KV_CACHE_DTYPE}")
+    [[ -n "${KV_CACHE_DTYPE}" ]] && parts+=("KV${KV_CACHE_DTYPE}")
     [[ -n "${GPU_MEM}" ]] && parts+=("MEM${GPU_MEM}")
     PARALLEL_CONFIG="$(IFS=-; echo "${parts[*]}")"
   fi
