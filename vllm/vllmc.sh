@@ -106,6 +106,27 @@ if [[ ! "${TOKEN_UNIT}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 CACHE_MODE="prefix_salt_no_flush"
 
+# ---- bench CLI 版本兼容探测 ----
+# 老版本 (如 0.28) 的 vllm bench serve:
+#   用 --input-len/--output-len (无 --random-*-len/--range-ratio),
+#   无 --num-warmups / --extra-body(cache_salt) / --percentile-metrics。
+# LEGACY_BENCH=auto 自动按版本判断 (阈值 LEGACY_THRESHOLD, 默认 0.30);
+# 可用 LEGACY_BENCH=0 / LEGACY_BENCH=1 强制。
+LEGACY_THRESHOLD="${LEGACY_THRESHOLD:-0.30}"
+bench_version="$(vllm --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)"
+BENCH_IS_LEGACY=0
+if [[ "${LEGACY_BENCH:-auto}" == "1" ]]; then
+  BENCH_IS_LEGACY=1
+elif [[ "${LEGACY_BENCH:-auto}" == "0" ]]; then
+  BENCH_IS_LEGACY=0
+elif [[ -n "${bench_version}" ]]; then
+  if [[ "$(awk -v a="${bench_version}" -v t="${LEGACY_THRESHOLD}" 'BEGIN{print (a<t)?1:0}')" == "1" ]]; then
+    BENCH_IS_LEGACY=1
+  fi
+fi
+echo "[INFO] bench client vllm=${bench_version:-unknown} legacy_flags=${BENCH_IS_LEGACY}" \
+     "(threshold=${LEGACY_THRESHOLD}, LEGACY_BENCH=${LEGACY_BENCH:-auto})"
+
 SLA_DENSE_ENABLE="${SLA_DENSE_ENABLE:-1}"
 # 通用 SLA 规则：metric:target:near，多个规则用逗号分隔
 # 示例：
@@ -855,12 +876,13 @@ python3 - \
   "${CACHE_MODE}" \
   "${PARALLEL_CONFIG:-UNKNOWN}" \
   "${NUM_PROMPTS_MULTIPLIER}" \
-  "${TOKEN_UNIT}" <<'PY'
+  "${TOKEN_UNIT}" \
+  "${BENCH_IS_LEGACY:-0}" <<'PY'
 import csv, re, sys
 from pathlib import Path
 
-if len(sys.argv) < 11:
-    raise SystemExit(f"merge_results argv mismatch: expected 10 args, got {len(sys.argv)-1}")
+if len(sys.argv) < 12:
+    raise SystemExit(f"merge_results argv mismatch: expected 11 args, got {len(sys.argv)-1}")
 
 log_dir, output_csv = Path(sys.argv[1]), Path(sys.argv[2])
 def to_int_or_none(v):
@@ -876,6 +898,7 @@ run_id, cache_mode = sys.argv[6], sys.argv[7]
 parallel_config = sys.argv[8]
 num_prompts_multiplier = int(sys.argv[9])
 token_unit = int(sys.argv[10])
+bench_is_legacy = sys.argv[11] == "1"
 
 pattern = re.compile(
     r"(?P<case>.+?)_in(?P<input>\d+)_out(?P<output>\d+)_perdp(?P<perdp>\d+)_global(?P<global>\d+)\.log$"
@@ -1197,8 +1220,8 @@ for log_path in sorted(log_dir.glob("*.log")):
         "max_concurrency": global_c,
         "concurrency": global_c,
         "global_concurrency": global_c,
-        "cache_mode": cache_mode,
-        "cache_salt": f"{run_id}_{case_name}_perdp{perdp}",
+        "cache_mode": "no_salt_legacy" if bench_is_legacy else cache_mode,
+        "cache_salt": "" if bench_is_legacy else f"{run_id}_{case_name}_perdp{perdp}",
     }
 
     if time_path.exists():
@@ -1495,33 +1518,53 @@ run_one_bs() {
   echo "Max Num Seqs       : ${MAX_NUM_SEQS:-N/A}"
   echo "Start Time         : ${bs_start_time}"
   echo "LOG                : ${log_file}"
-  echo "Cache Mode         : ${CACHE_MODE}"
-  echo "Cache Salt         : ${cache_salt}"
+  if (( BENCH_IS_LEGACY )); then
+    echo "Cache Mode         : no_salt_legacy"
+    echo "Cache Salt         : <n/a> legacy bench has no --extra-body"
+  else
+    echo "Cache Mode         : ${CACHE_MODE}"
+    echo "Cache Salt         : ${cache_salt}"
+  fi
   echo "============================================================"
   echo
 
   (
     set -o pipefail
     write_log_header "${log_file}"
-    vllm bench serve \
-      --backend openai \
-      --base-url "${BASE_URL}" \
-      --model "${MODEL}" \
-      "${TOKENIZER_ARGS[@]}" \
-      --dataset-name random \
-      --random-input-len "${input_len}" \
-      --random-output-len "${output_len}" \
-      --random-range-ratio 0.0 \
-      --max-concurrency "${global_concurrency}" \
-      --num-prompts "${num_prompts}" \
-      --request-rate inf \
-      --num-warmups "${warmup_requests}" \
-      --ignore-eos \
-      --percentile-metrics "${PERCENTILE_METRICS}" \
-      --metric-percentiles "${METRIC_PERCENTILES}" \
-      --disable-tqdm \
-      --extra-body "{\"cache_salt\":\"${cache_salt}\"}" \
-      2>&1 | tee -a "${log_file}"
+    bench_args=(
+      --backend openai
+      --base-url "${BASE_URL}"
+      --model "${MODEL}"
+      "${TOKENIZER_ARGS[@]}"
+      --dataset-name random
+    )
+    if (( BENCH_IS_LEGACY )); then
+      bench_args+=( --input-len "${input_len}" --output-len "${output_len}" )
+    else
+      bench_args+=(
+        --random-input-len "${input_len}"
+        --random-output-len "${output_len}"
+        --random-range-ratio 0.0
+      )
+    fi
+    bench_args+=(
+      --max-concurrency "${global_concurrency}"
+      --num-prompts "${num_prompts}"
+      --request-rate inf
+      --ignore-eos
+      --disable-tqdm
+    )
+    if (( BENCH_IS_LEGACY )); then
+      echo "[WARN] legacy bench v${bench_version:-?}: 不发送 --num-warmups/--extra-body(cache_salt)/--percentile-metrics; 本次无 salt 隔离、无 warmup 预热、百分位仅默认 Median/P99" | tee -a "${log_file}"
+    else
+      bench_args+=(
+        --num-warmups "${warmup_requests}"
+        --percentile-metrics "${PERCENTILE_METRICS}"
+        --metric-percentiles "${METRIC_PERCENTILES}"
+        --extra-body "{\"cache_salt\":\"${cache_salt}\"}"
+      )
+    fi
+    vllm bench serve "${bench_args[@]}" 2>&1 | tee -a "${log_file}"
     echo $? > "${exit_file}"
   ) &
   bench_pid=$!
