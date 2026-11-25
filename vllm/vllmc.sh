@@ -258,10 +258,16 @@ fetch_vllm_metrics() {
 # KV_TOKENS=$(echo "$m" | grep '^vllm:cache_config_info{' | sed ... | awk '{print $1*$2}')
 
 load_vllm_server_info() {
-  local info
-  info="$(curl -fsS --max-time 5 "${SERVER_INFO_URL}" 2>/dev/null || true)"
-  if [[ -z "${info}" ]]; then
-    echo "[WARN] /server_info 不可用: ${SERVER_INFO_URL}；TP/DP/PP/KV/CUDA Graph 后续使用 metrics/环境变量/fallback"
+  local info code
+  code="$(curl -sS --max-time 10 -o /tmp/.vllm_server_info.json -w '%{http_code}' "${SERVER_INFO_URL}" 2>/dev/null || echo 000)"
+  info="$(cat /tmp/.vllm_server_info.json 2>/dev/null || true)"
+  rm -f /tmp/.vllm_server_info.json 2>/dev/null
+  if [[ "${code}" != "200" || -z "${info}" ]]; then
+    if [[ "${code}" == "404" ]]; then
+      echo "[WARN] /server_info 在该 vLLM 版本不存在 (HTTP 404)；TP/CP/EP/MEM/MAX_NUM_SEQS 请用对应环境变量或 SERVER_LOG 提供，KV/DP 走 metrics"
+    else
+      echo "[WARN] /server_info 不可用 (HTTP ${code})；TP/DP/PP/KV/CUDA Graph 后续使用 metrics/环境变量/fallback"
+    fi
     return 0
   fi
 
