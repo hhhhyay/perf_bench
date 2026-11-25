@@ -426,24 +426,37 @@ load_vllm_server_log_config() {
     grep -Eio '(data_parallel_size|data-parallel-size|dp_size)[=: ]+[0-9]+' "${SERVER_LOG}" \
       | tail -1 | grep -Eo '[0-9]+' || true
   )"
+  cp="$(
+    grep -Eio '(prefill_context_parallel_size|decode_context_parallel_size|context-parallel-size|cp_size)[=: ]+[0-9]+' "${SERVER_LOG}" \
+      | tail -1 | grep -Eo '[0-9]+' || true
+  )"
   kv="$(
     grep -Eio 'kv_cache_dtype[=: ]+[^, ]+' "${SERVER_LOG}" \
       | tail -1 | sed -E 's/.*kv_cache_dtype[=: ]+//' || true
   )"
+  # EP: 0.34 为布尔开关, 日志打印 "EP rank N/A"(未启用) / "EP rank <n>"(启用)
+  local ep_on=""
+  if grep -Eq 'EP rank [0-9]+' "${SERVER_LOG}" 2>/dev/null; then
+    ep_on=1
+  fi
 
   [[ -z "${MAX_NUM_SEQS}" && -n "${mns}" ]] && MAX_NUM_SEQS="${mns}"
   [[ -z "${TP_SIZE}" && -n "${tp}" ]] && TP_SIZE="${tp}"
   [[ -z "${PP_SIZE}" && -n "${pp}" ]] && PP_SIZE="${pp}"
   [[ -z "${DP_SIZE}" && -n "${dp}" ]] && DP_SIZE="${dp}"
+  [[ -z "${CP_SIZE}" && -n "${cp}" ]] && CP_SIZE="${cp}"
   [[ -z "${KV_CACHE_DTYPE}" && -n "${kv}" ]] && KV_CACHE_DTYPE="${kv}"
+  [[ -z "${EP_SIZE}" && -n "${ep_on}" ]] && EP_SIZE="on"
 
-  if [[ -n "${mns}${mbt}${tp}${pp}${dp}${kv}" ]]; then
+  if [[ -n "${mns}${mbt}${tp}${pp}${dp}${cp}${kv}${ep_on}" ]]; then
     echo "[INFO] server log config:"
     echo "       MAX_NUM_SEQS=${MAX_NUM_SEQS:-N/A}"
     echo "       MAX_NUM_BATCHED_TOKENS=${mbt:-N/A}"
     echo "       TP_SIZE=${TP_SIZE:-N/A}"
     echo "       DP_SIZE=${DP_SIZE:-N/A}"
     echo "       PP_SIZE=${PP_SIZE:-N/A}"
+    echo "       CP_SIZE=${CP_SIZE:-N/A}"
+    echo "       EP=${EP_SIZE:-N/A}"
     echo "       KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-N/A}"
   fi
 }
@@ -612,7 +625,7 @@ load_vllm_capacity() {
     parts+=("CP${CP_SIZE:-1}")
     parts+=("DP${DP_SIZE:-1}")
     [[ -n "${PP_SIZE}" && "${PP_SIZE}" != "1" ]] && parts+=("PP${PP_SIZE}")
-    [[ -n "${EP_SIZE}" ]] && parts+=("EP${EP_SIZE}")
+    parts+=("EP${EP_SIZE:-1}")
     [[ -n "${KV_CACHE_DTYPE}" ]] && parts+=("KV${KV_CACHE_DTYPE}")
     [[ -n "${GPU_MEM}" ]] && parts+=("MEM${GPU_MEM}")
     PARALLEL_CONFIG="$(IFS=-; echo "${parts[*]}")"
