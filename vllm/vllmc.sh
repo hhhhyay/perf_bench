@@ -27,6 +27,7 @@ out_dir="./all_result/bench_vllm_prefix_salt_${run_id}"
 log_dir="${out_dir}/logs"
 mkdir -p "${log_dir}"
 STARTUP_READY=0
+BENCH_PID=""
 
 NODE_HOSTNAME="${NODE_HOSTNAME:-$(hostname 2>/dev/null || printf 'unknown')}"
 RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
@@ -256,10 +257,13 @@ fetch_vllm_metrics() {
 # KV_TOKENS=$(echo "$m" | grep '^vllm:cache_config_info{' | sed ... | awk '{print $1*$2}')
 
 load_vllm_server_info() {
-  local info code
-  code="$(curl -sS --max-time 10 -o /tmp/.vllm_server_info.json -w '%{http_code}' "${SERVER_INFO_URL}" 2>/dev/null || echo 000)"
-  info="$(cat /tmp/.vllm_server_info.json 2>/dev/null || true)"
-  rm -f /tmp/.vllm_server_info.json 2>/dev/null
+  local info code tmpf
+  # 唯一临时文件：同机并行多个 client 也互不覆盖
+  tmpf="$(mktemp "${TMPDIR:-/tmp}/.vllm_server_info.XXXXXX" 2>/dev/null || true)"
+  [[ -n "${tmpf}" ]] || tmpf="/tmp/.vllm_server_info.$$"
+  code="$(curl -sS --max-time 10 -o "${tmpf}" -w '%{http_code}' "${SERVER_INFO_URL}" 2>/dev/null || echo 000)"
+  info="$(cat "${tmpf}" 2>/dev/null || true)"
+  rm -f "${tmpf}" 2>/dev/null
   if [[ "${code}" != "200" || -z "${info}" ]]; then
     if [[ "${code}" == "404" ]]; then
       echo "[WARN] /server_info 在该 vLLM 版本不存在 (HTTP 404)；该版本未提供该接口，TP/PP/DP/EP/MEM/MAX_NUM_SEQS 无法自动获取（可用环境变量提供），KV/DP 走 /metrics"
@@ -314,13 +318,27 @@ if isinstance(vc, dict):
     if mem == "":
         mem = cc.get("gpu_memory_utilization") or ""
 
+    # EP: vLLM core 没有独立 ep_size 参数，--enable-expert-parallel 是布尔，
+    # 启用时规模 = TP x DP。优先用显式 expert_parallel_size 字段（部分构建提供）。
+    ep_flag = pc.get("enable_expert_parallel")
+    ep_field = num(pc.get("expert_parallel_size"))
+    if ep_field != "":
+        ep_val = int(ep_field)
+    elif ep_flag is True:
+        tp_v = num(pc.get("tensor_parallel_size"))
+        dp_v = num(pc.get("data_parallel_size"))
+        ep_val = int(tp_v) * int(dp_v) if tp_v != "" and dp_v != "" else "on"
+    elif ep_flag is False:
+        ep_val = 0
+    else:
+        ep_val = ""
+
     out = {
         "tp": num(pc.get("tensor_parallel_size")),
         "cp": cp,
         "dp": num(pc.get("data_parallel_size")),
         "pp": num(pc.get("pipeline_parallel_size")),
-        # 0.34 只有 enable_expert_parallel 布尔开关: 1=启用, 0=未启用
-        "ep": 1 if pc.get("enable_expert_parallel") else 0,
+        "ep": ep_val,
         "kv": kv,
         "mns": num(sc.get("max_num_seqs")),
         "cg": cg,
@@ -371,7 +389,10 @@ PY
   [[ -z "${CP_SIZE}" && -n "${_cp}" ]] && CP_SIZE="${_cp}"
   [[ -z "${DP_SIZE}" && -n "${_dp}" ]] && DP_SIZE="${_dp}"
   [[ -z "${PP_SIZE}" && -n "${_pp}" ]] && PP_SIZE="${_pp}"
-  [[ -z "${EP_SIZE}" && -n "${_ep}" ]] && EP_SIZE="${_ep}"
+  # 0=未启用(显示 EP1); 数值=EP规模(显示 EP4); on=启用但规模未知(显示 EPon)
+  if [[ -z "${EP_SIZE}" && -n "${_ep}" && "${_ep}" != "0" ]]; then
+    EP_SIZE="${_ep}"
+  fi
   [[ -z "${KV_CACHE_DTYPE}" && -n "${_kv}" ]] && KV_CACHE_DTYPE="${_kv}"
   [[ -z "${MAX_NUM_SEQS}" && -n "${_mns}" ]] && MAX_NUM_SEQS="${_mns}"
   [[ -z "${CUDA_GRAPH_BS}" && -n "${_cg}" ]] && CUDA_GRAPH_BS="${_cg}"
@@ -554,7 +575,14 @@ load_vllm_capacity() {
 
   [[ -z "${TP_SIZE}" && -n "${tp_size}" ]] && TP_SIZE="${tp_size}"
   [[ -z "${PP_SIZE}" && -n "${pp_size}" ]] && PP_SIZE="${pp_size}"
-  [[ -z "${EP_SIZE}" && -n "${ep_size}" ]] && EP_SIZE="${ep_size}"
+  # metrics 若暴露真实 ep_size 数值，可覆盖此前的 "on"（只知道启用、不知道规模）
+  if [[ -n "${ep_size}" && "${ep_size}" =~ ^[0-9]+$ && "${ep_size}" -gt 1 ]]; then
+    if [[ -z "${EP_SIZE}" || "${EP_SIZE}" == "on" ]]; then
+      EP_SIZE="${ep_size}"
+    fi
+  elif [[ -z "${EP_SIZE}" && -n "${ep_size}" && "${ep_size}" != "0" ]]; then
+    EP_SIZE="${ep_size}"
+  fi
   [[ -z "${KV_CACHE_DTYPE}" && -n "${kv_cache_dtype}" && "${kv_cache_dtype}" != "None" ]] && KV_CACHE_DTYPE="${kv_cache_dtype}"
   [[ -z "${GPU_MEM}" && -n "${gmem}" ]] && GPU_MEM="${gmem}"
 
@@ -1301,8 +1329,26 @@ on_exit() {
   echo "CSV     ：${out_dir}/sum_all.csv"
   exit "${exit_code}"
 }
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# 递归终止 bench 子进程树（Ctrl-C / kill 时不遗留孤儿 vllm bench serve）
+kill_tree() {
+  local pid="$1" sig="${2:-TERM}" child
+  for child in $(ps -o pid= --ppid "${pid}" 2>/dev/null); do
+    kill_tree "${child}" "${sig}"
+  done
+  kill -"${sig}" "${pid}" 2>/dev/null || true
+}
+
+on_signal() {
+  local code="$1"
+  if [[ -n "${BENCH_PID:-}" ]] && kill -0 "${BENCH_PID}" 2>/dev/null; then
+    echo
+    echo "[WARN] 收到中断信号，终止 bench 子进程 (pid=${BENCH_PID})"
+    kill_tree "${BENCH_PID}" TERM
+  fi
+  exit "${code}"
+}
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 trap on_exit EXIT
 
 
@@ -1328,6 +1374,8 @@ bs = int(bs_s)
 row_match = None
 with open(csv_file, newline="", encoding="utf-8-sig") as f:
     for r in csv.DictReader(f):
+        if r.get("case_status") not in ("", "PASS"):
+            continue
         if r.get("case_name") != case_name:
             continue
         try:
@@ -1381,7 +1429,9 @@ case_result_exists() {
   local exit_file="${log_dir}/${base_name}.log.exitcode"
 
   [[ -s "${log_file}" && -f "${exit_file}" ]] || return 1
-  [[ "$(tr -d '[:space:]' < "${exit_file}" 2>/dev/null)" == "0" ]]
+  [[ "$(tr -d '[:space:]' < "${exit_file}" 2>/dev/null)" == "0" ]] || return 1
+  # 复检日志有效性：防止历史脏结果（exit=0 但无有效成功请求）被静默跳过
+  benchmark_log_is_valid "${log_file}" >/dev/null 2>&1
 }
 
 benchmark_log_is_valid() {
@@ -1472,8 +1522,10 @@ run_one_bs() {
     echo $? > "${exit_file}"
   ) &
   bench_pid=$!
+  BENCH_PID="${bench_pid}"
 
   wait "${bench_pid}"
+  BENCH_PID=""
 
   if [[ -f "${exit_file}" ]]; then
     case_exit_code="$(tr -d '[:space:]' < "${exit_file}")"
