@@ -1883,4 +1883,10 @@ echo
 echo "汇总 CSV："
 echo "${out_dir}/sum_all.csv"
 echo
+if [[ -s "${out_dir}/sum_all.csv" ]]; then
+  echo "-------------------- sum_all.csv 内容 --------------------"
+  cat "${out_dir}/sum_all.csv"
+  echo "----------------------------------------------------------"
+fi
+echo
 echo
