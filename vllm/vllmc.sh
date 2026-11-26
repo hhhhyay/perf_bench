@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# 配置来源优先级：
-#   1) /server_info
-#   2) SERVER_LOG（尤其用于 max_num_seqs）
-#   3) /metrics
-#   4) 手动环境变量覆盖/兜底
+# 配置来源优先级（仅 vLLM HTTP 接口，与 sglc.sh 口径一致）：
+#   1) /server_info  TP/CP/DP/PP/EP/KV dtype/MEM/MAX_NUM_SEQS/CUDA Graph BS（vLLM>=0.30）
+#   2) /metrics      DP_SIZE(engine 标签数)/KV_TOKENS=block_size x num_gpu_blocks/KV dtype/MEM
+#   3) 手动环境变量覆盖/兜底
 # ============================================================
 # vLLM Prefix-Salt 标准容量压测
 #
@@ -40,7 +39,6 @@ SCRIPT_COMMIT="$(git -C "${script_dir}/.." rev-parse --short HEAD 2>/dev/null ||
 
 BASE_URL="${BASE_URL:-http://12.12.12.108:8332}"
 SERVER_INFO_URL="${SERVER_INFO_URL:-${BASE_URL%/}/server_info?config_format=json}"
-SERVER_LOG="${SERVER_LOG:-}"   # 可选：vLLM 服务端启动日志路径，用于提取 max_num_seqs 等未暴露配置
 MODEL="${MODEL:-/model/Qwen3-8B}"
 TOKENIZER="${TOKENIZER:-}"
 TOKEN_UNIT="${TOKEN_UNIT:-1024}"
@@ -264,7 +262,7 @@ load_vllm_server_info() {
   rm -f /tmp/.vllm_server_info.json 2>/dev/null
   if [[ "${code}" != "200" || -z "${info}" ]]; then
     if [[ "${code}" == "404" ]]; then
-      echo "[WARN] /server_info 在该 vLLM 版本不存在 (HTTP 404)；TP/CP/EP/MEM/MAX_NUM_SEQS 请用对应环境变量或 SERVER_LOG 提供，KV/DP 走 metrics"
+      echo "[WARN] /server_info 在该 vLLM 版本不存在 (HTTP 404)；该版本未提供该接口，TP/PP/DP/EP/MEM/MAX_NUM_SEQS 无法自动获取（可用环境变量提供），KV/DP 走 /metrics"
     else
       echo "[WARN] /server_info 不可用 (HTTP ${code})；TP/DP/PP/KV/CUDA Graph 后续使用 metrics/环境变量/fallback"
     fi
@@ -397,81 +395,6 @@ PY
   echo "       CUDA_GRAPH_BS=${CUDA_GRAPH_BS:-N/A}"
 }
 
-
-load_vllm_server_log_config() {
-  [[ -n "${SERVER_LOG}" ]] || return 0
-  if [[ ! -r "${SERVER_LOG}" ]]; then
-    echo "[WARN] SERVER_LOG 不可读: ${SERVER_LOG}"
-    return 0
-  fi
-
-  local mns mbt tp pp dp kv kv_tok
-  # 注意：non-default args 行是 Python dict repr（'key': value），
-  # 键名与冒号之间有引号，正则需容忍 ['"]。
-  mns="$(
-    grep -Eio "max[_-]num[_-]seqs['\"]?[=: ]+[0-9]+" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9]+' || true
-  )"
-  mbt="$(
-    grep -Eio "max[_-]num[_-]batched[_-]tokens['\"]?[=: ]+[0-9]+" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9]+' || true
-  )"
-  tp="$(
-    grep -Eio "(tensor_parallel_size|tensor-parallel-size|tp_size)['\"]?[=: ]+[0-9]+" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9]+' || true
-  )"
-  pp="$(
-    grep -Eio "(pipeline_parallel_size|pipeline-parallel-size|pp_size)['\"]?[=: ]+[0-9]+" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9]+' || true
-  )"
-  dp="$(
-    grep -Eio "(data_parallel_size|data-parallel-size|dp_size)['\"]?[=: ]+[0-9]+" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9]+' || true
-  )"
-  cp="$(
-    grep -Eio "(prefill_context_parallel_size|decode_context_parallel_size|context-parallel-size|cp_size)['\"]?[=: ]+[0-9]+" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9]+' || true
-  )"
-  kv="$(
-    grep -Eio "kv[_-]?cache[_-]?dtype['\"]?[=: ]+['\"]?[A-Za-z0-9_.-]+" "${SERVER_LOG}" \
-      | tail -1 | sed -E "s/.*dtype['\"]?[=: ]+['\"]?//; s/['\"],?$//" || true
-  )"
-  # 引擎自报的 KV cache 实际容量（比 metrics 的 blocks×block_size 换算可靠，
-  # 尤其对 mamba/engram 等混合缓存构建）：
-  #   GPU KV cache size: 1,058,756 tokens
-  kv_tok="$(
-    grep -Eio "GPU KV cache size: *[0-9,]+ tokens" "${SERVER_LOG}" \
-      | tail -1 | grep -Eo '[0-9,]+' | tr -d ',' || true
-  )"
-  SERVER_LOG_KV_TOKENS="${kv_tok}"
-  # EP: 0.34 为布尔开关, 日志打印 "EP rank N/A"(未启用) / "EP rank <n>"(启用)
-  local ep_on=""
-  if grep -Eq 'EP rank [0-9]+' "${SERVER_LOG}" 2>/dev/null; then
-    ep_on=1
-  fi
-
-  [[ -z "${MAX_NUM_SEQS}" && -n "${mns}" ]] && MAX_NUM_SEQS="${mns}"
-  [[ -z "${TP_SIZE}" && -n "${tp}" ]] && TP_SIZE="${tp}"
-  [[ -z "${PP_SIZE}" && -n "${pp}" ]] && PP_SIZE="${pp}"
-  [[ -z "${DP_SIZE}" && -n "${dp}" ]] && DP_SIZE="${dp}"
-  [[ -z "${CP_SIZE}" && -n "${cp}" ]] && CP_SIZE="${cp}"
-  [[ -z "${KV_CACHE_DTYPE}" && -n "${kv}" ]] && KV_CACHE_DTYPE="${kv}"
-  [[ -z "${KV_TOKENS}" && -n "${kv_tok}" ]] && KV_TOKENS="${kv_tok}"
-  [[ -z "${EP_SIZE}" && -n "${ep_on}" ]] && EP_SIZE="on"
-
-  if [[ -n "${mns}${mbt}${tp}${pp}${dp}${cp}${kv}${kv_tok}${ep_on}" ]]; then
-    echo "[INFO] server log config:"
-    echo "       MAX_NUM_SEQS=${MAX_NUM_SEQS:-N/A}"
-    echo "       MAX_NUM_BATCHED_TOKENS=${mbt:-N/A}"
-    echo "       TP_SIZE=${TP_SIZE:-N/A}"
-    echo "       DP_SIZE=${DP_SIZE:-N/A}"
-    echo "       PP_SIZE=${PP_SIZE:-N/A}"
-    echo "       CP_SIZE=${CP_SIZE:-N/A}"
-    echo "       EP=${EP_SIZE:-N/A}"
-    echo "       KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-N/A}"
-    echo "       KV_TOKENS=${KV_TOKENS:-N/A} (engine self-reported)"
-  fi
-}
 
 load_vllm_capacity() {
   local m
@@ -608,19 +531,14 @@ load_vllm_capacity() {
 
   if [[ -z "${KV_TOKENS}" ]]; then
     if [[ -z "${kv}" || "${kv}" -le 0 ]]; then
-      if [[ -n "${SERVER_LOG_KV_TOKENS}" ]]; then
-        KV_TOKENS="${SERVER_LOG_KV_TOKENS}"
-        echo "[INFO] metrics 未识别到 KV_TOKENS，采用 SERVER_LOG 引擎自报值: ${KV_TOKENS}"
-      else
-        echo "[ERROR] 未识别到 KV_TOKENS，请手动设置 KV_TOKENS=..."
-        exit 1
-      fi
-    else
-      KV_TOKENS="${kv}"
+      echo "[ERROR] /metrics 未识别到 KV_TOKENS (cache_config_info: block_size x num_gpu_blocks)；请检查 /metrics 或手动设置 KV_TOKENS=..."
+      exit 1
     fi
+    KV_TOKENS="${kv}"
+    echo "[INFO] 自动识别 KV_TOKENS=${KV_TOKENS} (source=/metrics cache_config_info)"
   elif [[ -n "${kv}" && "${kv}" != "${KV_TOKENS}" ]]; then
-    echo "[WARN] 已有 KV_TOKENS=${KV_TOKENS} (手动/SERVER_LOG) 与 metrics 换算=${kv} 不一致；保留已有值"
-    echo "[WARN] 若换算值才正确，请显式设置 KV_TOKENS=${kv}"
+    echo "[WARN] 手动 KV_TOKENS=${KV_TOKENS} 与 /metrics 换算=${kv} 不一致；保留手动值"
+    echo "[WARN] 若换算值才正确，请去掉手动 KV_TOKENS 重跑"
   fi
 
   if [[ -n "${MAX_NUM_SEQS}" ]]; then
@@ -811,7 +729,7 @@ get_bs_list() {
   (( theoretical_floor < 1 )) && theoretical_floor=1
   if (( theoretical_floor <= 2 )); then
     echo "[WARN] token theory/DP BS=${theoretical_floor} 过小: KV_TOKENS=${KV_TOKENS} ÷ req=${tokens_per_request}" \
-         "→ KV_TOKENS 疑似异常偏小，请核对 /metrics cache_config_info 或改用 SERVER_LOG=... (引擎自报值更可靠)" >&2
+         "→ KV_TOKENS 疑似异常偏小，请核对 /metrics vllm:cache_config_info (block_size x num_gpu_blocks)" >&2
   fi
   scan_max=$((theoretical_floor + 2))
 
@@ -1347,6 +1265,10 @@ hidden_columns = {
     "generated_texts", "start_times",
 }
 
+# 按 尺寸→BS 数值序输出（文件名字典序会把 perdp1,perdp16,perdp2 排错）
+rows.sort(key=lambda r: (r["input_len"], r["output_len"],
+                         r["per_dp_bs"], r["max_concurrency"]))
+
 keys = set()
 for r in rows:
     keys.update(r.keys())
@@ -1586,97 +1508,7 @@ run_one_bs() {
   merge_results
 }
 
-# ============================================================
-# vLLM 服务端自动发现（同机零配置）
-# 通道1: /proc/<pid>/cmdline —— 启动参数（容器内外、跨用户均可见），
-#        可解析 TP/PP/DP/EP/KV dtype/MEM/max_num_seqs 等
-# 通道2: /proc/<pid>/fd/1,2 —— 服务端日志文件（原生启动，非 docker logs），
-#        可提取 "GPU KV cache size" 引擎自报值
-# PID 筛选优先级: BASE_URL 端口匹配 > MODEL 名匹配 > 全机唯一实例
-# ============================================================
-find_vllm_server_pids() {
-  command -v pgrep >/dev/null 2>&1 || return 0
-  VLLM_SERVER_PIDS=""
-  VLLM_SERVER_CMDLINE=""
-  local port="" model_name all c p
-  [[ "${BASE_URL}" =~ :([0-9]+)(/)?$ ]] && port="${BASH_REMATCH[1]}"
-  model_name="$(basename "${MODEL}")"
-  all="$(pgrep -f 'vllm serve|vllm\.entrypoints' 2>/dev/null | sort -u || true)"
-  local by_port=() by_model=()
-  for p in ${all}; do
-    c="$(tr '\0' ' ' <"/proc/${p}/cmdline" 2>/dev/null || true)"
-    [[ -n "${c}" ]] || continue
-    if [[ -n "${port}" ]] && grep -qE -- "--port[ =]${port}([^0-9]|$)" <<<"${c}"; then
-      by_port+=("${p}"); continue
-    fi
-    if grep -qF "${model_name}" <<<"${c}"; then
-      by_model+=("${p}")
-    fi
-  done
-  local pids=""
-  if (( ${#by_port[@]} )); then pids="${by_port[@]}"
-  elif (( ${#by_model[@]} )); then pids="${by_model[@]}"
-  else
-    echo "[WARN] 未在同机定位到目标 vLLM 服务进程（端口/模型均不匹配，跨机压测时 cmdline/fd 通道不可用）" >&2
-    return 0
-  fi
-  VLLM_SERVER_PIDS="${pids}"
-  VLLM_SERVER_CMDLINE="$(tr '\0' ' ' <"/proc/${pids%% *}/cmdline" 2>/dev/null || true)"
-}
-
-load_vllm_server_cmdline() {
-  find_vllm_server_pids
-  [[ -n "${VLLM_SERVER_CMDLINE:-}" ]] || return 0
-  local -a tk
-  read -ra tk <<< "$(tr '=' ' ' <<<"${VLLM_SERVER_CMDLINE}")"
-  local i key v got=0
-  for ((i = 0; i < ${#tk[@]} - 1; i++)); do
-    key="${tk[i]}"
-    v="${tk[i+1]:-}"
-    [[ "${v}" == -* ]] && v=""
-    case "${key}" in
-      --tensor-parallel-size|-tp)   [[ -z "${TP_SIZE}" && "${v}" =~ ^[0-9]+$ ]] && { TP_SIZE="${v}"; got=1; } ;;
-      --pipeline-parallel-size|-pp) [[ -z "${PP_SIZE}" && "${v}" =~ ^[0-9]+$ ]] && { PP_SIZE="${v}"; got=1; } ;;
-      --data-parallel-size|-dp)     [[ -z "${DP_SIZE}" && "${v}" =~ ^[0-9]+$ ]] && { DP_SIZE="${v}"; got=1; } ;;
-      --max-num-seqs)               [[ -z "${MAX_NUM_SEQS}" && "${v}" =~ ^[0-9]+$ ]] && { MAX_NUM_SEQS="${v}"; got=1; } ;;
-      --kv-cache-dtype)             [[ -z "${KV_CACHE_DTYPE}" && -n "${v}" ]] && { KV_CACHE_DTYPE="${v}"; got=1; } ;;
-      --gpu-memory-utilization)     [[ -z "${GPU_MEM}" && -n "${v}" ]] && { GPU_MEM="${v}"; got=1; } ;;
-      --enable-expert-parallel)     [[ -z "${EP_SIZE}" ]] && { EP_SIZE="on"; got=1; } ;;
-    esac
-  done
-  if (( got )); then
-    echo "[INFO] server cmdline config: TP=${TP_SIZE:-N/A} PP=${PP_SIZE:-N/A} DP=${DP_SIZE:-N/A}" \
-         "MAX_NUM_SEQS=${MAX_NUM_SEQS:-N/A} KV=${KV_CACHE_DTYPE:-N/A} MEM=${GPU_MEM:-N/A} EP=${EP_SIZE:-N/A}"
-  fi
-}
-
-auto_discover_server_log() {
-  [[ -n "${SERVER_LOG}" ]] && return 0
-  find_vllm_server_pids
-  [[ -n "${VLLM_SERVER_PIDS:-}" ]] || { echo "[WARN] SERVER_LOG 未手动指定且未能自动发现；可用 SERVER_LOG=... 或 SERVER_LOG 通道缺失时依赖 cmdline/metrics" >&2; return 0; }
-  local p pids fd cand candidates=()
-  pids="${VLLM_SERVER_PIDS}"
-  for p in ${pids}; do
-    for fd in 1 2; do
-      cand="$(readlink "/proc/${p}/fd/${fd}" 2>/dev/null || true)"
-      [[ -z "${cand}" || "${cand}" == /dev/* || "${cand}" == pipe:* ]] && continue
-      [[ -r "${cand}" && -s "${cand}" ]] || continue
-      grep -q "non-default args" "${cand}" 2>/dev/null || continue
-      candidates+=("${cand}")
-    done
-  done
-  if (( ${#candidates[@]} == 0 )); then
-    echo "[INFO] 服务端日志 fd 指向管道/容器（docker logs 场景），配置走 cmdline 通道"
-    return 0
-  fi
-  SERVER_LOG="$(printf '%s\n' "${candidates[@]}" | sort -u | xargs -r ls -t 2>/dev/null | head -1)"
-  echo "[INFO] SERVER_LOG 自动发现: ${SERVER_LOG} (可用 SERVER_LOG=... 覆盖)"
-}
-
-auto_discover_server_log
 load_vllm_server_info
-load_vllm_server_cmdline
-load_vllm_server_log_config
 load_vllm_capacity
 validate_fixed_mode
 
@@ -1720,7 +1552,6 @@ echo "CACHE_MODE : ${CACHE_MODE}"
 echo "PARALLEL   : ${PARALLEL_CONFIG:-UNKNOWN}"
 echo "CUDA_GRAPH_BS: ${CUDA_GRAPH_BS:-FALLBACK_DP_LAYOUT}"
 echo "SERVER_INFO  : ${SERVER_INFO_URL}"
-echo "SERVER_LOG   : ${SERVER_LOG:-N/A}"
 echo "FLUSH      : NEVER"
 echo "SLA DENSE  : enable=${SLA_DENSE_ENABLE} rules=${SLA_RULES} mode=inline"
 echo "FIXED_PER_DP_BS   : ${FIXED_PER_DP_BS:-AUTO}"
