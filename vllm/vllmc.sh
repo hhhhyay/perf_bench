@@ -417,6 +417,27 @@ PY
 }
 
 
+# 并行度合法性兜底：vLLM 的 tp/cp/dp/pp 恒为 >=1，0 只可能来自异常输入/异常接口返回。
+# DP_SIZE 直接决定 global concurrency，非法值会算出 0 并发，必须纠正。
+validate_parallel_sizes() {
+  if [[ ! "${DP_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[WARN] DP_SIZE=${DP_SIZE:-<empty>} 非法(应为正整数)；回退 DP_SIZE=1"
+    DP_SIZE=1
+  fi
+  local _pname _pval
+  for _pname in TP_SIZE CP_SIZE PP_SIZE; do
+    _pval="${!_pname}"
+    if [[ -n "${_pval}" && ! "${_pval}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "[WARN] ${_pname}=${_pval} 非法(应为正整数)；忽略该分量"
+      printf -v "${_pname}" '%s' ""
+    fi
+  done
+  if [[ "${EP_SIZE}" == "0" ]]; then
+    echo "[WARN] EP_SIZE=0 非法(0 表示未启用)；按未启用处理"
+    EP_SIZE=""
+  fi
+}
+
 load_vllm_capacity() {
   local m
   local dp
@@ -440,6 +461,7 @@ load_vllm_capacity() {
       exit 1
     fi
     [[ -z "${DP_SIZE}" ]] && DP_SIZE=1
+    validate_parallel_sizes
     echo "[WARN] 使用已有/手动容量：DP_SIZE=${DP_SIZE} KV_TOKENS=${KV_TOKENS} MAX_NUM_SEQS=${MAX_NUM_SEQS:-N/A}"
     return 0
   fi
@@ -585,6 +607,9 @@ load_vllm_capacity() {
   fi
   [[ -z "${KV_CACHE_DTYPE}" && -n "${kv_cache_dtype}" && "${kv_cache_dtype}" != "None" ]] && KV_CACHE_DTYPE="${kv_cache_dtype}"
   [[ -z "${GPU_MEM}" && -n "${gmem}" ]] && GPU_MEM="${gmem}"
+
+  # 并行度合法性兜底（DP 决定 global concurrency，不能被 0 污染）
+  validate_parallel_sizes
 
   if [[ -z "${PARALLEL_CONFIG}" ]]; then
     parts=()
