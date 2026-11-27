@@ -479,23 +479,37 @@ load_vllm_capacity() {
       | tr -d ' '
   )"
 
+  # KV 容量：取所有 cache_config_info 行中的最大值。
+  #  - 优先 label kv_cache_size_tokens（部分构建直接给总 token 数）
+  #  - 否则 block_size x num_gpu_blocks（兼容两种 label 顺序）
+  # 混合架构(Mamba/hybrid)、MTP 投机解码、多 engine 构建可能出现多行小容量行，
+  # 只取第一行会严重低估（实测 NMZ Qwen3-Next 构建即如此）。
   kv="$(
-    printf "%s\n" "${m}" \
-      | grep '^vllm:cache_config_info{' \
-      | sed -n 's/.*block_size="\([0-9]*\)".*num_gpu_blocks="\([0-9]*\)".*/\1 \2/p' \
-      | head -1 \
-      | awk '{print $1*$2}'
+    printf "%s\n" "${m}" | python3 -c '
+import re, sys
+best = 0
+for line in sys.stdin:
+    if not line.startswith("vllm:cache_config_info{"):
+        continue
+    lab = dict(re.findall(r"([A-Za-z_]+)=\"([^\"]*)\"", line))
+    val = 0
+    raw = lab.get("kv_cache_size_tokens", "")
+    if raw.isdigit():
+        val = int(raw)
+    else:
+        bs = lab.get("block_size", "")
+        nb = lab.get("num_gpu_blocks", "")
+        if bs.isdigit() and nb.isdigit():
+            val = int(bs) * int(nb)
+    best = max(best, val)
+print(best if best > 0 else "")
+' 2>/dev/null || true
   )"
 
-  # 兼容 label 顺序：num_gpu_blocks 在前、block_size 在后
-  if [[ -z "${kv}" ]]; then
-    kv="$(
-      printf "%s\n" "${m}" \
-        | grep '^vllm:cache_config_info{' \
-        | sed -n 's/.*num_gpu_blocks="\([0-9]*\)".*block_size="\([0-9]*\)".*/\1 \2/p' \
-        | head -1 \
-        | awk '{print $1*$2}'
-    )"
+  # 容量异常偏小时打印原始行，便于定位（多行/语义差异）
+  if [[ -n "${kv}" && "${kv}" -lt 10000 ]]; then
+    echo "[WARN] /metrics 提取的 KV 容量异常小 (kv=${kv})，原始 cache_config_info 行："
+    printf "%s\n" "${m}" | grep '^vllm:cache_config_info{' | head -5
   fi
 
   # 尝试从任何带 max_num_seqs label 的 info metric 中提取。
@@ -1578,6 +1592,10 @@ run_one_bs() {
 
   if (( case_exit_code == 0 )); then
     echo "[PASS] ${case_name} per_dp_bs=${per_dp_bs} global=${global_concurrency} elapsed=${bs_elapsed_s}s"
+    # 实测并发超过理论 BS，说明 KV_TOKENS 被低估（服务端实际可容纳更多请求）
+    if awk -v a="${per_dp_bs}" -v b="${theoretical_bs}" 'BEGIN{exit !(a>b)}'; then
+      echo "[WARN] 实测 BS=${per_dp_bs} > 理论 BS=${theoretical_bs}：KV_TOKENS=${KV_TOKENS} 疑似被低估，扫描点可能不全（可用 KV_TOKENS=... 指定真实容量）"
+    fi
   else
     echo "[FAIL] ${case_name} per_dp_bs=${per_dp_bs} global=${global_concurrency} exit=${case_exit_code} elapsed=${bs_elapsed_s}s"
   fi
