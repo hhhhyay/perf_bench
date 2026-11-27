@@ -240,7 +240,6 @@ LOW_DP_BS=(1 2 4 8 16 32 48 64 96 128)
 # 理论 BS > 64 后继续按 16 的步长扩展：
 #   80/96/112/128/...
 DENSE_DP_BS=(1 2 4 6 8 10 12 14 16 20 24 28 32 40 48 56 64)
-THEORY_DELTAS=(-2 -1 0)
 
 
 # ============================================================
@@ -479,15 +478,15 @@ load_vllm_capacity() {
       | tr -d ' '
   )"
 
-  # KV 容量：取所有 cache_config_info 行中的最大值。
+  # KV 容量：取所有 cache_config_info 行中的最小值。
   #  - 优先 label kv_cache_size_tokens（部分构建直接给总 token 数）
   #  - 否则 block_size x num_gpu_blocks（兼容两种 label 顺序）
-  # 混合架构(Mamba/hybrid)、MTP 投机解码、多 engine 构建可能出现多行小容量行，
-  # 只取第一行会严重低估（实测 NMZ Qwen3-Next 构建即如此）。
+  # 混合架构(Mamba/hybrid)、MTP 投机解码、多 cache group 构建会出现多行，
+  # 实际可用容量受最小的一组限制，故取最小值（保守估计）。
   kv="$(
     printf "%s\n" "${m}" | python3 -c '
 import re, sys
-best = 0
+cap = 0
 for line in sys.stdin:
     if not line.startswith("vllm:cache_config_info{"):
         continue
@@ -501,8 +500,9 @@ for line in sys.stdin:
         nb = lab.get("num_gpu_blocks", "")
         if bs.isdigit() and nb.isdigit():
             val = int(bs) * int(nb)
-    best = max(best, val)
-print(best if best > 0 else "")
+    if val > 0:
+        cap = val if cap == 0 else min(cap, val)
+print(cap if cap > 0 else "")
 ' 2>/dev/null || true
   )"
 
@@ -777,7 +777,6 @@ get_bs_list() {
   local theoretical_floor
   local scan_max
   local bs
-  local delta
 
   input_tokens="$(tokens_from_k "${input_k}")" || return 1
   output_tokens="$(tokens_from_k "${output_k}")" || return 1
@@ -796,9 +795,10 @@ get_bs_list() {
   (( theoretical_floor < 1 )) && theoretical_floor=1
   if (( theoretical_floor <= 2 )); then
     echo "[WARN] token theory/DP BS=${theoretical_floor} 过小: KV_TOKENS=${KV_TOKENS} ÷ req=${tokens_per_request}" \
-         "→ KV_TOKENS 疑似异常偏小，请核对 /metrics vllm:cache_config_info (block_size x num_gpu_blocks)" >&2
+         "→ KV_TOKENS 疑似异常偏小，请核对 /metrics vllm:cache_config_info 的 kv_cache_size_tokens" >&2
   fi
-  scan_max=$((theoretical_floor + 2))
+  # 与 sglc.sh 对齐：最大 BS 即 effective theory，不测 theory 之后的点
+  scan_max="${theoretical_floor}"
 
   declare -A selected=()
 
@@ -835,12 +835,7 @@ get_bs_list() {
     fi
   fi
 
-  # effective theory 附近只加 ±1/±2
-  for delta in "${THEORY_DELTAS[@]}"; do
-    bs=$((theoretical_floor + delta))
-    (( bs >= 1 && bs <= scan_max )) && selected["${bs}"]=1
-  done
-
+  # 与 sglc.sh 对齐：默认只跑 CUDA Graph capture BS，额外补 1 和最大 BS（effective theory）
   selected["1"]=1
   selected["${scan_max}"]=1
 
@@ -1682,9 +1677,9 @@ for case_config in "${CASES[@]}"; do
   echo "# Token Theory/DP: ${token_theoretical_bs}"
   echo "# Effective Theory/DP: ${theoretical_bs}"
   if [[ -n "${CUDA_GRAPH_BS}" ]]; then
-    echo "# BS Source      : /server_info cudagraph_capture_sizes + theory ±1/±2"
+    echo "# BS Source      : /server_info cudagraph_capture_sizes + 1 + max_bs"
   else
-    echo "# BS Source      : DP_SIZE fallback + theory ±1/±2"
+    echo "# BS Source      : DP_SIZE fallback + 1 + max_bs"
   fi
   echo "# Auto BS        : ${auto_bs_list}"
   echo "# Test BS        : ${bs_list}"
